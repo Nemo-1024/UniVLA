@@ -152,3 +152,6 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+
+weights
+vla-scripts/extern/ego4d_rlds_dataset_builder/ego4d/univla-ego4d-rlds-dependencies

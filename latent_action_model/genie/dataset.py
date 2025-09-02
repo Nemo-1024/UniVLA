@@ -155,11 +155,13 @@ class random_crop_resize():
         top = random.randint(0, height - crop_size)
 
         image_cropped = image.crop((left, top, left + crop_size, top + crop_size))
-        image_resized = image_cropped.resize((self.target_size, self.target_size), Image.BILINEAR)
+        image_resized = image_cropped.resize((self.target_size, self.target_size), Image.Resampling.BILINEAR)
         image_resized = self.to_tensor(image_resized)
         
         return image_resized
 
+
+# center_crop_resize 逻辑已移至 RLDS 阶段的 decode_and_resize 函数中
 
 
 class LightningOpenX(LightningDataset):
@@ -198,7 +200,7 @@ class LightningOpenX(LightningDataset):
         self.worker_init_fn = set_global_seed(42, get_worker_init_fn=True)
 
         self.batch_transform = RLDSBatchTransformVideo(
-            image_transform=transforms.ToTensor() 
+            image_transform=transforms.ToTensor()  # center crop现在在RLDS阶段处理
         )
         self.collate_fn = CollatorForLatentAction()
 

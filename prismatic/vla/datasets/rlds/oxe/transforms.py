@@ -860,22 +860,26 @@ def human_dataset_transform(sample: Dict[str, Any]) -> Dict[str, Any]:
     """
     # Extract the observation from the sample
     observation = sample["observation"]
-    print('ego4d', sample.keys())
-    print('ego4d obs', sample["observation"].keys())
-    # print('sample["observation"]', sample["observation"]['image'].shape[0])
-    # observation["state"] = tf.zeros((2, 7), dtype=tf.float32)
-    
+
+    # Infer trajectory length from available observation keys
+    if "image" in observation:
+        traj_len = tf.shape(observation["image"])[0]
+    elif "wrist_image" in observation:
+        traj_len = tf.shape(observation["wrist_image"])[0]
+    elif "state" in observation:
+        traj_len = tf.shape(observation["state"])[0]
+    else:
+        # Fallback: cannot infer length reliably
+        raise ValueError("human_dataset_transform: cannot infer trajectory length from observation.")
+
+    # Populate proprio placeholders matching trajectory length
+    observation["EEF_state"] = tf.zeros((traj_len, 6), dtype=tf.float32)
+    observation["gripper_state"] = tf.zeros((traj_len, 1), dtype=tf.float32)
+
     # Create a dummy action tensor with all zeros
     # Assuming the action space is 7D (6D for EEF + 1D for gripper)
-    # dummy_action = tf.zeros((2, 7), dtype=tf.float32)
-    
-    # Add the dummy action to the sample
-    # sample["action"] = dummy_action
-    
-    # Split the observation state into EEF_state and gripper_state
-    # sample["observation"]["EEF_state"] = observation["state"][:, :6]  
-    # sample["observation"]["gripper_state"] = observation["state"][:, -1:] 
-    
+    sample["action"] = tf.zeros((traj_len, 7), dtype=tf.float32)
+
     return sample
 
 
@@ -939,6 +943,7 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "berkeley_gnm_cory_hall": gnm_dataset_transform,
     "berkeley_gnm_sac_son": gnm_dataset_transform,
     "droid": droid_baseact_transform,
+    "droid_100": droid_baseact_transform,
     "fmb": fmb_dataset_transform,
     "dobbe": dobbe_dataset_transform,
     "roboset": roboset_dataset_transform,
@@ -965,8 +970,6 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "libero_10_no_noops_quad": libero_dataset_transform,
     "libero_combined": libero_dataset_transform,
     ### Human Dataset
-    "ego4d_split_1": human_dataset_transform,
-    "ego4d_split_2": human_dataset_transform,
-    "ego4d_split_3": human_dataset_transform,
-    "ego4d_split_4": human_dataset_transform,
+    "ego4d": human_dataset_transform,
+
 }

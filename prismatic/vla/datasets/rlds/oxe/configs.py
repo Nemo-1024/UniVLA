@@ -76,28 +76,7 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
-    "ego4d_split_1": { 
-        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
-        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["EEF_state", None, "gripper_state"],
-        "state_encoding": StateEncoding.POS_EULER,
-        "action_encoding": ActionEncoding.EEF_POS,
-    },
-    "ego4d_split_2": { 
-        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
-        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["EEF_state", None, "gripper_state"],
-        "state_encoding": StateEncoding.POS_EULER,
-        "action_encoding": ActionEncoding.EEF_POS,
-    },
-    "ego4d_split_3": { 
-        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
-        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["EEF_state", None, "gripper_state"],
-        "state_encoding": StateEncoding.POS_EULER,
-        "action_encoding": ActionEncoding.EEF_POS,
-    },
-    "ego4d_split_4": { 
+    "ego4d": { 
         "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
         "state_obs_keys": ["EEF_state", None, "gripper_state"],
@@ -565,8 +544,24 @@ OXE_DATASET_CONFIGS = {
             "wrist": "wrist_image_left",
         },
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["proprio"],
-        "state_encoding": StateEncoding.POS_QUAT,
+        "state_obs_keys": ["cartesian_position", None, "gripper_position"],
+        "state_encoding": StateEncoding.POS_EULER,
+        "action_encoding": ActionEncoding.EEF_POS,
+        "aux_kwargs": {
+            "dataset_frame_transform_kwargs": {
+                "chunk_filter_fn": zero_action_filter,
+            },
+        },
+    },
+    "droid_100": {
+        "image_obs_keys": {
+            "primary": "exterior_image_1_left",
+            "secondary": "exterior_image_2_left",
+            "wrist": "wrist_image_left",
+        },
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        "state_obs_keys": ["cartesian_position", None, "gripper_position"],
+        "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
         "aux_kwargs": {
             "dataset_frame_transform_kwargs": {

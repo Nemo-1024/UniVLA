@@ -298,8 +298,20 @@ class RLDSBatchTransformVideo:
         # print(sum(np.array(img_k) - np.array(img)))
         target_pixel_values= self.image_transform(img_k)
 
-        return dict(initial_pixel_values=initial_pixel_values, target_pixel_values=target_pixel_values, 
+        # 提取状态数据（用于CollatorForLatentAction）
+        proprio = None
+        if "proprio" in rlds_batch["observation"]:
+            # 提取时间序列的状态数据 [T, state_dim]
+            proprio = np.array(rlds_batch["observation"]["proprio"])
+        
+        result = dict(initial_pixel_values=initial_pixel_values, target_pixel_values=target_pixel_values, 
                     task_instruction=lang, action=action, dataset_name=dataset_name)
+        
+        # 只在状态数据存在时添加到结果中
+        if proprio is not None:
+            result["proprio"] = proprio
+            
+        return result
 
 
 
@@ -333,7 +345,7 @@ class RLDSDataset(IterableDataset):
             mixture_spec,
             load_camera_views=("primary",),
             load_depth=False,
-            load_proprio=False,
+            load_proprio=True,  # 启用状态数据加载以支持物理接地损失
             load_language=True,
             action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
         )
@@ -361,7 +373,7 @@ class RLDSDataset(IterableDataset):
         # If applicable, enable image augmentations
         if image_aug:
             rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
-                random_resized_crop=dict(scale=[0.9, 0.9], ratio=[1.0, 1.0]),
+                random_resized_crop=dict(scale=[0.8, 1.0], ratio=[1.0, 1.0]),
                 random_brightness=[0.2],
                 random_contrast=[0.8, 1.2],
                 random_saturation=[0.8, 1.2],
@@ -387,7 +399,8 @@ class RLDSDataset(IterableDataset):
             yield self.batch_transform(rlds_batch)
 
     def __len__(self) -> int:
-        return self.dataset_length
+        """返回预计算的数据集长度，已经反映了所有transformation的影响"""
+        return int(self.dataset_length)
 
     # === Explicitly Unused ===
     def __getitem__(self, idx: int) -> None:

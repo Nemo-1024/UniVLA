@@ -84,14 +84,9 @@ def droid_baseact_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
             trajectory["observation"]["exterior_image_2_left"],
         )
     )
-    trajectory["observation"]["proprio"] = tf.concat(
-        (
-            trajectory["observation"]["cartesian_position"],
-            trajectory["observation"]["gripper_position"],
-        ),
-        axis=-1,
-    )
-    print(trajectory['observation'].keys())
+    # Note: proprio will be reconstructed by the system based on state_obs_keys configuration
+    # cartesian_position (6-dim) + None padding (1-dim) + gripper_position (1-dim) = 8-dim
+    # print(trajectory['observation'].keys())
     return trajectory
 
 
@@ -115,13 +110,8 @@ def droid_wristact_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
             trajectory["observation"]["exterior_image_2_left"],
         )
     )
-    trajectory["observation"]["proprio"] = tf.concat(
-        (
-            trajectory["observation"]["cartesian_position"],
-            trajectory["observation"]["gripper_position"],
-        ),
-        axis=-1,
-    )
+    # Note: proprio will be reconstructed by the system based on state_obs_keys configuration
+    # cartesian_position (6-dim) + None padding (1-dim) + gripper_position (1-dim) = 8-dim
     return trajectory
 
 

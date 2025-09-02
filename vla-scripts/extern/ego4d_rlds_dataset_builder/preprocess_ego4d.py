@@ -4,25 +4,24 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 import argparse
-import multiprocessing
-from multiprocessing import Pool, Manager, Lock
+from multiprocessing import Pool, Manager
 
 def parse_arguments():
     """Parse command line arguments for video processing configuration."""
     parser = argparse.ArgumentParser(description='Process Ego4D video clips into frame sequences.')
     
     # Required paths
-    parser.add_argument('--denseclips_dir', type=str, required=True,
+    parser.add_argument('--denseclips_dir', type=str, default="/data/home/jlchen/datasets/ego4d/denseclips",
                        help='Root directory for denseclips output')
-    parser.add_argument('--info_clips_json', type=str, required=True,
+    parser.add_argument('--info_clips_json', type=str, default="/data/home/jlchen/code/UniVLA/vla-scripts/extern/ego4d_rlds_dataset_builder/ego4d/univla-ego4d-rlds-dependencies/info_clips.json",
                        help='Path to info_clips.json containing clip information')
-    parser.add_argument('--source_videos_dir', type=str, required=True,
+    parser.add_argument('--source_videos_dir', type=str, default="/data/home/jlchen/datasets/ego4d/v2/clips",
                        help='Directory containing source video files')
     
     # Processing options
     parser.add_argument('--frame_interval', type=int, default=15,
                        help='Interval between saved frames (default: 15)')
-    parser.add_argument('--processes', type=int, default=1,
+    parser.add_argument('--processes', type=int, default=16,
                        help='Number of parallel processes to use (default: 1)')
     
     return parser.parse_args()
@@ -71,6 +70,27 @@ def process_video(video_name, clips, args, info):
             'id': idx
         })
 
+def _process_video_wrapper(task_args):
+    """Unpack arguments and run `process_video` for use with imap-style pool APIs.
+
+    Returns the processed `video_name` to enable progress tracking in the parent process.
+    """
+    video_name, clips, args, info = task_args
+    process_video(video_name, clips, args, info)
+    return video_name
+
+def _init_worker_opencv_threads():
+    """Initializer for worker processes to avoid OpenCV over-threading in multiprocessing.
+
+    Sets OpenCV internal thread count to 0 to prevent thread contention when using
+    multiple processes.
+    """
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        # Be resilient if OpenCV backend does not support thread control
+        pass
+
 def main():
     args = parse_arguments()
     os.makedirs(args.denseclips_dir, exist_ok=True)
@@ -82,10 +102,12 @@ def main():
         manager = Manager()
         info = manager.list()
         
-        with Pool(processes=args.processes) as pool:
-            pool.starmap(process_video, 
-                        [(video_name, clips, args, info) 
-                         for video_name, clips in clip_data.items()])
+        with Pool(processes=args.processes, initializer=_init_worker_opencv_threads) as pool:
+            tasks = [(video_name, clips, args, info) for video_name, clips in clip_data.items()]
+            for _ in tqdm(pool.imap_unordered(_process_video_wrapper, tasks),
+                          total=len(tasks),
+                          desc="Processing videos (MP)"):
+                pass
     else:
         info = []
         for video_name, clips in tqdm(clip_data.items(), desc="Processing videos"):

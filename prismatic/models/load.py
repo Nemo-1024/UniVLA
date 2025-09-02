@@ -218,7 +218,7 @@ def load_vla(
 
     # Load VLM using `from_pretrained` (clobbers HF syntax... eventually should reconcile)
     overwatch.info(f"Loading VLA [bold blue]{model_cfg.model_id}[/] from Checkpoint")
-    vla = OpenVLA.from_pretrained(
+    vla = Op                                        enVLA.from_pretrained(
         checkpoint_pt,
         model_cfg.model_id,
         vision_backbone,

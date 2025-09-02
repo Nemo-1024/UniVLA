@@ -1,5 +1,5 @@
 from os import listdir, makedirs, path
-from typing import Callable, Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, Tuple, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -45,7 +45,7 @@ class DINO_LAM(LightningModule):
             stage: str = 'stage-1',
             optimizer: OptimizerCallable = AdamW,
             make_data_pair: bool = False,
-            stage_one_ckpt: str = None,
+            stage_one_ckpt: Optional[str] = None,
     ) -> None:
         super(DINO_LAM, self).__init__()
         assert stage in ['stage-1', 'stage-2']
@@ -209,8 +209,9 @@ class DINO_LAM(LightningModule):
         plt.gca().set_axis_off()
         plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
         plt.margins(0, 0)
-        plt.gca().xaxis.set_major_locator(plt.NullLocator())
-        plt.gca().yaxis.set_major_locator(plt.NullLocator())
+        from matplotlib.ticker import NullLocator
+        plt.gca().xaxis.set_major_locator(NullLocator())
+        plt.gca().yaxis.set_major_locator(NullLocator())
         plt.savefig(f"{filename}.png", bbox_inches="tight", pad_inches=0.0)
         plt.close()
 

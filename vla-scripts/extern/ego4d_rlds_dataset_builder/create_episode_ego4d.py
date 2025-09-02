@@ -19,7 +19,7 @@ def parse_arguments():
                        help='Path to the annotation JSON file')
     parser.add_argument('--processes', type=int, default=96,
                        help='Number of worker processes to use (default: 96)')
-    parser.add_argument('--target_size', type=int, nargs=2, default=[224, 224],
+    parser.add_argument('--target_size', type=int, nargs=2, default=[256, 256],
                        help='Target size for resizing images as "height width" (default: 224 224)')
     parser.add_argument('--verify', action='store_true',
                        help='Verify saved episodes by loading them after creation')
@@ -56,7 +56,12 @@ def center_crop_and_resize(image, target_size=(224, 224)):
 
     # Convert to PIL Image for high-quality resizing
     pil_image = Image.fromarray(cropped_image)
-    resized_image = pil_image.resize(target_size, Image.BILINEAR)
+    resampling_enum = getattr(Image, 'Resampling', None)
+    if resampling_enum is not None:
+        resample_method = getattr(resampling_enum, 'BILINEAR')
+    else:
+        resample_method = getattr(Image, 'BILINEAR', 2)
+    resized_image = pil_image.resize(target_size, resample=resample_method)
 
     return np.array(resized_image)
 
@@ -82,16 +87,23 @@ def create_fake_episode(clip_dir, save_dir, annotation, target_size, verify=Fals
     caption = None
     episode_id = None
     for anno in annotation:
-        if anno['video_name'] == video_name and anno['action_name'] == clip_name:
-            caption = anno['language'][5:]  # Remove first 5 characters '#C C '
-            episode_id = anno['id']
+        # Be robust if malformed items exist in annotation
+        if not isinstance(anno, dict):
+            continue
+        if anno.get('video_name') == video_name and anno.get('action_name') == clip_name:
+            lang = anno.get('language', '')
+            if isinstance(lang, str) and lang.startswith('#C C '):
+                caption = lang[5:]
+            else:
+                caption = lang
+            episode_id = anno.get('id', 0)
             break
     
     if caption is None or episode_id is None:
         print(f"No matching annotation found for {video_name}/{clip_name}")
         return
 
-    save_path = os.path.join(save_dir, f'episode_{episode_id}.npy')
+    save_path = os.path.join(save_dir, f'episode_{video_name}_{episode_id}.npy')
 
     # Process each frame in the clip
     for frame_name in sorted(os.listdir(clip_dir)):
@@ -155,9 +167,46 @@ def main():
     print("Loading annotation file...")
     try:
         with open(args.annotation_file) as f:
-            annotation = json.load(f)
+            raw_annotation = json.load(f)
     except Exception as e:
         print(f"Failed to load annotation file: {str(e)}")
+        return
+
+    # Normalize annotations:
+    # - If provided annotations.json: expected to be a list of dicts
+    # - If provided info_clips.json: dict mapping video_name -> list of clip dicts
+    annotation = None
+    if isinstance(raw_annotation, list):
+        annotation = raw_annotation
+    elif isinstance(raw_annotation, dict):
+        normalized = []
+        for video_name, clips in raw_annotation.items():
+            if not isinstance(clips, list):
+                continue
+            for idx, clip in enumerate(clips):
+                if not isinstance(clip, dict):
+                    continue
+                # Try to derive action_name from pre_frame.path like "<video>/<action_name>"
+                action_name = None
+                pre_frame = clip.get('pre_frame') or {}
+                pre_path = pre_frame.get('path') if isinstance(pre_frame, dict) else None
+                if isinstance(pre_path, str) and '/' in pre_path:
+                    parts = pre_path.split('/')
+                    if len(parts) >= 2:
+                        action_name = parts[1]
+                if action_name is None:
+                    action_name = f"clip_{idx:05d}"
+
+                language = clip.get('narration_text') or clip.get('language') or ''
+                normalized.append({
+                    'video_name': video_name,
+                    'action_name': action_name,
+                    'language': language,
+                    'id': idx,
+                })
+        annotation = normalized
+    else:
+        print('Unsupported annotation file format. Expect list or dict JSON.')
         return
     
     # Get list of video directories

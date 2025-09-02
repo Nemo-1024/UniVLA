@@ -363,15 +363,38 @@ class CollatorForLatentAction:
         action = [torch.from_numpy(instance["action"]) for instance in instances]
         action = torch.stack(action)
 
+        proprio = [torch.from_numpy(instance["proprio"]) for instance in instances]
+        proprio = torch.stack(proprio, dim=0)
+
         # removing all punctuation in task instruction
         task_instruction = [re.sub('[{}]'.format(string.punctuation),"",instance["task_instruction"]) for instance in instances]
 
+        # # 处理状态数据（用于物理接地辅助损失）
+        # states = None
+        # if "states" in instances[0] and instances[0]["states"] is not None:
+        #     states_list = []
+        #     for instance in instances:
+        #         if "states" in instance and instance["states"] is not None:
+        #             states_tensor = torch.from_numpy(instance["states"]).float()
+        #             states_list.append(states_tensor)
+        #         else:
+        #             # 如果某些样本没有状态数据，用零填充
+        #             # 假设状态维度为7（常见的机械臂状态维度）
+        #             dummy_states = torch.zeros((2, 7), dtype=torch.float32)  # [T, state_dim]
+        #             states_list.append(dummy_states)
+        #     states = torch.stack(states_list)
 
         output = dict(
             videos=pixel_values,
             task_instruction=task_instruction,
             action=action,
+            proprio=proprio
         )
+        
+        # # 只在状态数据存在时添加到输出中
+        # if states is not None:
+        #     output["states"] = states
+            
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
 

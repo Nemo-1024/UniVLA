@@ -13,6 +13,51 @@ import tensorflow as tf
 from absl import logging
 
 
+def center_crop_and_resize_tf(image: tf.Tensor, target_size: Tuple[int, int]) -> tf.Tensor:
+    """
+    对图像进行短边中心裁剪并缩放到目标尺寸，保持物体比例关系不变
+    
+    Args:
+        image: TensorFlow张量，形状为 [H, W, C]
+        target_size: 目标尺寸 (height, width)
+    
+    Returns:
+        处理后的图像张量，形状为 [target_height, target_width, C]
+    """
+    # 获取图像尺寸
+    shape = tf.shape(image)
+    height, width = shape[0], shape[1]
+    
+    # 找到短边长度作为裁剪尺寸
+    crop_size = tf.minimum(height, width)
+    
+    # 计算中心裁剪的起始位置
+    offset_height = (height - crop_size) // 2
+    offset_width = (width - crop_size) // 2
+    
+    # 执行中心裁剪
+    image_cropped = tf.image.crop_to_bounding_box(
+        image, 
+        offset_height=offset_height,
+        offset_width=offset_width, 
+        target_height=crop_size,
+        target_width=crop_size
+    )
+    
+    # 缩放到目标尺寸
+    image_resized = tf.image.resize(
+        image_cropped, 
+        size=target_size, 
+        method=tf.image.ResizeMethod.BILINEAR,
+        antialias=True
+    )
+    
+    # 确保像素值在正确范围内
+    image_resized = tf.cast(tf.clip_by_value(tf.round(image_resized), 0, 255), tf.uint8)
+    
+    return image_resized
+
+
 # ruff: noqa: B023
 def augment(obs: Dict, seed: tf.Tensor, augment_kwargs: Union[Dict, Dict[str, Dict]]) -> Dict:
     """Augments images, skipping padding images."""
@@ -34,7 +79,7 @@ def augment(obs: Dict, seed: tf.Tensor, augment_kwargs: Union[Dict, Dict[str, Di
             lambda: dl.transforms.augment_image(
                 obs[f"image_{name}"],
                 **kwargs,
-                seed=seed + i,  # augment each image differently
+                seed=seed + i,  # augment each camera key differently
             ),                                                                                                                                                                                                                                                                                                            
             lambda: obs[f"image_{name}"],  # skip padding images
         )
@@ -74,7 +119,8 @@ def decode_and_resize(
         elif image.dtype != tf.uint8:
             raise ValueError(f"Unsupported image dtype: found image_{name} with dtype {image.dtype}")
         if name in resize_size:
-            image = dl.transforms.resize_image(image, size=resize_size[name])
+            # 使用center crop + resize 保持物体比例关系不变
+            image = center_crop_and_resize_tf(image, target_size=resize_size[name])
         obs[f"image_{name}"] = image
 
     for name in depth_names:

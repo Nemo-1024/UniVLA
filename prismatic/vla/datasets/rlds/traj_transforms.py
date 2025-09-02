@@ -123,6 +123,148 @@ def chunk_act_obs_libero(traj: Dict, window_size: int, future_action_window_size
     return traj
 
 
+def chunk_act_obs_half_stride(traj: Dict, window_size: int, future_action_window_size: int = 0) -> Dict:
+    """
+    使用半窗口步长对轨迹进行分块处理，步进大小为window_size//2
+    
+    与chunk_act_obs的区别：
+    - 步进从1改为window_size//2，减少数据重叠
+    - 确定性采样，避免1-3等特定时刻
+    - 仍然只取首尾帧，保持内存效率
+    
+    Args:
+        traj: 包含观测和动作的轨迹字典
+        window_size: 窗口大小
+        future_action_window_size: 未来动作窗口大小
+        
+    Returns:
+        处理后的轨迹字典，chunk数量约为原来的1/(window_size//2)
+        
+    Examples:
+        window_size=10 → stride=5 → 起始位置[0,5,10,15...] → 重叠率50%
+        window_size=8  → stride=4 → 起始位置[0,4,8,12...]  → 重叠率50%
+    """
+    # 调试：打印轨迹字段信息
+    if tf.executing_eagerly():  # 只在eager模式下打印
+        tf.print("=== DEBUG: Trajectory keys ===")
+        for key in traj.keys():
+            if hasattr(traj[key], 'shape'):
+                tf.print(f"  {key}: shape = {tf.shape(traj[key])}")
+            else:
+                tf.print(f"  {key}: {type(traj[key])}")
+        tf.print("===============================")
+    traj_len = tf.shape(traj["action"])[0]
+    action_dim = traj["action"].shape[-1]
+    
+    # 计算步长：窗口大小的一半，至少为1
+    stride = tf.maximum(window_size // 2, 1)
+    
+    # 生成采样的起始位置 - 确定性采样
+    max_start = tf.maximum(traj_len - window_size, 0)
+    sample_starts = tf.range(0, traj_len, stride, dtype=tf.int32)
+    
+    # 过滤掉超出范围的起始位置
+    valid_starts = tf.boolean_mask(sample_starts, sample_starts <= max_start)
+    
+    # 确保至少有一个有效位置
+    valid_starts = tf.cond(
+        tf.size(valid_starts) > 0,
+        lambda: valid_starts,
+        lambda: tf.constant([0], dtype=tf.int32)
+    )
+    
+    num_chunks = tf.shape(valid_starts)[0]
+    
+    # 创建chunk索引 - 仍然只取首尾帧
+    first_indices = valid_starts[:, None]
+    last_indices = tf.minimum(
+        first_indices + (window_size - 1), 
+        traj_len - 1
+    )
+    chunk_indices = tf.concat([first_indices, last_indices], axis=1)
+    
+    # 创建动作chunk索引  
+    action_first_indices = first_indices
+    action_last_indices = tf.minimum(
+        first_indices + (window_size + future_action_window_size - 1),
+        traj_len - 1
+    )
+    action_chunk_indices = tf.concat([action_first_indices, action_last_indices], axis=1)
+    
+    # 确保索引有效
+    floored_chunk_indices = tf.maximum(tf.minimum(chunk_indices, traj_len - 1), 0)
+    
+    # 处理goal_timestep
+    if "timestep" in traj["task"]:
+        goal_timestep = tf.gather(traj["task"]["timestep"], valid_starts)
+    else:
+        goal_timestep = tf.fill([num_chunks], traj_len - 1)
+        
+    floored_action_chunk_indices = tf.minimum(
+        tf.maximum(action_chunk_indices, 0), 
+        goal_timestep[:, None]
+    )
+    
+    # 重构轨迹 - 注意：这里改变了轨迹的长度
+    new_traj = {}
+    
+    # 采样观测 - 只取首尾帧
+    new_traj["observation"] = tf.nest.map_structure(
+        lambda x: tf.gather(x, floored_chunk_indices), 
+        traj["observation"]
+    )
+    
+    # 采样动作
+    new_traj["action"] = tf.gather(traj["action"], floored_action_chunk_indices)
+    
+    # 添加pad_mask
+    new_traj["observation"]["pad_mask"] = chunk_indices >= 0
+    
+    # 处理task字段 - 需要重新采样
+    if "task" in traj:
+        new_traj["task"] = tf.nest.map_structure(
+            lambda x: tf.gather(x, valid_starts) if hasattr(x, 'shape') and len(x.shape) > 0 and tf.shape(x)[0] == traj_len else x,
+            traj["task"]
+        )
+    
+    # 处理其他轨迹级别的字段
+    for key in traj:
+        if key not in ["observation", "action", "task"]:
+            # 检查是否是轨迹长度相关的字段
+            if hasattr(traj[key], 'shape') and len(traj[key].shape) > 0 and tf.shape(traj[key])[0] == traj_len:
+                new_traj[key] = tf.gather(traj[key], valid_starts)
+            else:
+                new_traj[key] = traj[key]
+    
+    # 处理absolute_action_mask和neutral_actions
+    if "absolute_action_mask" not in traj and future_action_window_size > 0:
+        logging.warning(
+            "future_action_window_size > 0 but no absolute_action_mask was provided. "
+            "Assuming all actions are relative for the purpose of making neutral actions."
+        )
+    
+    # 获取原始mask，然后采样
+    absolute_action_mask = traj.get("absolute_action_mask", tf.zeros([traj_len, action_dim], dtype=tf.bool))
+    sampled_mask = tf.gather(absolute_action_mask, valid_starts)
+    
+    # 创建neutral actions
+    neutral_actions = tf.where(
+        sampled_mask[:, None, :],
+        new_traj["action"],  # absolute actions are repeated
+        tf.zeros_like(new_traj["action"]),  # relative actions are zeroed
+    )
+    
+    # 处理超过goal timestep的动作
+    action_past_goal = action_chunk_indices > goal_timestep[:, None]
+    new_traj["action"] = tf.where(
+        action_past_goal[:, :, None], 
+        neutral_actions, 
+        new_traj["action"]
+    )
+    
+    return new_traj
+
+
 def subsample(traj: Dict, subsample_length: int) -> Dict:
     """Subsamples trajectories to the given length."""
     traj_len = tf.shape(traj["action"])[0]
@@ -154,3 +296,4 @@ def add_pad_mask_dict(traj: Dict) -> Dict:
         traj[key]["pad_mask_dict"] = pad_mask_dict
 
     return traj
+

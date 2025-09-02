@@ -11,20 +11,30 @@ from typing import Dict, List, Tuple
 OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
     # === Bridge V2 Dataset ===
     "bridge": [
-        ("bridge_oxe", 1.0),                                      # Version of Bridge V2 in Open-X GCP Bucket
+        ("bridge_dataset", 1.0),                                      # Version of Bridge V2 in Open-X GCP Bucket
         # ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
     ],
 
     "droid": [
         ("droid", 1.0),
     ],
+    "droid_100": [
+        ("droid_100", 1.0),
+    ],
+
+    "droid_bridge": [
+        ("droid_100", 0.9),
+        ("bridge_dataset", 0.2),
+    ],
+    "droid_bridge_ego4d": [
+        ("droid", 1.0),
+        ("bridge_dataset", 1.0),
+        ("ego4d", 1.0),
+    ],
     
     # === Human-data Only ===
     "Ego4D": [ 
-        ("ego4d_split_1", 1.0),
-        ("ego4d_split_2", 1.0),
-        ("ego4d_split_3", 1.0),
-        ("ego4d_split_4", 1.0),
+        ("ego4d", 1.0),
     ],
 
 
