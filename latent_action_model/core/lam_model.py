@@ -510,11 +510,13 @@ class LatentLAMModel(nn.Module):
         dropout: float = 0.1,
         num_queries: int = 4,
         # 新增：状态差预测器参数
-        enable_state_delta_prediction: bool = False,
+        enable_state_delta_prediction: bool = True,
 
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 集成视觉编码器：负责将 videos 编码为 [B, T, N, D] 特征
+        self.vision_encoder = VJEPAEncoder().to(self.device)
         self.encoder = LAMEncoder(context_dim=dim, query_dim=code_dim, num_queries=num_queries, num_layers=enc_layers, dropout=dropout).to(self.device)
         self.decoder = LAMDecoder(dim, code_dim, dec_layers,  dropout=dropout).to(self.device)
         vq_kwargs = vq_kwargs or {}
@@ -535,54 +537,65 @@ class LatentLAMModel(nn.Module):
                 dropout=dropout
             ).to(self.device)
 
-    def forward(self, feature_pair: torch.Tensor, state_pair: Optional[torch.Tensor] = None):
+    def forward(self, videos: torch.Tensor, state_pair: Optional[torch.Tensor] = None):
         """
         Args:
-            feature_pair: [B, T, N, D]  # 输入特征
+            videos: 视频帧张量，形状取决于 VJEPAEncoder 的实现，例如 [B, T, C, H, W]
             state_pair: [B, T, state_dim] # 可选的状态信息，用于状态差预测
         Returns:
-            tuple: (recon, perplexity, indices, delta_s_pred)
-                recon: [B, N, D] 重建的下一帧patch特征
+            tuple: (recon, perplexity, indices, delta_s_pred, features)
+                recon: [B, N, D] 重建的下一帧 patch 特征
                 perplexity: 标量 VQ困惑度
                 indices: [B, num_queries] VQ索引
                 delta_s_pred: [B, 3] 预测的状态差（如果启用）或 None
+                features: [B, T, N, D] 由视觉编码器得到的特征
         """
-        return self._run(feature_pair=feature_pair, user_specific=None, vq_training=True)
+        return self._run(videos=videos, vq_training=True)
 
+
+    
     def _run(
         self,
-        feature_pair: torch.Tensor,
+        videos: torch.Tensor,
         user_specific: Optional[int] = None,
         vq_training: bool = True,
     ):
         """统一的执行路径，仅在 VQ 调用上区分训练/推理。
         Args:
-            feature_pair: [B, T, N, D]
+            videos: 原始视频帧张量
             user_specific: 指定 codebook（仅推理时生效）
             vq_training: True 使用 self.vq(...)，False 使用 self.vq.inference(...)
         Returns:
-            (recon, perplexity, indices, delta_s_pred)
+            (recon, perplexity, indices, delta_s_pred, features)
         """
-        nodes = self.encoder(feature_pair)  # [B, num_queries, code_dim]
+        # 冻结视觉编码器参数，与原 Lightning 行为保持一致
+        with torch.no_grad():
+            features = self.vision_encoder.encode_video_frames(videos)
+
+        nodes = self.encoder(features)  # [B, num_queries, code_dim]
         if vq_training:
             quantized, perplexity, indices = self.vq(nodes)
         else:
             quantized, perplexity, indices = self.vq.inference(nodes, user_specific=user_specific)
 
-        recon = self.decoder(feature_pair[:, 0], quantized)
+        recon = self.decoder(features[:, 0], quantized)
 
         delta_s_pred = None
         if self.enable_state_delta_prediction:
             delta_s_pred = self.state_delta_predictor(quantized)
 
-        return recon, perplexity, indices, delta_s_pred
+        return recon, perplexity, indices, delta_s_pred, features
+
+
+    def inference(self, videos: torch.Tensor, user_specific=None):
+        return self._run(videos=videos, user_specific=user_specific, vq_training=False)
 
     @torch.no_grad()
-    def inference(self, feature_pair: torch.Tensor, user_specific=None, return_indices: bool = True):
+    def vq_encode(self, videos: torch.Tensor, user_specific=None):
         """
-        推理流程：编码 -> VQ.inference(user_specific) -> 解码
+        推理流程：videos -> 视觉编码 -> 编码 -> VQ.inference(user_specific) -> 解码
         Args:
-            feature_pair: [B, T, N, D]
+            videos: 输入视频帧张量
             user_specific: int or list, 指定VQ codebook索引
             return_indices: 保留参数（无效，保持兼容）
         Returns:
@@ -592,11 +605,19 @@ class LatentLAMModel(nn.Module):
                 indices: [B, num_queries]
                 delta_s_pred: [B, 3] 或 None（若未启用）
         """
-        return self._run(
-            feature_pair=feature_pair,
+        
+        recon, perplexity, indices, delta_s_pred, features =  self._run(
+            videos=videos,
             user_specific=user_specific,
             vq_training=False,
         )
+        return {
+            'recon': recon,
+            'perplexity': perplexity,
+            'indices': indices,
+            'delta_s_pred': delta_s_pred,
+            'features': features,
+        }
 
 
 

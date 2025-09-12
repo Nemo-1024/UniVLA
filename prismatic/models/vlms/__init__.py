@@ -1,1 +1,1 @@
-from .prismatic import PrismaticVLM
+from .hf_vlm import PrismaticVLM

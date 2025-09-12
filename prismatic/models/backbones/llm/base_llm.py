@@ -29,8 +29,8 @@ from prismatic.overwatch import initialize_overwatch
 # Suppress HF Deprecation Warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Initialize Overwatch =>> Wraps `logging.Logger`
-overwatch = initialize_overwatch(__name__)
+# # Initialize Overwatch =>> Wraps `logging.Logger`
+# overwatch = initialize_overwatch(__name__)
 
 
 # === Abstract Base Class for arbitrary HF LLM Backbones ===

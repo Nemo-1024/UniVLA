@@ -10,13 +10,18 @@ from typing import Tuple, Type
 
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
-
+import torch.nn as nn
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import EpisodicRLDSDataset, RLDSBatchTransform, RLDSBatchTransformLatentAction, RLDSDataset
-
+import torchvision.transforms as transforms
+from latent_action_model.core.lam_model import LatentLAMModel
+import torch
+# 使用 timm 的 ImageNet 标准化参数
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 def get_vla_dataset_and_collator(
     data_root_dir: Path,
@@ -24,7 +29,7 @@ def get_vla_dataset_and_collator(
     image_transform: ImageTransform,
     tokenizer: PreTrainedTokenizerBase,
     prompt_builder_fn: Type[PromptBuilder],
-    default_image_resolution: Tuple[int, int, int],
+    default_image_resolution: int,
     padding_side: str = "right",
     predict_stop_token: bool = True,
     shuffle_buffer_size: int = 100_000,
@@ -47,7 +52,7 @@ def get_vla_dataset_and_collator(
         data_root_dir,
         data_mix,
         batch_transform,
-        resize_resolution=default_image_resolution[1:],
+        resize_resolution=(default_image_resolution,default_image_resolution),
         shuffle_buffer_size=shuffle_buffer_size,
         train=train,
         image_aug=image_aug,
@@ -59,32 +64,36 @@ def get_vla_dataset_and_collator(
 def get_latent_vla_dataset_and_collator(
     data_root_dir: Path,
     data_mix: str,
-    image_transform: ImageTransform,
-    image_transform_lam: ImageTransform,
-    latent_action_tokenizer: PreTrainedTokenizerBase, 
+    latent_action_model: LatentLAMModel,
     tokenizer: PreTrainedTokenizerBase,
-    prompt_builder_fn: Type[PromptBuilder],
-    default_image_resolution: Tuple[int, int, int],
+    default_image_resolution: int,
     padding_side: str = "right",
     predict_stop_token: bool = True,
     shuffle_buffer_size: int = 100_000,
     train: bool = True,
     episodic: bool = False,
     image_aug: bool = False,
-) -> Tuple[Dataset, ActionTokenizer, PaddedCollatorForActionPrediction]:
+) -> Tuple[Dataset, PreTrainedTokenizerBase, PaddedCollatorForActionPrediction]:
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
     # action_tokenizer = ActionTokenizer(tokenizer)
 
+    image_transform = transforms.Compose([transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
+
+    image_transform_lam =transforms.Compose([transforms.Resize((256,256)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
+
+
     batch_transform = RLDSBatchTransformLatentAction(
-        action_tokenizer=latent_action_tokenizer,
+        action_tokenizer=latent_action_model,
         base_tokenizer=tokenizer,
         image_transform=image_transform,
         image_transform_lam=image_transform_lam,
-        prompt_builder_fn=prompt_builder_fn
     )
-
+    #151667 原为"<think>"，但用不到，所以用int(151667)
     collator = PaddedCollatorForActionPrediction(
-        tokenizer.model_max_length, tokenizer.pad_token_id, padding_side=padding_side
+        tokenizer.model_max_length, int(151667), padding_side=padding_side
     )
 
 
@@ -94,7 +103,7 @@ def get_latent_vla_dataset_and_collator(
         data_root_dir,
         data_mix,
         batch_transform,
-        resize_resolution=default_image_resolution[1:],
+        resize_resolution=(default_image_resolution, default_image_resolution),
         shuffle_buffer_size=shuffle_buffer_size,
         train=train,
         image_aug=image_aug,

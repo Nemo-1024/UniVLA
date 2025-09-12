@@ -55,11 +55,11 @@ class VJEPAEncoder(nn.Module):
         self.model_id = model_id
         
         # 模型组件
-        self.encoder = None
+        # self.encoder = None
         self.feature_dim = 1024  # V-JEPA2 ViT Large 特征维度
         
         #  标准化转换
-        self.ImageNet_transform = transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
+        # self.ImageNet_transform = transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
         
         # 加载模型
         self._load_model()
@@ -72,30 +72,26 @@ class VJEPAEncoder(nn.Module):
     
     def _load_model(self):
         """加载V-JEPA2模型编码器部分"""
-        print(f"🔄 加载V-JEPA2编码器...")
+        # print(f"🔄 加载V-JEPA2编码器...")
         
-        try:
-            # 加载V-JEPA2模型 (编码器+预测器的tuple)
-            model= torch.hub.load('facebookresearch/vjepa2', self.model_id)
-            # print(type(model), dir(model))
-            encoder,_ = model
+     
+        # 加载V-JEPA2模型 (编码器+预测器的tuple)
+        model= torch.hub.load('facebookresearch/vjepa2', self.model_id)
+        # print(type(model), dir(model))
+        encoder,_ = model
+        
+        # 将编码器注册为子模块（这样参数会被Lightning正确识别）
+        self.encoder = encoder.to(self.device)
+
+        self.encoder.eval()
+        
+        # 冻结参数
+        for param in self.encoder.parameters():
+            param.requires_grad = False
             
-            # 将编码器注册为子模块（这样参数会被Lightning正确识别）
-            self.encoder = encoder
+        # print(f"✅ 编码器加载成功")
             
-            # 移动到指定设备并设置为评估模式
-            self.encoder = self.encoder.to(self.device)
-            self.encoder.eval()
-            
-            # 冻结参数
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-                
-            # print(f"✅ 编码器加载成功")
-            
-        except Exception as e:
-            # print(f"❌ 编码器加载失败: {str(e)}")
-            raise e
+
     
     def _prepare_temporal_input(self, videos: torch.Tensor) -> torch.Tensor:
         """
@@ -113,7 +109,7 @@ class VJEPAEncoder(nn.Module):
         frames = videos.view(-1, C, H, W)  # [B*T, C, H, W]
         
         # 应用 ImageNet 标准化转换
-        frames = self.ImageNet_transform(frames)
+        # frames = self.ImageNet_transform(frames)
         
         # 复制每一帧以满足时间维度步长=2的要求
         frames_duplicated = frames.unsqueeze(2).repeat(1, 1, 2, 1, 1)  # [B*T, C, 2, H, W]

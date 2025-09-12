@@ -10,6 +10,7 @@ from typing import Callable, Dict, Sequence, Tuple, Any
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
@@ -39,19 +40,26 @@ class PaddedCollatorForLanguageModeling:
         self.dummy_pixel_values = torch.zeros(self.default_image_resolution, dtype=self.pixel_values_dtype)
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids_list, labels_list = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
 
         # For now, we only support Tokenizers with `padding_side = "right"` during Training (but plan to extend!)
         #   => Handle padding via RNN Utils => `pad_sequence`
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
-        labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        # Build attention mask from original sequence lengths to allow using <eos> as padding
+        seq_lengths = [min(t.size(0), self.model_max_length) for t in input_ids_list]
+        input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
+        labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
 
         # Truncate (if necessary)
         input_ids, labels = input_ids[:, : self.model_max_length], labels[:, : self.model_max_length]
 
-        # Get `attention_mask` by checking for `pad_token_id`
-        attention_mask = input_ids.ne(self.pad_token_id)
+        # Build `attention_mask` from sequence lengths (not value equality), so real <eos> tokens aren't masked
+        attention_mask = pad_sequence(
+            [torch.ones(l, dtype=torch.bool) for l in seq_lengths],
+            batch_first=True,
+            padding_value=0,
+        )
+        attention_mask = attention_mask[:, : input_ids.size(1)]
 
         # === Handle "unimodal" (language-only) vs. "multimodal" ===
 
@@ -100,7 +108,7 @@ class PaddedCollatorForActionPrediction:
     pixel_values_dtype: torch.dtype = torch.float32
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids_list, labels_list = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
@@ -110,14 +118,29 @@ class PaddedCollatorForActionPrediction:
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
-        labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        # Target padded sequence length
+        target_len = 350
 
-        # Truncate (if necessary)
-        input_ids, labels = input_ids[:, : self.model_max_length], labels[:, : self.model_max_length]
+        # Build attention lengths from original sequence lengths (cap at target_len)
+        seq_lengths = [min(t.size(0), target_len) for t in input_ids_list]
 
-        # Get `attention_mask` by checking for `pad_token_id`
-        attention_mask = input_ids.ne(self.pad_token_id)
+        # Pad sequences to the longest in batch first
+        input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
+        labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
+
+        # Right-truncate to target_len if necessary
+        input_ids = input_ids[:, :target_len]
+        labels = labels[:, :target_len]
+
+        # Right-pad to target_len if necessary
+        if input_ids.size(1) < target_len:
+            pad_amt = target_len - input_ids.size(1)
+            input_ids = F.pad(input_ids, (0, pad_amt), value=self.pad_token_id)
+            labels = F.pad(labels, (0, pad_amt), value=IGNORE_INDEX)
+
+        # Build attention_mask from lengths (True for real tokens, False for padding), shape [B, target_len]
+        lengths_tensor = torch.tensor(seq_lengths, dtype=torch.long)
+        attention_mask = (torch.arange(target_len, dtype=torch.long).unsqueeze(0) < lengths_tensor.unsqueeze(1))
 
         # [Contract] For VLA Training =>> No "Unimodal" Data!
         assert all([pv is not None for pv in pixel_values]), "Invalid VLA Example with `pixel_values = None`!"
@@ -151,7 +174,7 @@ class PaddedCollatorForActionPrediction_LIBERO:
     pixel_values_dtype: torch.dtype = torch.float32
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids_list, labels_list = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
@@ -161,14 +184,21 @@ class PaddedCollatorForActionPrediction_LIBERO:
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
-        labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        # Build attention mask from original sequence lengths to allow using <eos> as padding
+        seq_lengths = [min(t.size(0), self.model_max_length) for t in input_ids_list]
+        input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
+        labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
 
         # Truncate (if necessary)
         input_ids, labels = input_ids[:, : self.model_max_length], labels[:, : self.model_max_length]
 
-        # Get `attention_mask` by checking for `pad_token_id`
-        attention_mask = input_ids.ne(self.pad_token_id)
+        # Build `attention_mask` from sequence lengths (not value equality), so real <eos> tokens aren't masked
+        attention_mask = pad_sequence(
+            [torch.ones(l, dtype=torch.bool) for l in seq_lengths],
+            batch_first=True,
+            padding_value=0,
+        )
+        attention_mask = attention_mask[:, : input_ids.size(1)]
 
         # For low-level policy training
         actions = [torch.from_numpy(instance["actions"]) for instance in instances]

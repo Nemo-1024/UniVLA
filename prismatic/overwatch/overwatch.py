@@ -14,25 +14,54 @@ from typing import Any, Callable, ClassVar, Dict, MutableMapping, Tuple, Union
 # Overwatch Default Format String
 RICH_FORMATTER, DATEFMT = "| >> %(message)s", "%m/%d [%H:%M:%S]"
 
-# Set Logging Configuration
-LOG_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": True,
-    "formatters": {"simple-console": {"format": RICH_FORMATTER, "datefmt": DATEFMT}},
-    "handlers": {
-        "console": {
-            "class": "rich.logging.RichHandler",
-            "formatter": "simple-console",
-            "markup": True,
-            "rich_tracebacks": True,
-            "show_level": True,
-            "show_path": True,
-            "show_time": True,
+# Idempotent root logging configuration (avoid clobbering third-party loggers)
+_LOGGING_CONFIGURED = False
+
+
+def _configure_root_logging_once() -> None:
+    """Configure the root logger once with Rich (fallback to StreamHandler if Rich is unavailable).
+
+    This avoids disabling existing loggers and only attaches handlers if none are present.
+    """
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+
+    # If root already has handlers (configured by the app), do not reconfigure
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        _LOGGING_CONFIGURED = True
+        return
+
+    try:
+        # Prefer RichHandler when available
+        LOG_CONFIG = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {"simple-console": {"format": RICH_FORMATTER, "datefmt": DATEFMT}},
+            "handlers": {
+                "console": {
+                    "class": "rich.logging.RichHandler",
+                    "formatter": "simple-console",
+                    "markup": True,
+                    "rich_tracebacks": True,
+                    "show_level": True,
+                    "show_path": True,
+                    "show_time": True,
+                }
+            },
+            "root": {"level": "INFO", "handlers": ["console"]},
         }
-    },
-    "root": {"level": "INFO", "handlers": ["console"]},
-}
-logging.config.dictConfig(LOG_CONFIG)
+        logging.config.dictConfig(LOG_CONFIG)
+    except Exception:
+        # Fallback to a simple StreamHandler without Rich
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(fmt=RICH_FORMATTER, datefmt=DATEFMT)
+        handler.setFormatter(formatter)
+        root_logger.setLevel(logging.INFO)
+        root_logger.addHandler(handler)
+
+    _LOGGING_CONFIGURED = True
 
 
 # === Custom Contextual Logging Logic ===
@@ -41,7 +70,11 @@ class ContextAdapter(LoggerAdapter):
 
     def process(self, msg: str, kwargs: MutableMapping[str, Any]) -> Tuple[str, MutableMapping[str, Any]]:
         ctx_level = kwargs.pop("ctx_level", 0)
-        return f"{self.CTX_PREFIXES[ctx_level]}{msg}", kwargs
+        prefix = self.CTX_PREFIXES.get(ctx_level)
+        if prefix is None:
+            indent = 4 + (ctx_level * 4)
+            prefix = "|=> ".rjust(indent)
+        return f"{prefix}{msg}", kwargs
 
 
 class DistributedOverwatch:
@@ -139,9 +172,35 @@ class PureOverwatch:
         return 0
 
     @staticmethod
+    def local_rank() -> int:
+        return 0
+
+    @staticmethod
     def world_size() -> int:
         return 1
 
 
 def initialize_overwatch(name: str) -> Union[DistributedOverwatch, PureOverwatch]:
-    return DistributedOverwatch(name) if int(os.environ.get("WORLD_SIZE", -1)) != -1 else PureOverwatch(name)
+    """Factory for an Overwatch logger instance; configures root logging once.
+
+    Chooses a distributed-aware variant when a multi-process environment is detected and `accelerate` is available.
+    """
+    _configure_root_logging_once()
+
+    world_size_env = os.environ.get("WORLD_SIZE")
+    try:
+        world_size = int(world_size_env) if world_size_env is not None else -1
+    except ValueError:
+        world_size = -1
+
+    if world_size != -1:
+        try:
+            return DistributedOverwatch(name)
+        except Exception:
+            # Fallback gracefully if accelerate is unavailable or misconfigured
+            logging.getLogger(__name__).warning(
+                "Falling back to PureOverwatch due to distributed initialization issue."
+            )
+            return PureOverwatch(name)
+    else:
+        return PureOverwatch(name)

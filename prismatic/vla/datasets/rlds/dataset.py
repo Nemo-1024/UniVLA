@@ -434,7 +434,7 @@ def apply_trajectory_transforms(
         transform = traj_transforms.chunk_act_obs_half_stride    # 半步长，平衡重叠
         # transform = traj_transforms.chunk_act_obs               # 标准版本，无重叠
     else:       
-        transform = traj_transforms.chunk_act_obs               # 标准版本，无重叠
+        transform = traj_transforms.chunk_act_obs_half_stride               # 标准版本，无重叠
 
     dataset = dataset.traj_map(
         partial(

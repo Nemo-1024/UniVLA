@@ -12,7 +12,6 @@ import dlimp as dl
 import tensorflow as tf
 from absl import logging
 
-
 def center_crop_and_resize_tf(image: tf.Tensor, target_size: Tuple[int, int]) -> tf.Tensor:
     """
     对图像进行短边中心裁剪并缩放到目标尺寸，保持物体比例关系不变
@@ -25,8 +24,9 @@ def center_crop_and_resize_tf(image: tf.Tensor, target_size: Tuple[int, int]) ->
         处理后的图像张量，形状为 [target_height, target_width, C]
     """
     # 获取图像尺寸
-    shape = tf.shape(image)
-    height, width = shape[0], shape[1]
+    shape = tf.shape(image, out_type=tf.int32)
+    height = tf.gather(shape, 0)
+    width = tf.gather(shape, 1)
     
     # 找到短边长度作为裁剪尺寸
     crop_size = tf.minimum(height, width)
@@ -34,6 +34,8 @@ def center_crop_and_resize_tf(image: tf.Tensor, target_size: Tuple[int, int]) ->
     # 计算中心裁剪的起始位置
     offset_height = (height - crop_size) // 2
     offset_width = (width - crop_size) // 2
+
+    # 保持严格中心裁剪，避免在 tf.data 图模式中引入不必要的随机性
     
     # 执行中心裁剪
     image_cropped = tf.image.crop_to_bounding_box(
@@ -79,7 +81,7 @@ def augment(obs: Dict, seed: tf.Tensor, augment_kwargs: Union[Dict, Dict[str, Di
             lambda: dl.transforms.augment_image(
                 obs[f"image_{name}"],
                 **kwargs,
-                seed=seed + i,  # augment each camera key differently
+                seed=seed + tf.ones_like(seed) * tf.cast(i, seed.dtype),  # augment each camera key differently
             ),                                                                                                                                                                                                                                                                                                            
             lambda: obs[f"image_{name}"],  # skip padding images
         )
@@ -95,14 +97,12 @@ def decode_and_resize(
     """Decodes images and depth images, and then optionally resizes them."""
     image_names = {key[6:] for key in obs if key.startswith("image_")}
     depth_names = {key[6:] for key in obs if key.startswith("depth_")}
-    print('image_names', image_names)
-    # print('depth_names', depth_names)
+    
     if isinstance(resize_size, tuple):
         resize_size = {name: resize_size for name in image_names}
     if isinstance(depth_resize_size, tuple):
         depth_resize_size = {name: depth_resize_size for name in depth_names}
 
-    print('keys', obs.keys())
     for name in image_names:
         if name not in resize_size:
             logging.warning(
@@ -118,6 +118,8 @@ def decode_and_resize(
                 image = tf.io.decode_image(image, expand_animations=False, dtype=tf.uint8)
         elif image.dtype != tf.uint8:
             raise ValueError(f"Unsupported image dtype: found image_{name} with dtype {image.dtype}")
+        # 显式转为 Tensor 以帮助类型检查
+        image = tf.convert_to_tensor(image)
         if name in resize_size:
             # 使用center crop + resize 保持物体比例关系不变
             image = center_crop_and_resize_tf(image, target_size=resize_size[name])
@@ -135,9 +137,13 @@ def decode_and_resize(
             if tf.strings.length(depth) == 0:
                 depth = tf.zeros((*depth_resize_size.get(name, (1, 1)), 1), dtype=tf.float32)
             else:
-                depth = tf.io.decode_image(depth, expand_animations=False, dtype=tf.float32)[..., 0]
+                depth = tf.io.decode_image(depth, expand_animations=False, dtype=tf.float32)
+                # 取第 0 个通道并保留通道维度
+                depth = tf.gather(depth, indices=[0], axis=-1)
         elif depth.dtype != tf.float32:
             raise ValueError(f"Unsupported depth dtype: found depth_{name} with dtype {depth.dtype}")
+        # 显式转为 Tensor 以帮助类型检查
+        depth = tf.convert_to_tensor(depth)
 
         if name in depth_resize_size:
             depth = dl.transforms.resize_depth_image(depth, size=depth_resize_size[name])

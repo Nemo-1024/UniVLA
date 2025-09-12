@@ -12,7 +12,6 @@ from accelerate import PartialState
 import wandb
 # 导入 core 中的模型组件
 from .lam_model import LatentLAMModel, PhysicalGroundingLoss
-from .vjepa_encoder import VJEPAEncoder
 import logging
 logging.basicConfig(format='%(message)s', level=logging.INFO)
 
@@ -57,11 +56,8 @@ class VJEPA_LAM(LightningModule):
         # 保存超参数
         self.save_hyperparameters()
         
-        # 初始化视觉编码器 (V-JEPA2)
-        self.vision_encoder = VJEPAEncoder()
-        
         # 初始化 LAM 模型
-        self.lam_model = LatentLAMModel(
+        self.lam = LatentLAMModel(
             dim=dim,
             enc_layers=enc_layers,
             codebook_size=codebook_size,
@@ -142,15 +138,11 @@ class VJEPA_LAM(LightningModule):
             (loss, logs)
         """
         videos = batch["videos"]
-        # 冻结视觉编码器，训练与推理一致
-        with torch.no_grad():
-            features = self.vision_encoder.encode_video_frames(videos)
-
-        # VQ 路径区分在模型内部
+        # VQ 路径区分在模型内部（视觉编码也已迁移到 LAM 内部）
         if vq_training:
-            recon, perplexity, indices, delta_s_pred = self.lam_model(features.detach())
+            recon, perplexity, indices, delta_s_pred, features = self.lam(videos)
         else:
-            recon, perplexity, indices, delta_s_pred = self.lam_model.inference(features)
+            recon, perplexity, indices, delta_s_pred, features = self.lam.inference(videos)
 
         target = features[:, 1]
         # recon_loss = F.mse_loss(recon, target)
@@ -245,13 +237,13 @@ class VJEPA_LAM(LightningModule):
     def on_train_epoch_end(self):
         """训练 epoch 结束时的回调"""
         # 1. 先替换未使用的码本条目（基于当前的使用统计）
-        if hasattr(self.lam_model.vq, 'replace_unused_codebooks'):
+        if hasattr(self.lam.vq, 'replace_unused_codebooks'):
             # 这里需要传入累计的批次数，可以根据实际情况调整
-            self.lam_model.vq.replace_unused_codebooks()
+            self.lam.vq.replace_unused_codebooks()
         
         # 2. 然后重置码本使用统计（为下一个 epoch 做准备）
-        if hasattr(self.lam_model.vq, 'reset_node_count'):
-            self.lam_model.vq.reset_node_count()
+        if hasattr(self.lam.vq, 'reset_node_count'):
+            self.lam.vq.reset_node_count()
 
     def on_test_epoch_end(self):
         """测试 epoch 结束时的回调 - 保存索引和可视化"""
@@ -261,12 +253,12 @@ class VJEPA_LAM(LightningModule):
             os.makedirs(self.output_dir, exist_ok=True)
             
             # 获取使用频率最高的码本索引
-            if hasattr(self.lam_model.vq, 'node_count'):
-                usage = self.lam_model.vq.node_count
+            if hasattr(self.lam.vq, 'node_count'):
+                usage = self.lam.vq.node_count
                 top_indices = torch.topk(usage, min(16, self.codebook_size), largest=True, sorted=True).indices
                 
                 # 保存 top latents
-                top_latents = self.lam_model.vq.codebooks[top_indices]
+                top_latents = self.lam.vq.codebooks[top_indices]
                 torch.save(top_latents, f"{self.output_dir}/top_16.pt")
                 
                 # 保存索引列表
@@ -274,9 +266,9 @@ class VJEPA_LAM(LightningModule):
                     f.write(" ".join([str(i.item()) for i in top_indices]))
         
         # 绘制使用分布图
-        if hasattr(self.lam_model.vq, 'node_count'):
-            self.plot_usage_distribution(self.lam_model.vq.node_count, "unsorted_usage")
-            sorted_usage, _ = torch.sort(self.lam_model.vq.node_count)
+        if hasattr(self.lam.vq, 'node_count'):
+            self.plot_usage_distribution(self.lam.vq.node_count, "unsorted_usage")
+            sorted_usage, _ = torch.sort(self.lam.vq.node_count)
             self.plot_usage_distribution(sorted_usage, "sorted_usage")
 
     def plot_usage_distribution(self, usage, filename):
@@ -332,31 +324,3 @@ class VJEPA_LAM(LightningModule):
         
         return loss
         
-    # TODO: 添加用户指定码本的推理
-    @torch.no_grad()
-    def inference_with_user_specific(self, batch: Dict, user_specific: Optional[int] = None) -> Dict:
-        """
-        使用用户指定码本的推理
-        
-        Args:
-            batch: 输入批次数据
-            user_specific: 用户指定的码本索引
-            
-        Returns:
-            Dict: 推理结果
-        """
-        videos = batch['videos']
-        
-        # 提取特征
-        features = self.vision_encoder.encode_video_frames(videos)
-        
-        # 推理，对齐 forward 接口
-        recon, perplexity, indices, delta_s_pred = self.lam_model.inference(features, user_specific=user_specific)
-        
-        return {
-            'indices': indices,
-            'recon': recon,
-            'features': features,
-            'delta_s_pred': delta_s_pred,
-            'perplexity': perplexity,
-        }

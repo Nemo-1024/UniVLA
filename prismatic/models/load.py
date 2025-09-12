@@ -35,7 +35,8 @@ def available_models() -> List[str]:
 
 
 def available_model_names() -> List[str]:
-    return list(GLOBAL_REGISTRY.items())
+    # 返回注册表中可读名称列表
+    return list(GLOBAL_REGISTRY.keys())
 
 
 def get_model_description(model_id_or_name: str) -> str:
@@ -55,7 +56,11 @@ def load(
     cache_dir: Optional[Union[str, Path]] = None,
     load_for_training: bool = False,
 ) -> PrismaticVLM:
-    """Loads a pretrained PrismaticVLM from either local disk or the HuggingFace Hub."""
+    """加载预训练 VLM。
+
+    - 若 `model_id_or_path` 是有效目录，则维持旧逻辑读取 `config.json` + `.pt`。
+    - 否则：直接将其视为 Hugging Face model id，使用 `PrismaticVLM.from_pretrained(model_id_or_path)` 加载。
+    """
     if os.path.isdir(model_id_or_path):
         overwatch.info(f"Loading from local path `{(run_dir := Path(model_id_or_path))}`")
 
@@ -63,58 +68,32 @@ def load(
         config_json, checkpoint_pt = run_dir / "config.json", run_dir / "checkpoints" / "latest-checkpoint.pt"
         assert config_json.exists(), f"Missing `config.json` for `{run_dir = }`"
         assert checkpoint_pt.exists(), f"Missing checkpoint for `{run_dir = }`"
-    else:
-        if model_id_or_path not in GLOBAL_REGISTRY:
-            raise ValueError(f"Couldn't find `{model_id_or_path = }; check `prismatic.available_model_names()`")
 
-        overwatch.info(f"Downloading `{(model_id := GLOBAL_REGISTRY[model_id_or_path]['model_id'])} from HF Hub")
-        with overwatch.local_zero_first():
-            config_json = hf_hub_download(repo_id=HF_HUB_REPO, filename=f"{model_id}/config.json", cache_dir=cache_dir)
-            checkpoint_pt = hf_hub_download(
-                repo_id=HF_HUB_REPO, filename=f"{model_id}/checkpoints/latest-checkpoint.pt", cache_dir=cache_dir
-            )
+        with open(config_json, "r") as f:
+            model_cfg = json.load(f)["model"]
 
-    # Load Model Config from `config.json`
-    with open(config_json, "r") as f:
-        model_cfg = json.load(f)["model"]
+        overwatch.info(
+            f"Found Config =>> Loading & Freezing [bold blue]{model_cfg['model_id']}[/] with:\n"
+            f"             Checkpoint Path =>> [underline]`{checkpoint_pt}`[/]"
+        )
 
-    # = Load Individual Components necessary for Instantiating a VLM =
-    #   =>> Print Minimal Config
-    overwatch.info(
-        f"Found Config =>> Loading & Freezing [bold blue]{model_cfg['model_id']}[/] with:\n"
-        f"             Vision Backbone =>> [bold]{model_cfg['vision_backbone_id']}[/]\n"
-        f"             LLM Backbone    =>> [bold]{model_cfg['llm_backbone_id']}[/]\n"
-        f"             Arch Specifier  =>> [bold]{model_cfg['arch_specifier']}[/]\n"
-        f"             Checkpoint Path =>> [underline]`{checkpoint_pt}`[/]"
-    )
+        # 直接通过 HF 入口加载底层模型（兼容 trust_remote_code 的权重）
+        vlm = PrismaticVLM.from_pretrained(
+            run_dir.as_posix(),
+            token=hf_token,
+            cache_dir=cache_dir,
+            trust_remote_code=True,
+        )
+        return vlm
 
-    # Load Vision Backbone
-    overwatch.info(f"Loading Vision Backbone [bold]{model_cfg['vision_backbone_id']}[/]")
-    vision_backbone, image_transform = get_vision_backbone_and_transform(
-        model_cfg["vision_backbone_id"],
-        model_cfg["image_resize_strategy"],
-    )
-
-    # Load LLM Backbone --> note `inference_mode = True` by default when calling `load()`
-    overwatch.info(f"Loading Pretrained LLM [bold]{model_cfg['llm_backbone_id']}[/] via HF Transformers")
-    llm_backbone, tokenizer = get_llm_backbone_and_tokenizer(
-        model_cfg["llm_backbone_id"],
-        llm_max_length=model_cfg.get("llm_max_length", 2048),
-        hf_token=hf_token,
-        inference_mode=not load_for_training,
-    )
-
-    # Load VLM using `from_pretrained` (clobbers HF syntax... eventually should reconcile)
-    overwatch.info(f"Loading VLM [bold blue]{model_cfg['model_id']}[/] from Checkpoint")
+    # 不是本地目录：直接视为 HF model id
+    overwatch.info(f"Loading HF model `{model_id_or_path}` via Auto* classes")
     vlm = PrismaticVLM.from_pretrained(
-        checkpoint_pt,
-        model_cfg["model_id"],
-        vision_backbone,
-        llm_backbone,
-        arch_specifier=model_cfg["arch_specifier"],
-        freeze_weights=not load_for_training,
+        str(model_id_or_path),
+        token=hf_token,
+        cache_dir=cache_dir,
+        trust_remote_code=True,
     )
-
     return vlm
 
 
@@ -152,8 +131,10 @@ def load_vla(
             raise ValueError(f"Couldn't find valid HF Hub Path `{hf_path = }`")
 
         # Identify Checkpoint to Load (via `step_to_load`)
-        step_to_load = f"{step_to_load:06d}" if step_to_load is not None else None
-        valid_ckpts = tmpfs.glob(f"{hf_path}/checkpoints/step-{step_to_load if step_to_load is not None else ''}*.pt")
+        step_to_load_str = f"{step_to_load:06d}" if step_to_load is not None else None
+        valid_ckpts = tmpfs.glob(
+            f"{hf_path}/checkpoints/step-{step_to_load_str if step_to_load_str is not None else ''}*.pt"
+        )
         if (len(valid_ckpts) == 0) or (step_to_load is not None and len(valid_ckpts) != 1):
             raise ValueError(f"Couldn't find a valid checkpoint to load from HF Hub Path `{hf_path}/checkpoints/")
 
@@ -185,48 +166,16 @@ def load_vla(
     # = Load Individual Components necessary for Instantiating a VLA (via base VLM components) =
     #   =>> Print Minimal Config
     overwatch.info(
-        f"Found Config =>> Loading & Freezing [bold blue]{model_cfg.model_id}[/] with:\n"
-        f"             Vision Backbone =>> [bold]{model_cfg.vision_backbone_id}[/]\n"
-        f"             LLM Backbone    =>> [bold]{model_cfg.llm_backbone_id}[/]\n"
-        f"             Arch Specifier  =>> [bold]{model_cfg.arch_specifier}[/]\n"
-        f"             Checkpoint Path =>> [underline]`{checkpoint_pt}`[/]"
+        f"Found Config =>> Loading & Freezing [bold blue]{model_cfg.model_id}[/] with checkpoint `{checkpoint_pt}`"
     )
 
-    # Load Vision Backbone
-    overwatch.info(f"Loading Vision Backbone [bold]{model_cfg.vision_backbone_id}[/]")
-    vision_backbone, image_transform = get_vision_backbone_and_transform(
-        model_cfg.vision_backbone_id,
-        model_cfg.image_resize_strategy,
-    )
+    # 直接通过 HF Auto 类加载 VLA（通过其 trust_remote_code 实现）
+    from transformers import AutoModelForVision2Seq, AutoProcessor
 
-    # Load LLM Backbone --> note `inference_mode = True` by default when calling `load()`
-    overwatch.info(f"Loading Pretrained LLM [bold]{model_cfg.llm_backbone_id}[/] via HF Transformers")
-    llm_backbone, tokenizer = get_llm_backbone_and_tokenizer(
-        model_cfg.llm_backbone_id,
-        llm_max_length=model_cfg.llm_max_length,
-        hf_token=hf_token,
-        inference_mode=not load_for_training,
-    )
-
-    # Create Action Tokenizer
-    action_tokenizer = ActionTokenizer(llm_backbone.get_tokenizer())
-
-    # Add special tokens and resize embeddings
-    # special_tokens_dict = {'additional_special_tokens': [f'<ACT_{i}>' for i in range(action_codebook_size)]}
-    # num_added_toks = action_tokenizer.add_special_tokens(special_tokens_dict)
-    # llm_backbone.llm.resize_token_embeddings(32033)
-
-    # Load VLM using `from_pretrained` (clobbers HF syntax... eventually should reconcile)
-    overwatch.info(f"Loading VLA [bold blue]{model_cfg.model_id}[/] from Checkpoint")
-    vla = Op                                        enVLA.from_pretrained(
-        checkpoint_pt,
-        model_cfg.model_id,
-        vision_backbone,
-        llm_backbone,
-        arch_specifier=model_cfg.arch_specifier,
-        freeze_weights=not load_for_training,
-        norm_stats=norm_stats,
-        action_tokenizer=action_tokenizer,
+    AutoProcessor.register(model_cfg.__class__, None)  # 兼容占位，实际项目中应注册自定义 Processor
+    vla = AutoModelForVision2Seq.from_pretrained(
+        run_dir.as_posix() if os.path.isfile(model_id_or_path) else str(Path(VLA_HF_HUB_REPO) / model_type / model_id_or_path),
+        trust_remote_code=True,
     )
 
     return vla

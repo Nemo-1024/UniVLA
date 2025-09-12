@@ -162,7 +162,9 @@ class random_crop_resize():
 
 
 # center_crop_resize 逻辑已移至 RLDS 阶段的 decode_and_resize 函数中
-
+# 使用 timm 的 ImageNet 标准化参数
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 class LightningOpenX(LightningDataset):
     """
@@ -200,8 +202,11 @@ class LightningOpenX(LightningDataset):
         self.worker_init_fn = set_global_seed(42, get_worker_init_fn=True)
 
         self.batch_transform = RLDSBatchTransformVideo(
-            image_transform=transforms.ToTensor()  # center crop现在在RLDS阶段处理
+            image_transform= transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])  # center crop现在在RLDS阶段处理
         )
+        # self.batch_transform = RLDSBatchTransformVideo(
+        #     image_transform= transforms.Compose([transforms.ToTensor(),])  # center crop现在在RLDS阶段处理
+        # )
         self.collate_fn = CollatorForLatentAction()
 
         self.save_hyperparameters()

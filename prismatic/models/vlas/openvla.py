@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from transformers import LlamaTokenizerFast
 
-from prismatic.models.vlms.prismatic import PrismaticVLM
+from prismatic.models.vlms import PrismaticVLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.vla.action_tokenizer import ActionTokenizer
 
@@ -34,7 +34,7 @@ class OpenVLA(PrismaticVLM):
 
     @torch.inference_mode()
     def predict_action(
-        self, image: Image, instruction: str, unnorm_key: Optional[str] = None, **kwargs: str
+        self, image: Image.Image, instruction: str, unnorm_key: Optional[str] = None, **kwargs: str
     ) -> np.ndarray:
         """
         Core function for VLA inference; maps input image and task instruction to continuous action (de-tokenizes).
@@ -75,10 +75,10 @@ class OpenVLA(PrismaticVLM):
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
         # Invoke super().generate --> taps into `GenerationMixin` which (redirects) to `forward()`
-        autocast_dtype = self.llm_backbone.half_precision_dtype
-        with torch.autocast("cuda", dtype=autocast_dtype, enabled=self.enable_mixed_precision_training):
+        autocast_dtype = torch.float16
+        with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             # fmt: off
-            generated_ids = super(PrismaticVLM, self).generate(
+            generated_ids = self.generate(
                 input_ids=input_ids,                            # Shape: [1, seq]
                 pixel_values=pixel_values,                      # Shape: [1, 3, res, res] or Dict[str, ...]
                 max_new_tokens=self.get_action_dim(unnorm_key),
@@ -103,7 +103,7 @@ class OpenVLA(PrismaticVLM):
         return actions
 
     @staticmethod
-    def _check_unnorm_key(norm_stats: Dict, unnorm_key: str) -> str:
+    def _check_unnorm_key(norm_stats: Dict, unnorm_key: Optional[str]) -> str:
         if unnorm_key is None:
             assert len(norm_stats) == 1, (
                 f"Your model was trained on more than one dataset, please pass a `unnorm_key` from the following "
@@ -116,7 +116,7 @@ class OpenVLA(PrismaticVLM):
             unnorm_key in norm_stats
         ), f"The `unnorm_key` you chose is not in the set of available statistics; choose from: {norm_stats.keys()}"
 
-        return unnorm_key
+        return str(unnorm_key)
 
     def get_action_dim(self, unnorm_key: Optional[str] = None) -> int:
         """Dimensionality of the policy's action space."""

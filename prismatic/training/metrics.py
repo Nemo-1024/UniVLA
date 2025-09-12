@@ -89,10 +89,33 @@ class WeightsBiasesTracker:
     @staticmethod
     def finalize() -> None:
         if overwatch.is_rank_zero():
-            wandb.finish()
+            try:
+                wandb.finish()
+            except Exception:
+                pass
+        # 移除长时间 sleep，避免阻塞
+        return
 
-        # A job gets 210 seconds to get its affairs in order
-        time.sleep(210)
+
+class AccelerateTracker:
+    def __init__(self, accelerator, run_id: str, hparams: Dict[str, Any], stage: str) -> None:
+        self.accelerator = accelerator
+        self.run_id = run_id
+        self.hparams = hparams
+        self.stage = stage
+
+    def write_hyperparameters(self) -> None:
+        # 由外部 accelerator.init_trackers 写入，这里无需重复
+        return
+
+    def write(self, global_step: int, metrics: Dict[str, Union[int, float]]) -> None:
+        # 直接通过 accelerator.log 推送
+        safe_metrics = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
+        self.accelerator.log(safe_metrics, step=global_step)
+
+    def finalize(self) -> None:
+        # 由加速器结束时统一处理
+        return
 
 
 # === Core Metrics Container :: Initializes Trackers => Compiles/Pushes Metrics ===
@@ -110,6 +133,7 @@ class Metrics:
         wandb_entity: Optional[str] = None,
         grad_accumulation_steps: int = 1,
         window_size: int = 128,
+        accelerator: Optional[Any] = None,
     ) -> None:
         self.run_id, self.run_dir, self.hparams, self.stage = run_id, run_dir, hparams, stage
 
@@ -122,6 +146,8 @@ class Metrics:
                 tracker = WeightsBiasesTracker(
                     run_id, run_dir, hparams, project=wandb_project, entity=wandb_entity, group=self.stage
                 )
+            elif tracker_type == "accelerate" and accelerator is not None:
+                tracker = AccelerateTracker(accelerator, run_id, hparams, stage)
             else:
                 raise ValueError(f"Tracker with type `{tracker_type} is not supported!")
 
@@ -134,15 +160,36 @@ class Metrics:
         self.state = {
             "loss_raw": deque(maxlen=grad_accumulation_steps),
             "loss": deque(maxlen=window_size),
+            "l1_loss": deque(maxlen=window_size),
+            "action_accuracy": deque(maxlen=window_size),
             "step_time": deque(maxlen=window_size),
             "lr": [],
         }
 
-    def log(self, global_step: int, metrics: Dict[str, Union[int, float]]) -> None:
-        for tracker in self.trackers:
-            tracker.write(global_step, metrics)
+        # Per-dataset rolling buffers for action metrics
+        self.dataset_state: Dict[str, Dict[str, deque]] = defaultdict(
+            lambda: {"l1_loss": deque(maxlen=window_size), "action_accuracy": deque(maxlen=window_size)}
+        )
 
-    def get_status(self, loss: Optional[torch.Tensor] = None) -> str:
+    def log(self, global_step: int, metrics: Dict[str, Union[int, float]]) -> None:
+        safe_metrics: Dict[str, Union[int, float]] = {}
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)):
+                safe_metrics[k] = v
+            elif hasattr(v, "item"):
+                try:
+                    safe_metrics[k] = float(v.item())
+                except Exception:
+                    continue
+            else:
+                try:
+                    safe_metrics[k] = float(v)  # type: ignore[arg-type]
+                except Exception:
+                    continue
+        for tracker in self.trackers:
+            tracker.write(global_step, safe_metrics)
+
+    def get_status(self, loss: Optional[float] = None) -> str:
         lr = self.state["lr"][-1] if len(self.state["lr"]) > 0 else 0
         if loss is None:
             return f"=>> [Global Step] {self.global_step:06d} =>> LR :: {lr:.6f}"
@@ -172,17 +219,38 @@ class Metrics:
         # Generic Keyword Arguments
         for key, value in kwargs.items():
             if key == "loss":
-                loss_val = value.detach()
+                loss_val = value.detach() if hasattr(value, "detach") else torch.tensor(float(value))
                 self.state["loss_raw"].append(loss_val)
                 self.state["loss"].append(loss_val)
+            elif key in {"l1_loss", "action_accuracy"}:
+                val_t = value.detach() if hasattr(value, "detach") else torch.tensor(float(value))
+                self.state[key].append(val_t)
             else:
-                self.state[key].append(value.detach())
+                val_t = value.detach() if hasattr(value, "detach") else torch.tensor(float(value))
+                self.state.setdefault(key, deque(maxlen=128)).append(val_t)
+
+    def commit_for_dataset(self, dataset_name: str, **kwargs) -> None:
+        if not overwatch.is_rank_zero():
+            return
+        ds_buf = self.dataset_state[dataset_name]
+        for key, value in kwargs.items():
+            if key in {"l1_loss", "action_accuracy"}:
+                val = value.detach().item() if hasattr(value, "detach") else float(value)
+                ds_buf[key].append(val)
 
     @overwatch.rank_zero_only
     def push(self) -> str:
         # Note :: Raw Loss is an Average over Gradient Accumulation Steps --> No Smoothing!
-        loss_raw = torch.stack(list(self.state["loss_raw"])).mean().item()
-        loss = torch.stack(list(self.state["loss"])).mean().item()
+        loss_raw = torch.stack(list(self.state["loss_raw"])).mean().item() if len(self.state["loss_raw"]) > 0 else 0.0
+        loss = torch.stack(list(self.state["loss"])).mean().item() if len(self.state["loss"]) > 0 else 0.0
+        l1_loss = (
+            torch.stack(list(self.state["l1_loss"])).mean().item() if len(self.state["l1_loss"]) > 0 else 0.0
+        )
+        action_accuracy = (
+            torch.stack(list(self.state["action_accuracy"])).mean().item()
+            if len(self.state["action_accuracy"]) > 0
+            else 0.0
+        )
         step_time, lr = np.mean(list(self.state["step_time"])), self.state["lr"][-1]
         status = self.get_status(loss)
 
@@ -191,16 +259,29 @@ class Metrics:
         self.log(
             self.global_step,
             metrics={
-                f"{prefix}/Step": self.global_step,
-                f"{prefix}/Loss": loss,
-                f"{prefix}/Loss (Raw)": loss_raw,
-                f"{prefix}/Learning Rate": lr,
-                f"{prefix}/Step Time": step_time,
+                f"{prefix}/Step": int(self.global_step),
+                f"{prefix}/Loss": float(loss),
+                f"{prefix}/L1 Loss": float(l1_loss),
+                f"{prefix}/Action Token Accuracy": float(action_accuracy),
+                f"{prefix}/Loss (Raw)": float(loss_raw),
+                f"{prefix}/Learning Rate": float(lr),
+                f"{prefix}/Step Time": float(step_time),
             },
         )
+
+        # Per-dataset metrics
+        if len(self.dataset_state) > 0:
+            ds_metrics: Dict[str, float] = {}
+            for ds, buf in self.dataset_state.items():
+                if len(buf["l1_loss"]) > 0:
+                    ds_metrics[f"{ds}/L1 Loss"] = float(np.mean(list(buf["l1_loss"])))
+                if len(buf["action_accuracy"]) > 0:
+                    ds_metrics[f"{ds}/Action Token Accuracy"] = float(np.mean(list(buf["action_accuracy"])))
+            if len(ds_metrics) > 0:
+                self.log(self.global_step, metrics=ds_metrics) 
         return status
 
-    def finalize(self) -> str:
+    def finalize(self) -> None:
         for tracker in self.trackers:
             tracker.finalize()
 
@@ -251,13 +332,27 @@ class VLAMetrics:
         }
 
         # Created metrics buffers for individual tracked datasets
-        self.dataset_trackers = defaultdict(lambda: VLAMetrics([], "", "", {}))
+        self.dataset_trackers = defaultdict(lambda: VLAMetrics((), "", Path("."), {}))
 
     def log(self, global_step: int, metrics: Dict[str, Union[int, float]]) -> None:
+        safe_metrics: Dict[str, Union[int, float]] = {}
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)):
+                safe_metrics[k] = v
+            elif hasattr(v, "item"):
+                try:
+                    safe_metrics[k] = float(v.item())
+                except Exception:
+                    continue
+            else:
+                try:
+                    safe_metrics[k] = float(v)  # type: ignore[arg-type]
+                except Exception:
+                    continue
         for tracker in self.trackers:
-            tracker.write(global_step, metrics)
+            tracker.write(global_step, safe_metrics)
 
-    def get_status(self, loss: Optional[torch.Tensor] = None) -> str:
+    def get_status(self, loss: Optional[float] = None) -> str:
         lr = self.state["lr"][-1] if len(self.state["lr"]) > 0 else 0
         if loss is None:
             return f"=>> [Epoch {self.epoch:03d}] Global Step {self.global_step:06d} =>> LR :: {lr:.6f}"
@@ -316,12 +411,20 @@ class VLAMetrics:
         status = self.get_status(loss)
 
         # Get metrics per dataset
-        dataset_metrics = {}
+        dataset_metrics: Dict[str, float] = {}
         for ds, tracker in self.dataset_trackers.items():
             dataset_metrics.update(
                 {
-                    f"{ds}/L1 Loss": torch.stack(list(tracker.state["l1_loss"])).mean().item(),
-                    f"{ds}/Action Token Accuracy": torch.stack(list(tracker.state["action_accuracy"])).mean().item(),
+                    f"{ds}/L1 Loss": float(
+                        torch.stack(list(tracker.state["l1_loss"])) .mean().item()
+                        if len(tracker.state.get("l1_loss", [])) > 0
+                        else 0.0
+                    ),
+                    f"{ds}/Action Token Accuracy": float(
+                        torch.stack(list(tracker.state["action_accuracy"])) .mean().item()
+                        if len(tracker.state.get("action_accuracy", [])) > 0
+                        else 0.0
+                    ),
                 }
             )
 
@@ -330,19 +433,19 @@ class VLAMetrics:
         self.log(
             self.global_step,
             metrics={
-                f"{prefix}/Step": self.global_step,
-                f"{prefix}/Epoch": self.epoch,
-                f"{prefix}/Loss": loss,
-                f"{prefix}/L1 Loss": l1_loss,
-                f"{prefix}/Action Token Accuracy": action_accuracy,
-                f"{prefix}/Loss (Raw)": loss_raw,
-                f"{prefix}/Learning Rate": lr,
-                f"{prefix}/Step Time": step_time,
+                f"{prefix}/Step": int(self.global_step),
+                f"{prefix}/Epoch": int(self.epoch),
+                f"{prefix}/Loss": float(loss),
+                f"{prefix}/L1 Loss": float(l1_loss),
+                f"{prefix}/Action Token Accuracy": float(action_accuracy),
+                f"{prefix}/Loss (Raw)": float(loss_raw),
+                f"{prefix}/Learning Rate": float(lr),
+                f"{prefix}/Step Time": float(step_time),
                 **dataset_metrics,
             },
         )
         return status
 
-    def finalize(self) -> str:
+    def finalize(self) -> None:
         for tracker in self.trackers:
             tracker.finalize()

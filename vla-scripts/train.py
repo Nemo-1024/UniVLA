@@ -1,104 +1,116 @@
 import json
 import os
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict, Any
 
-import draccus
 import torch
 import torch.distributed as dist
-import torchvision.transforms as transforms
 import yaml
-
-from prismatic.conf import VLAConfig, VLARegistry
-from prismatic.models import load, load_vla
+from latent_action_model.core.lam_model import LatentLAMModel
 from prismatic.overwatch import initialize_overwatch
-from prismatic.training import VLAMetrics, get_train_strategy
 from prismatic.util import set_global_seed
 from prismatic.vla import get_latent_vla_dataset_and_collator
+from prismatic.vla.datasets.datasets import RLDSDataset
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from typing import cast
+from prismatic.training.accelerate_fsdp_trainer import run_latent_action_training
+from transformers import AutoProcessor
+from transformers.models.internvl.modeling_internvl import (
+    InternVLForConditionalGeneration,
+)
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
+# 📝 动作 token 列表: ['<ACT_0>', '<ACT_1>', '<ACT_2>', '<ACT_3>', '<ACT_4>', '<ACT_5>', '<ACT_6>', '<ACT_7>', '<ACT_8>', '<ACT_9>', '<ACT_10>', '<ACT_11>', '<ACT_12>', '<ACT_13>', '<ACT_14>', '<ACT_15>']
+# 🔢 对应的 token ID: [151679, 151680, 151681, 151682, 151683, 151684, 151685, 151686, 151687, 151688, 151689, 151690, 151691, 151692, 151693, 151694]
+# 🎯 action_token_begin_id = 151679
+# 📊 ID 范围: 151679 - 151694
 
 @dataclass
 class TrainConfig:
     # fmt: off
 
-    # VLAConfig (`prismatic/conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
-    vla: VLAConfig = field(
-        default_factory=VLAConfig.get_choice_class(VLARegistry.DINOSIGLIP_224PX_MX_BRIDGE.vla_id)
-    )
-    pretrain_vlm: str = '/path/to/your/prism-dinosiglip-224px_7b'
-    lam_path: str = "latent_action_model/logs/task_centric_lam_stage2/epoch=0-step=200000.ckpt"
+    # 冻结策略
+    freeze_vision_backbone: bool = True
+    freeze_llm_backbone: bool = True
+    freeze_last_llm_layer: bool = False
+    freeze_projector: bool = True
 
-    # LAM setting
-    codebook_size: int = 16
-    lam_model_dim: int = 768
-    lam_latent_dim: int = 128
-    lam_patch_size: int = 14
-    lam_enc_blocks: int = 12
-    lam_dec_blocks: int = 12
-    lam_num_heads: int = 12
+    action_token_begin_id: int = 151679
+
+    # 数据混合与缓冲
+    data_mix: str = "droid_100"
+    shuffle_buffer_size: int = 20_000
+    image_resolution: int = 448
+
+    # 训练超参
+    epochs: int = 10
+    max_steps: Optional[int] = None
+    per_device_batch_size: int = 4
+    learning_rate: float = 2e-6
+    weight_decay: float = 0.0
+    max_grad_norm: float = 1.0
+    lr_scheduler_type: str = "constant"
+    warmup_ratio: float = 0.0
+
+    # 训练加速
+    enable_mixed_precision_training: bool = True
+
+    # 分布式 / FSDP
+    fsdp: Optional[str] = "full_shard"                     # 示例："full_shard auto_wrap" 或 None 关闭
+    fsdp_config: Optional[Dict[str, Any]] = None   # 示例：{"fsdp_min_num_params": 1e7, "xla": False}
+
+    # Hugging Face 模型标识（或本地权重目录）；用于 PrismaticVLM.from_pretrained()
+    model_id: str = '/data/home/jlchen/weights/InternVL3_5-1B-Instruct-HF'
+    hf_cache_dir: Optional[Path] = None
+    lam_path: str = "/data/home/jlchen/code/UniVLA/latent_action_model/logs/vjepa_lam/last.ckpt"
+
+    # VJEPA_LAM 模型架构参数
+    dim: int = 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
+    enc_layers: int = 6                # LAM 编码器层数
+    codebook_size: int = 16            # 码本大小
+    code_dim: int = 256                # 码本维度
+    dec_layers: int = 6                # 解码器层数
+    dec_self_heads: int = 4            # 解码器自注意力头数
+    dec_cross_heads: int = 4           # 解码器交叉注意力头数
+    dropout: float = 0.1                 # Dropout 率
+    num_queries: int = 4               # 查询向量数量
 
     # Directory Paths
-    data_root_dir: Path = Path(                                     # Path to Open-X dataset directory
-        "/path/to/your/rlds_data_collection"
-    )
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
+    data_root_dir: Path = Path("/data/home/jlchen/datasets")
+    run_root_dir: Path = Path("vla_log")                               # Path to directory to store logs & checkpoints
 
-    # Resume Run Parameters
-    pretrained_checkpoint: Optional[Path] = None                    # Absolute Path to Checkpoint
-    is_resume: bool = True                                          # Whether we are continuing a prior training run
-                                                                    #   (only applicable given pretrained checkpoint)
-    resume_step: Optional[int] = None                               # Global Step to Resume (should match checkpoint)
-    resume_epoch: Optional[int] = None                              # Epoch to Resume (should match checkpoint)
+    # Resume (logging) Parameters -- 仅用于日志标记，不再用于模型权重加载
+    resume_step: Optional[int] = None
+    resume_epoch: Optional[int] = None
 
     # Run Arguments
     run_id: Optional[str] = None                                    # Run ID for logging, Weights & Biases
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
-    save_interval: int = 10000                                      # Interval for saving checkpoints (in steps)
+    save_interval: int = 1                                      # Interval for saving checkpoints (in steps)
     image_aug: bool = True                                          # Whether to enable image augmentations
     seed: int = 42                                                  # Random seed (for reproducibility)
 
     # HF Hub Credentials (for any gated models)
-    hf_token: Union[str, Path] = ''                
+    hf_token: Optional[str] = None
 
     # Tracking Parameters
-    trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
-    wandb_project: str = "latent-action-pretrain"                   # Name of W&B project to log to (use default!)
-    wandb_entity: str = "opendrivelab"                              # Name of entity to log under
+    wandb_project: str = "test-project"                   # Name of W&B project to log to (use default!)
+    # wandb_entity: str = "opendrivelab"                              # Name of entity to log under
 
-    def __post_init__(self) -> None:
-        """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
-        self.epochs = self.vla.epochs
-        self.max_steps = self.vla.max_steps
-        self.global_batch_size = self.vla.global_batch_size
-        self.per_device_batch_size = self.vla.per_device_batch_size
 
-        self.learning_rate = self.vla.learning_rate
-        self.weight_decay = self.vla.weight_decay
-        self.max_grad_norm = self.vla.max_grad_norm
-        self.lr_scheduler_type = self.vla.lr_scheduler_type
-        self.warmup_ratio = self.vla.warmup_ratio
-
-        self.train_strategy = self.vla.train_strategy
-
-        # [Validate] Assert on `expected_world_size`
-        assert (
-            self.vla.expected_world_size == overwatch.world_size()
-        ), f"Expected World Size = {self.vla.expected_world_size} but Found {overwatch.world_size()} GPUs!"
 
     # fmt: on
 
 
-@draccus.wrap()
 def train(cfg: TrainConfig) -> None:
     overwatch.info("OpenVLA Training :: Warming Up")
 
@@ -107,9 +119,11 @@ def train(cfg: TrainConfig) -> None:
     torch.cuda.empty_cache()
 
     # Configure Unique Run Name & Save Directory
-    vla_id = cfg.vla.vla_id
+    vla_tag = f"{cfg.model_id.split('/')[-1]}+{cfg.data_mix}"
+    world_size = overwatch.world_size() if dist.is_initialized() else max(torch.cuda.device_count(), 1)
+    overwatch.info(f"Detected world_size = {world_size}")
     cfg.run_id = (
-        f"{vla_id}+n{cfg.vla.expected_world_size // 8}+b{cfg.per_device_batch_size}+x{cfg.seed}"
+        f"{vla_tag}+n{world_size}+b{cfg.per_device_batch_size}+x{cfg.seed}"
         if cfg.run_id is None
         else cfg.run_id
     )
@@ -122,60 +136,47 @@ def train(cfg: TrainConfig) -> None:
     # Start =>> Build Directories and Set Randomness
     overwatch.info('"Do or do not; there is no try."', ctx_level=1)
     # hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
-    hf_token = cfg.hf_token
+    hf_token = str(cfg.hf_token) if isinstance(cfg.hf_token, Path) else cfg.hf_token
     worker_init_fn = set_global_seed(cfg.seed, get_worker_init_fn=True)
     os.makedirs(run_dir := (cfg.run_root_dir / cfg.run_id), exist_ok=True)
     os.makedirs(cfg.run_root_dir / cfg.run_id / "checkpoints", exist_ok=True)
 
-    # Save Configuration =>> additionally save a JSON version for later HF Integration
-    if overwatch.is_rank_zero():
-        draccus.dump(cfg, open(run_dir / "config.yaml", "w"))
-        with open(run_dir / "config.yaml", "r") as f_yaml, open(run_dir / "config.json", "w") as f_json:
-            yaml_cfg = yaml.safe_load(f_yaml)
-            json.dump(yaml_cfg, f_json, indent=2)
 
-    # Load VLA checkpoint (if resuming from training) or Base VLM otherwise (from `cfg.vla.base_vlm` ID or Path)
-    #   =>> Note :: Verifies that all parameters are loaded in FP32 on load!
-    overwatch.info(f"Loading Base VLM `{cfg.vla.base_vlm}` from ID/Path")
-    if cfg.pretrained_checkpoint is not None:
-        # [Validate] Pretrained Checkpoint `step` and `epoch` should match `resume_step` and `resume_epoch`
-        #   =>> Note :: We make developers pass in `resume_*` arguments as an extra sanity check!
-        if cfg.is_resume:
-            assert int(re.search("step-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_step
-            assert int(re.search("epoch-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_epoch
-
-        vlm = load_vla(cfg.pretrained_checkpoint, hf_token=hf_token, load_for_training=True, cache_dir=cfg.pretrain_vlm)
-
-    else:
-        vlm = load(cfg.pretrain_vlm, hf_token=hf_token, load_for_training=True, cache_dir=cfg.pretrain_vlm)
+ 
+    # 直接通过 HF ID/Path 加载 InternVL 模型与处理器
+    overwatch.info(f"🔄 加载基础 InternVL `{cfg.model_id}`（HF from_pretrained）")
+    vlm = InternVLForConditionalGeneration.from_pretrained(
+        cfg.model_id,
+        token=hf_token,
+        cache_dir=str(cfg.hf_cache_dir) if cfg.hf_cache_dir is not None else None,
+        trust_remote_code=True,
+        device_map="cpu",  # 避免多进程默认加载到 cuda:0；后续由 Accelerate 迁移到各自 GPU
+        dtype=torch.bfloat16,
+    )
+    processor = AutoProcessor.from_pretrained(
+        cfg.model_id,
+        token=hf_token,
+        cache_dir=str(cfg.hf_cache_dir) if cfg.hf_cache_dir is not None else None,
+        trust_remote_code=True,
+    )
+    hf_tokenizer = cast(PreTrainedTokenizerBase, processor.tokenizer)  # type: ignore[attr-defined]
+    # 附加 processor 以便回调保存
+    setattr(vlm, "processor", processor)
 
     # [Validate] Model should be in Full Precision!
     for param in vlm.parameters():
-        assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
+        assert param.dtype in (torch.float32, torch.bfloat16), f"Loaded VLM parameter has unexpected dtype: {param.dtype}"
 
-    # Determine training "stage" based on frozen vs unfrozen parameters --> supports different fine-tuning schemes!
-    if not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "vla-full-train"  # Full fine-tuning
-    elif cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "vla-train"  # Frozen vision encoder
-    elif not cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
-        assert cfg.vla.unfreeze_last_llm_layer, "You should unfreeze at least the last layer of your LLM!"
-        stage = "vla-sandwich-train"  # Fine-tuning vision encoder, projector, and LLM last layer
-    elif cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
-        assert cfg.vla.unfreeze_last_llm_layer, "Need to unfreeze at least last LLM layer to train!"
-        stage = "vla-last-layer-train"  # Fine-tuning LLM last layer only
-    else:
-        raise ValueError(
-            "Weight freezing configuration not supported. VLA config has the following parameters: "
-            f"freeze_vision_backbone: {cfg.vla.freeze_vision_backbone}"
-            f"freeze_llm_backbone: {cfg.vla.freeze_llm_backbone}"
-            f"unfreeze_last_llm_layer: {cfg.vla.unfreeze_last_llm_layer}"
-        )
-
-    # [Explicit] Call to `freeze_backbones` here for clarity =>> will log exactly what is/is not frozen
-    overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{vla_id}` => Stage: `{stage}`")
-    vlm.freeze_backbones(stage)
-
+    # 直接按配置冻结模块（若可用）；HF-only InternVL 组件名：vision_tower / language_model / multi_modal_projector / lm_head
+    if cfg.freeze_vision_backbone and hasattr(vlm, "vision_tower"):
+        vlm.vision_tower.requires_grad_(False)
+    if cfg.freeze_projector and hasattr(vlm, "multi_modal_projector"):
+        vlm.multi_modal_projector.requires_grad_(False)
+    if cfg.freeze_llm_backbone and hasattr(vlm, "language_model"):
+        vlm.language_model.requires_grad_(False)
+    if cfg.freeze_last_llm_layer and hasattr(vlm, "lm_head"):
+        vlm.lm_head.requires_grad_(False)
+   
     # Print number of total/trainable model parameters
     num_params = sum(p.numel() for p in vlm.parameters())
     num_trainable_params = sum(p.numel() for p in vlm.parameters() if p.requires_grad)
@@ -183,105 +184,92 @@ def train(cfg: TrainConfig) -> None:
         f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
     )
     
-    from latent_action_model.genie.modules.lam import ControllableDINOLatentActionModel
+    # Get VLA Dataset & Collator
 
-    latent_action_model = ControllableDINOLatentActionModel(
-        in_dim=3,
-        model_dim=cfg.lam_model_dim,
-        latent_dim=cfg.lam_latent_dim,
-        num_latents=cfg.codebook_size,
-        patch_size=cfg.lam_patch_size,
-        enc_blocks=cfg.lam_enc_blocks,
-        dec_blocks=cfg.lam_dec_blocks,
-        num_heads=cfg.lam_num_heads,
-        dropout=0.,
+    overwatch.info(
+        f"🔄 加载 V-JEPA2 动作编码器与码本（ckpt=`{cfg.lam_path}`，"
+        f"K={cfg.codebook_size}）"
+    )
+    latent_action_model = LatentLAMModel(
+            dim=cfg.dim,
+            enc_layers=cfg.enc_layers,
+            codebook_size=cfg.codebook_size,
+            code_dim=cfg.code_dim,
+            dec_layers=cfg.dec_layers,
+            dec_self_heads=cfg.dec_self_heads,
+            dec_cross_heads=cfg.dec_cross_heads,
+            dropout=cfg.dropout,
+            num_queries=cfg.num_queries,
     )
 
-    lam_ckpt = torch.load(cfg.lam_path)['state_dict']
+    lam_ckpt = torch.load(cfg.lam_path, map_location="cpu")['state_dict']
     new_ckpt = {}
     for key in lam_ckpt.keys():
         new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
 
     latent_action_model.load_state_dict(new_ckpt, strict=True)
     latent_action_model = latent_action_model.to(device_id).eval()
-
-    # Get VLA Dataset & Collator
-    overwatch.info(f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
-    vla_dataset, action_tokenizer, collator = get_latent_vla_dataset_and_collator(
+    overwatch.info(
+        f"🔄 构建 RLDS 数据集与 Collator（mixture=`{cfg.data_mix}`，image_res={cfg.image_resolution}）"
+    )
+    # 类型提示规避：latent_action_tokenizer 需要 VQ 编码器，这里用 cast 静态规避
+    vla_dataset, tokenizer, collator = get_latent_vla_dataset_and_collator(
         cfg.data_root_dir,
-        cfg.vla.data_mix,
-        image_transform=vlm.vision_backbone.get_image_transform(),
-        image_transform_lam=transforms.ToTensor(),
-        latent_action_tokenizer=latent_action_model,
-        tokenizer=vlm.llm_backbone.get_tokenizer(),
-        prompt_builder_fn=vlm.llm_backbone.prompt_builder_fn,
-        default_image_resolution=vlm.vision_backbone.default_image_resolution,
-        shuffle_buffer_size=cfg.vla.shuffle_buffer_size,
+        cfg.data_mix,
+        latent_action_model,
+        tokenizer=hf_tokenizer,
+        default_image_resolution=cfg.image_resolution,
+        shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
 
+    overwatch.info("🔧 扩充 LLM 词表以注入动作离散 token")
     special_tokens_dict = {'additional_special_tokens': [f'<ACT_{i}>' for i in range(cfg.codebook_size)]}
-    num_added_toks = action_tokenizer.add_special_tokens(special_tokens_dict)
+    try:
+        num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)  # type: ignore[attr-defined]
+    except Exception:
+        num_added_toks = 0
+
+
+    act_tokens = [f"<ACT_{i}>" for i in range(cfg.codebook_size)]
+    act_ids = tokenizer.convert_tokens_to_ids(act_tokens)
+
+    expected_begin_id = min(act_ids)
+    expected_end_id = max(act_ids)
+
+    assert cfg.action_token_begin_id == expected_begin_id, (
+        f"cfg.action_token_begin_id={cfg.action_token_begin_id} "
+        f"but tokenizer gives {expected_begin_id} "
+        f"(range: {expected_begin_id}-{expected_end_id})"
+    )
+
 
     # Save dataset statistics for de-normalization at inference time
     if overwatch.is_rank_zero():
-        save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
+        save_dataset_statistics(cast(RLDSDataset, vla_dataset).dataset_statistics, run_dir)
 
-    # Create Train Strategy
-    overwatch.info(f"Initializing Train Strategy `{cfg.train_strategy}`")
-    train_strategy = get_train_strategy(
-        train_strategy=cfg.train_strategy,
+    # 使用 Accelerate + FSDP 的新训练器（直接传入 dataclass -> dict）
+    overwatch.info("🚀 启动 VLA 训练循环（Accelerate+FSDP）；首次 step 可能较慢（初始化 FSDP/AMP）")
+
+    run_latent_action_training(
+        cfg=cfg,
         vlm=vlm,
-        device_id=device_id,
-        stage=stage,
-        epochs=cfg.epochs,
-        max_steps=cfg.max_steps,
-        global_batch_size=cfg.global_batch_size,
-        per_device_batch_size=cfg.per_device_batch_size,
-        learning_rate=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        max_grad_norm=cfg.max_grad_norm,
-        lr_scheduler_type=cfg.lr_scheduler_type,
-        warmup_ratio=cfg.warmup_ratio,
-        enable_gradient_checkpointing=cfg.vla.enable_gradient_checkpointing,
-        enable_mixed_precision_training=cfg.vla.enable_mixed_precision_training,
-        reduce_in_full_precision=cfg.vla.reduce_in_full_precision,
-        worker_init_fn=worker_init_fn,
-    )
-    train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
-
-    # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
-    overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
-    metrics = VLAMetrics(
-        cfg.trackers,
-        cfg.run_id,
-        run_dir,
-        draccus.encode(cfg),
-        wandb_project=cfg.wandb_project,
-        wandb_entity=cfg.wandb_entity,
-        resume_step=cfg.resume_step,
-        resume_epoch=cfg.resume_epoch,
-    )
-
-    # Run VLA Training
-    overwatch.info("Starting VLA Latent Action Training Loop")
-    train_strategy.run_latent_action_training(
-        vla_dataset,
-        collator,
-        action_tokenizer,
-        metrics,
-        save_interval=cfg.save_interval,
+        vla_dataset=cast(RLDSDataset, vla_dataset),
+        collator=collator,
+        tokenizer=tokenizer,
+        run_dir=run_dir,
+        overwatch=overwatch,
     )
 
     # Finalize
     overwatch.info("Done with Training =>> Finalizing Metrics")
-    metrics.finalize()
-
     # And... we're done!
     overwatch.info("... and that's all, folks!")
-    dist.barrier()
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    train()
+    # 简化入口（原 draccus CLI 装饰器已移除）
+    train(TrainConfig())

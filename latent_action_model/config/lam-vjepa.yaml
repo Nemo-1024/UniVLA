@@ -14,7 +14,7 @@ model:
   dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
   enc_layers: 6                # LAM 编码器层数
   codebook_size: 16            # 码本大小
-  code_dim: 128                # 码本维度
+  code_dim: 256                # 码本维度
   dec_layers: 6                # 解码器层数
   dec_self_heads: 4            # 解码器自注意力头数
   dec_cross_heads: 4           # 解码器交叉注意力头数
@@ -25,7 +25,7 @@ model:
   enable_state_delta_prediction: true  # 是否启用物理接地功能
   lambda_aux: 3.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
   lambda_dir: 1.0                        # (保持)
-  lambda_mag_reg: 0.0                  # (↓↓) 极度降低：几乎只把它当作一个微弱的正则项，防止幅度跑得太偏。
+  lambda_mag_reg: 0.1                 # (↓↓) 极度降低：几乎只把它当作一个微弱的正则项，防止幅度跑得太偏。
   motion_threshold_beta: 0.01            # (保持)
   motion_scale_alpha: 100.0              # (保持)
   
@@ -75,7 +75,10 @@ trainer:
         verbose: true
         save_last: true
         save_top_k: -1
-        every_n_train_steps: 20000
+        # every_n_train_steps: 10000
+        # save_on_train_epoch_end: true    # 每个epoch结束时也保存
+        every_n_epochs: 1
+        filename: "epoch={epoch:02d}"
 
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
