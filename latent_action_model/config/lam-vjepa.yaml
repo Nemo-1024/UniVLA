@@ -44,7 +44,7 @@ model:
 # 数据参数
 data:
   data_root: /data/home/jlchen/datasets
-  data_mix: droid_bridge      # Manip. + Navi. + Human
+  data_mix: droid_bridge_ego4d      # Manip. + Navi. + Human
   batch_size: 256
   resolution: 256
   num_frames: 16               # 视频帧数

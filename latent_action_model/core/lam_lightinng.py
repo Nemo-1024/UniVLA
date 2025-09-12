@@ -153,7 +153,8 @@ class VJEPA_LAM(LightningModule):
             recon, perplexity, indices, delta_s_pred = self.lam_model.inference(features)
 
         target = features[:, 1]
-        recon_loss = F.mse_loss(recon, target)
+        # recon_loss = F.mse_loss(recon, target)
+        recon_loss = F.l1_loss(recon, target)
         total_loss = recon_loss
 
         aux_loss = torch.tensor(0.0, device=self.device)

@@ -22,6 +22,6 @@ echo "📋 配置文件: ${CONFIG_FILE}"
 echo "📝 日志文件: ${LOG_FILE}"
 
 
-torchrun --standalone --nnodes 1 --nproc-per-node 2 main.py fit \
+torchrun --standalone --nnodes 1 --nproc-per-node 8 main.py fit \
     --config ${CONFIG_FILE} \
     2>&1 | tee ${LOG_FILE}
