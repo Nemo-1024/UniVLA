@@ -30,7 +30,7 @@ if [[ -n "${CKPT_PATH}" ]]; then
 echo "🔁 从检查点恢复: ${CKPT_PATH}"
 fi
 
-torchrun --standalone --nnodes 1 --nproc-per-node 8 main.py fit \
+torchrun --standalone --nnodes 1 --nproc-per-node 2 main.py fit \
     --config ${CONFIG_FILE} \
     ${CKPT_PATH:+--ckpt_path ${CKPT_PATH}} \
     "$@" \

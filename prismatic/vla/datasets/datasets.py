@@ -162,16 +162,15 @@ class RLDSBatchTransformLIBERO_withHis:
 
 @dataclass
 class RLDSBatchTransformLIBERO:
-    action_tokenizer: ActionTokenizer
+    action_tokenizer: nn.Module
     base_tokenizer: PreTrainedTokenizerBase
     image_transform: ImageTransform
     image_transform_lam: ImageTransform
-    prompt_builder_fn: Type[PromptBuilder]
-    predict_stop_token: bool = True
+    predict_stop_token: bool = False
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+        dataset_name = rlds_batch["dataset_name"]
         # img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
@@ -183,8 +182,9 @@ class RLDSBatchTransformLIBERO:
             initial_pixel_values = self.image_transform_lam(img)
             target_pixel_values= self.image_transform_lam(img_k)
             video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
-            latent_action_idx = self.action_tokenizer.vq_encode(video)['indices'].squeeze()
-
+            features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
+            latent_action_idx = features['indices'].squeeze()
+            image_features = features['features'].detach().to("cpu")
         action_vocab = [f'<ACT_{i.item()}>' for i in latent_action_idx]   # [ACT_1, ACT_2, ... ACT_K]
 
         action_tokens = ''
@@ -192,17 +192,23 @@ class RLDSBatchTransformLIBERO:
             action_tokens += action
         # print(action_tokens)
 
-        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
-        prompt_builder = self.prompt_builder_fn("openvla")
-        conversation = [
-            {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": action_tokens},
+        # 未使用system prompt，参照univla的实现
+        # 使用 HF 官方 chat_template 构造对话
+        image_tokens = "<IMG_CONTEXT>" * 256
+        messages = [
+            {"role": "system", "content": "You are a robot controller. Based on visual input and instructions, always output exactly 4 latent action tokens chosen from <ACT_0> ... <ACT_15>."},
+            # 为 InternVL 显式插入图像占位符，使 input_ids 中含有 <image> token
+            {"role": "user", "content": f"{image_tokens}\nWhat action should the robot take to {lang}?"},
+            {"role": "assistant", "content": action_tokens},
         ]
-        for turn in conversation:
-            prompt_builder.add_turn(turn["from"], turn["value"])
 
-        # Tokenize (w/ `base_tokenizer`)
-        input_ids = self.base_tokenizer(prompt_builder.get_prompt(), add_special_tokens=True).input_ids
+        # 始终使用 HF chat_template：前缀（仅 user，带 generation_prompt）与完整（含 assistant）
+        prefix_ids = self.base_tokenizer.apply_chat_template(
+            messages[:2], tokenize=True, add_generation_prompt=True
+        )
+        input_ids = self.base_tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False
+        )
         labels = list(input_ids)
 
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
@@ -211,11 +217,16 @@ class RLDSBatchTransformLIBERO:
 
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(len(action_vocab) + 1)] = IGNORE_INDEX
+        # 仅监督 assistant 段（从 prefix 之后到结尾）
+        prefix_len = len(prefix_ids)
+        labels[:prefix_len] = IGNORE_INDEX
         if not self.predict_stop_token:
-            labels[-1] = IGNORE_INDEX
+            labels[-2:] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, actions=rlds_batch["action"], latent_action_idx=latent_action_idx, dataset_name=dataset_name)
+
+        proprio = np.array(rlds_batch["observation"]["proprio"])
+        actions = np.array(rlds_batch["action"])
+        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels,image_features=image_features, actions=actions, latent_action_idx=latent_action_idx,proprio=proprio)
 
 
 @dataclass

@@ -9,16 +9,15 @@ import json
 import os
 from pathlib import Path
 from typing import List, Optional, Union
-
+import torch
 from huggingface_hub import HfFileSystem, hf_hub_download
 
 from prismatic.conf import ModelConfig
-from prismatic.models.materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform
 from prismatic.models.registry import GLOBAL_REGISTRY, MODEL_REGISTRY
 from prismatic.models.vlas import OpenVLA
-from prismatic.models.vlms import PrismaticVLM
+
 from prismatic.overwatch import initialize_overwatch
-from prismatic.vla.action_tokenizer import ActionTokenizer
+from transformers import AutoProcessor, InternVLForConditionalGeneration
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -50,51 +49,36 @@ def get_model_description(model_id_or_name: str) -> str:
 
 
 # === Load Pretrained Model ===
-def load(
-    model_id_or_path: Union[str, Path],
-    hf_token: Optional[str] = None,
-    cache_dir: Optional[Union[str, Path]] = None,
-    load_for_training: bool = False,
-) -> PrismaticVLM:
-    """加载预训练 VLM。
+def load_vlm(model_id, cache_dir=None,dtype=torch.bfloat16):
+    """加载预训练 VLM。"""
 
-    - 若 `model_id_or_path` 是有效目录，则维持旧逻辑读取 `config.json` + `.pt`。
-    - 否则：直接将其视为 Hugging Face model id，使用 `PrismaticVLM.from_pretrained(model_id_or_path)` 加载。
-    """
-    if os.path.isdir(model_id_or_path):
-        overwatch.info(f"Loading from local path `{(run_dir := Path(model_id_or_path))}`")
-
-        # Get paths for `config.json` and pretrained checkpoint
-        config_json, checkpoint_pt = run_dir / "config.json", run_dir / "checkpoints" / "latest-checkpoint.pt"
-        assert config_json.exists(), f"Missing `config.json` for `{run_dir = }`"
-        assert checkpoint_pt.exists(), f"Missing checkpoint for `{run_dir = }`"
-
-        with open(config_json, "r") as f:
-            model_cfg = json.load(f)["model"]
-
-        overwatch.info(
-            f"Found Config =>> Loading & Freezing [bold blue]{model_cfg['model_id']}[/] with:\n"
-            f"             Checkpoint Path =>> [underline]`{checkpoint_pt}`[/]"
-        )
-
-        # 直接通过 HF 入口加载底层模型（兼容 trust_remote_code 的权重）
-        vlm = PrismaticVLM.from_pretrained(
-            run_dir.as_posix(),
-            token=hf_token,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
-        return vlm
-
-    # 不是本地目录：直接视为 HF model id
-    overwatch.info(f"Loading HF model `{model_id_or_path}` via Auto* classes")
-    vlm = PrismaticVLM.from_pretrained(
-        str(model_id_or_path),
-        token=hf_token,
-        cache_dir=cache_dir,
+    vlm = InternVLForConditionalGeneration.from_pretrained(
+        model_id,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+        trust_remote_code=True,
+        device_map="cpu",  # 避免多进程默认加载到 cuda:0；后续由 Accelerate 迁移到各自 GPU
+        torch_dtype=dtype,
+    )
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
         trust_remote_code=True,
     )
-    return vlm
+    tokenizer = processor.tokenizer 
+
+    return vlm, tokenizer
+
+def freeze_internvl(vlm, freeze_vision_backbone, freeze_projector, freeze_llm_backbone, freeze_last_llm_layer):
+    if freeze_vision_backbone and hasattr(vlm, "vision_tower"):
+        vlm.vision_tower.requires_grad_(False)
+    if freeze_projector and hasattr(vlm, "multi_modal_projector"):
+        vlm.multi_modal_projector.requires_grad_(False)
+    if freeze_llm_backbone and hasattr(vlm, "language_model"):
+        vlm.language_model.requires_grad_(False)
+    if freeze_last_llm_layer and hasattr(vlm, "lm_head"):
+        vlm.lm_head.requires_grad_(False)
+
+
 
 
 # === Load Pretrained VLA Model ===

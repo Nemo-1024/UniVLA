@@ -6,7 +6,7 @@ V-JEPA2 核心模块 - LAM专用版
 
 from .vjepa_encoder import VJEPAEncoder
 from .lam_lightinng import VJEPA_LAM
-from .lam_model import LatentLAMModel
+from .lam_model import LatentLAMModel,load_latent_action_model
 
 from .vq import NSVQ
 

@@ -114,7 +114,7 @@ class QFormer(nn.Module):
 
         # 可学习的查询向量，形状为 [1, n, d]，可以广播到整个 batch
         self.queries = nn.Parameter(torch.randn(1, num_queries, query_dim))
-        
+
         # 堆叠多个 QFormerBlock
         self.layers = nn.ModuleList([
             QFormerBlock(
@@ -500,11 +500,11 @@ class LatentLAMModel(nn.Module):
     def __init__(
         self,
         dim: int=1024,
-        enc_layers: int = 4,
+        enc_layers: int = 6,
         codebook_size: int = 16,
-        code_dim: int = 128,
+        code_dim: int = 256,
         vq_kwargs: Optional[Dict[str, Any]] = None,
-        dec_layers: int = 4,
+        dec_layers: int = 6,
         dec_self_heads: int = 4,
         dec_cross_heads: int = 4,
         dropout: float = 0.1,
@@ -571,7 +571,8 @@ class LatentLAMModel(nn.Module):
         # 冻结视觉编码器参数，与原 Lightning 行为保持一致
         with torch.no_grad():
             features = self.vision_encoder.encode_video_frames(videos)
-
+            # print(f"features.shape: {features.shape}")
+            #features.shape: torch.Size([16, 2, 256, 1024])
         nodes = self.encoder(features)  # [B, num_queries, code_dim]
         if vq_training:
             quantized, perplexity, indices = self.vq(nodes)
@@ -584,7 +585,7 @@ class LatentLAMModel(nn.Module):
         if self.enable_state_delta_prediction:
             delta_s_pred = self.state_delta_predictor(quantized)
 
-        return recon, perplexity, indices, delta_s_pred, features
+        return recon, perplexity, indices, delta_s_pred, features, quantized
 
 
     def inference(self, videos: torch.Tensor, user_specific=None):
@@ -606,7 +607,7 @@ class LatentLAMModel(nn.Module):
                 delta_s_pred: [B, 3] 或 None（若未启用）
         """
         
-        recon, perplexity, indices, delta_s_pred, features =  self._run(
+        recon, perplexity, indices, delta_s_pred, features, quantized =  self._run(
             videos=videos,
             user_specific=user_specific,
             vq_training=False,
@@ -617,8 +618,28 @@ class LatentLAMModel(nn.Module):
             'indices': indices,
             'delta_s_pred': delta_s_pred,
             'features': features,
+            'quantized': quantized,
         }
 
+def load_latent_action_model(lam_path):
+    latent_action_model = LatentLAMModel(
+            dim=1024,
+            enc_layers=6,
+            codebook_size=16,
+            code_dim=256,
+            dec_layers=6,
+            dec_self_heads=4,
+            dec_cross_heads=4,
+            dropout=0.1,
+            num_queries=4,
+    )
 
+    lam_ckpt = torch.load(lam_path, map_location="cpu")['state_dict']
+    new_ckpt = {}
+    for key in lam_ckpt.keys():
+        new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
+
+    latent_action_model.load_state_dict(new_ckpt, strict=True)
+    return latent_action_model
 
 

@@ -206,3 +206,10 @@ class NSVQ(nn.Module):
             nn.init.uniform_(self.codebooks.data, -1 / self.codebook_size, 1 / self.codebook_size)
         self.reset_node_count()
 
+    def get_codebooks(self) -> Tensor:
+        return self.codebooks
+    
+    def get_codebook_size(self) -> int:
+        return self.codebook_size
+    
+

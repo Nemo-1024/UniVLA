@@ -140,9 +140,9 @@ class VJEPA_LAM(LightningModule):
         videos = batch["videos"]
         # VQ 路径区分在模型内部（视觉编码也已迁移到 LAM 内部）
         if vq_training:
-            recon, perplexity, indices, delta_s_pred, features = self.lam(videos)
+            recon, perplexity, indices, delta_s_pred, features,_ = self.lam(videos)
         else:
-            recon, perplexity, indices, delta_s_pred, features = self.lam.inference(videos)
+            recon, perplexity, indices, delta_s_pred, features,_ = self.lam.inference(videos)
 
         target = features[:, 1]
         # recon_loss = F.mse_loss(recon, target)

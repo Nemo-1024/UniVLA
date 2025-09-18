@@ -7,12 +7,12 @@ from typing import Optional, Tuple, Union, Dict, Any
 import torch
 import torch.distributed as dist
 import yaml
-from latent_action_model.core.lam_model import LatentLAMModel
+from latent_action_model.core.lam_model import load_latent_action_model
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util import set_global_seed
 from prismatic.vla import get_latent_vla_dataset_and_collator
 from prismatic.vla.datasets.datasets import RLDSDataset
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from prismatic.models import load_vlm,freeze_internvl
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from typing import cast
 from prismatic.training.accelerate_fsdp_trainer import run_latent_action_training
@@ -69,9 +69,9 @@ class TrainConfig:
     fsdp_config: Optional[Dict[str, Any]] = None   # 示例：{"fsdp_min_num_params": 1e7, "xla": False}
 
     # Hugging Face 模型标识（或本地权重目录）；用于 PrismaticVLM.from_pretrained()
-    model_id: str = '/data/home/jlchen/weights/InternVL3_5-1B-Instruct-HF'
+    model_id: str = '/mnt/mnt/public/chenjl/weights/InternVL3_5-1B-Instruct-HF'
     hf_cache_dir: Optional[Path] = None
-    lam_path: str = "/data/home/jlchen/code/UniVLA/latent_action_model/logs/vjepa_lam/last.ckpt"
+    lam_path: str = "/mnt/mnt/public/chenjl/code/UniVLA/latent_action_model/logs/vjepa_lam/epoch=14-step=20000.ckpt"
 
     # VJEPA_LAM 模型架构参数
     dim: int = 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
@@ -85,7 +85,7 @@ class TrainConfig:
     num_queries: int = 4               # 查询向量数量
 
     # Directory Paths
-    data_root_dir: Path = Path("/data/home/jlchen/datasets")
+    data_root_dir: Path = Path("/mnt/mnt/public/chenjl/datasets")
     run_root_dir: Path = Path("vla_log")                               # Path to directory to store logs & checkpoints
 
     # Resume (logging) Parameters -- 仅用于日志标记，不再用于模型权重加载
@@ -145,37 +145,11 @@ def train(cfg: TrainConfig) -> None:
  
     # 直接通过 HF ID/Path 加载 InternVL 模型与处理器
     overwatch.info(f"🔄 加载基础 InternVL `{cfg.model_id}`（HF from_pretrained）")
-    vlm = InternVLForConditionalGeneration.from_pretrained(
-        cfg.model_id,
-        token=hf_token,
-        cache_dir=str(cfg.hf_cache_dir) if cfg.hf_cache_dir is not None else None,
-        trust_remote_code=True,
-        device_map="cpu",  # 避免多进程默认加载到 cuda:0；后续由 Accelerate 迁移到各自 GPU
-        dtype=torch.bfloat16,
-    )
-    processor = AutoProcessor.from_pretrained(
-        cfg.model_id,
-        token=hf_token,
-        cache_dir=str(cfg.hf_cache_dir) if cfg.hf_cache_dir is not None else None,
-        trust_remote_code=True,
-    )
-    hf_tokenizer = cast(PreTrainedTokenizerBase, processor.tokenizer)  # type: ignore[attr-defined]
-    # 附加 processor 以便回调保存
-    setattr(vlm, "processor", processor)
+    vlm, tokenizer = load_vlm(cfg.model_id, cfg.hf_cache_dir, dtype=torch.bfloat16) 
 
-    # [Validate] Model should be in Full Precision!
-    for param in vlm.parameters():
-        assert param.dtype in (torch.float32, torch.bfloat16), f"Loaded VLM parameter has unexpected dtype: {param.dtype}"
 
     # 直接按配置冻结模块（若可用）；HF-only InternVL 组件名：vision_tower / language_model / multi_modal_projector / lm_head
-    if cfg.freeze_vision_backbone and hasattr(vlm, "vision_tower"):
-        vlm.vision_tower.requires_grad_(False)
-    if cfg.freeze_projector and hasattr(vlm, "multi_modal_projector"):
-        vlm.multi_modal_projector.requires_grad_(False)
-    if cfg.freeze_llm_backbone and hasattr(vlm, "language_model"):
-        vlm.language_model.requires_grad_(False)
-    if cfg.freeze_last_llm_layer and hasattr(vlm, "lm_head"):
-        vlm.lm_head.requires_grad_(False)
+    freeze_internvl(vlm, cfg.freeze_vision_backbone, cfg.freeze_projector, cfg.freeze_llm_backbone, cfg.freeze_last_llm_layer)
    
     # Print number of total/trainable model parameters
     num_params = sum(p.numel() for p in vlm.parameters())
@@ -190,24 +164,7 @@ def train(cfg: TrainConfig) -> None:
         f"🔄 加载 V-JEPA2 动作编码器与码本（ckpt=`{cfg.lam_path}`，"
         f"K={cfg.codebook_size}）"
     )
-    latent_action_model = LatentLAMModel(
-            dim=cfg.dim,
-            enc_layers=cfg.enc_layers,
-            codebook_size=cfg.codebook_size,
-            code_dim=cfg.code_dim,
-            dec_layers=cfg.dec_layers,
-            dec_self_heads=cfg.dec_self_heads,
-            dec_cross_heads=cfg.dec_cross_heads,
-            dropout=cfg.dropout,
-            num_queries=cfg.num_queries,
-    )
-
-    lam_ckpt = torch.load(cfg.lam_path, map_location="cpu")['state_dict']
-    new_ckpt = {}
-    for key in lam_ckpt.keys():
-        new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
-
-    latent_action_model.load_state_dict(new_ckpt, strict=True)
+    latent_action_model = load_latent_action_model(cfg.lam_path)
     latent_action_model = latent_action_model.to(device_id).eval()
     overwatch.info(
         f"🔄 构建 RLDS 数据集与 Collator（mixture=`{cfg.data_mix}`，image_res={cfg.image_resolution}）"
@@ -217,7 +174,7 @@ def train(cfg: TrainConfig) -> None:
         cfg.data_root_dir,
         cfg.data_mix,
         latent_action_model,
-        tokenizer=hf_tokenizer,
+        tokenizer=tokenizer,
         default_image_resolution=cfg.image_resolution,
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,

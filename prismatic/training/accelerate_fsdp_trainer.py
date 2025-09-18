@@ -18,7 +18,7 @@ from typing import Optional, Any, cast
 import torch
 from torch.utils.data import IterableDataset as TorchIterableDataset
 from dataclasses import asdict
-
+from transformers import AutoModel
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
 from transformers.trainer_callback import TrainerCallback
@@ -97,7 +97,7 @@ class ActionAccuracyTrainer(Trainer):
 def run_latent_action_training(
     *,
     cfg: Any,
-    vlm: PrismaticVLM,
+    vlm: AutoModel,
     vla_dataset: TorchIterableDataset,
     collator,
     tokenizer,
