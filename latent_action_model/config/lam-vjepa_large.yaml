@@ -11,28 +11,26 @@
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
-  vision_model_id: "/mnt/public_zgc/home/jlchen/weights/vjepa2-vitl-fpc64-256"
   dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
-  enc_layers: 6                # LAM 编码器层数
+  enc_layers: 9                # LAM 编码器层数
   codebook_size: 16            # 码本大小
-  code_dim: 128                # 码本维度
-  dec_layers: 6                # 解码器层数
-  dec_self_heads: 4            # 解码器自注意力头数
-  dec_cross_heads: 4           # 解码器交叉注意力头数
+  code_dim: 256                # 码本维度
+  dec_layers: 9                # 解码器层数
+  dec_self_heads: 8            # 解码器自注意力头数
+  dec_cross_heads: 8           # 解码器交叉注意力头数
   dropout: 0.1                 # Dropout 率
   num_queries: 4               # 查询向量数量
   
-  # 物理接地状态差解码器参数       
-  #由于数据已经缩放到 [-1, 1]，状态差（delta_s）向量的 模长范围在 [0, √3] ≈ [0, 1.73]。
-  enable_state_delta_prediction: true     # 是否启用物理接地功能
-  lambda_aux: 3.0                         # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
-  lambda_dir: 1.0                         # λ_dir 的选择主要取决于你想让「方向一致性」在总损失中的权重，初始值可设为 λ_dir = 1.0
-  lambda_mag_reg: 0.5                    # λ_mag_reg 一般设为 0.5 ~ 1.0
-  motion_threshold_beta: 0.1             # 如果你想忽略接近 0 的运动，可以设 β = 0.05 ~ 0.1。如果你希望只强调中等以上幅度，可以设 β = 0.3 ~ 0.5。
-  motion_scale_alpha: 15.0               # α 控制 Sigmoid 的陡峭程度，>50则几乎变成阶跃函数，完全忽略小幅度的动作
+  # 物理接地状态差解码器参数
+  enable_state_delta_prediction: true  # 是否启用物理接地功能
+  lambda_aux: 3.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
+  lambda_dir: 1.0                        # (保持)
+  lambda_mag_reg: 0.1                 # (↓↓) 极度降低：几乎只把它当作一个微弱的正则项，防止幅度跑得太偏。
+  motion_threshold_beta: 0.01            # (保持)
+  motion_scale_alpha: 100.0              # (保持)
 
   project: UniVLA-latent_action_model
-  task_name: code_128
+  task_name: lam_large
   wandb_offline: false
   
   # 训练参数
@@ -50,7 +48,7 @@ model:
 data:
   data_root: /mnt/public_zgc/home/jlchen/datasets
   data_mix: lam    # Manip. + Navi. + Human
-  batch_size: 256
+  batch_size: 160
   resolution: 256
   num_frames: 16               # 视频帧数
   episodic: false
@@ -59,7 +57,7 @@ data:
 
 # 训练器参数
 trainer:
-  max_epochs: 100
+  max_epochs: 50
   accelerator: gpu
   num_nodes: 1
   devices: auto
@@ -81,21 +79,14 @@ trainer:
         # save_last: true
         save_top_k: -1
         # save_on_train_epoch_end: true    # 每个epoch结束时也保存
-        # every_n_epochs: 1
-        every_n_train_steps: 1000
+        every_n_epochs: 1
         filename: "{epoch}_{step}"
-        
-    - class_path: latent_action_model.core.lam_lightinng.CodebookMaintenanceCallback
-      init_args:
-        interval_steps: 1000
-
-    - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
 
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
-        save_dir: latent_action_model/logs
-        name: physical_grounding
+        save_dir: ./logs
+        name: test
 
     # - class_path: lightning.pytorch.loggers.WandbLogger
     #   init_args:

@@ -9,6 +9,20 @@ import torch
 import torch.nn as nn
 import math
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, model_dim: int, max_len: int = 5000):
+        super().__init__()
+        pe = torch.zeros(max_len, model_dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, model_dim, 2).float() * -(math.log(10000.0) / model_dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pos_enc', pe.unsqueeze(0))  # [1, max_len, model_dim]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, model_dim]
+        return x + self.pos_enc[:, :x.size(1), :].to(x.device)
+
 class QFormerBlock(nn.Module):
     """
     一个完整的 Q-Former 构建块。
@@ -178,26 +192,27 @@ class LAMEncoder(nn.Module):
         # self.blocks = nn.ModuleList([
         #     SpatioTemporalBlock(dim, dropout=dropout) for _ in range(num_layers)
         # ])
+        self.positional_encoding = PositionalEncoding(model_dim=context_dim)
         self.QFormer = QFormer(query_dim=query_dim, context_dim=context_dim, num_queries=num_queries, num_layers=num_layers, dropout=dropout)
         # 0 代表 t, 1 代表 t+1
         self.temporal_embeddings = nn.Embedding(2, context_dim)
-    def forward(self, feature: torch.Tensor) -> torch.Tensor:
-        B, T, K, D = feature.shape
-        f_t = feature[:,0]
-        f_t1 = feature[:,1]
+    def forward(self, f_t: torch.Tensor, f_t1: torch.Tensor) -> torch.Tensor:
+        B, K, D = f_t.shape
         # 给所有 t 时刻的 K 个 token 加上 t 时刻的嵌入
         time_ids_t = torch.zeros(B, K, dtype=torch.long, device=f_t.device)
         f_t_enhanced = f_t + self.temporal_embeddings(time_ids_t)
+        f_t_enhanced = self.positional_encoding(f_t_enhanced)
 
         # 给所有 t+1 时刻的 K 个 token 加上 t+1 时刻的嵌入
         time_ids_t1 = torch.ones(B, K, dtype=torch.long, device=f_t1.device)
         f_t1_enhanced = f_t1 + self.temporal_embeddings(time_ids_t1)
+        f_t1_enhanced = self.positional_encoding(f_t1_enhanced)
         context = torch.cat([f_t_enhanced, f_t1_enhanced], dim=1) # Shape: [B, 2*K, dim]
         latents=self.QFormer(context)
     
         return latents
 
-class DecoderBlock(nn.Module):
+class Attn_Crossn_Block(nn.Module):
     """
     LAMDecoder 的核心构建块。
     它将“动作”信息 (z_q) 融合到“状态”特征 (f_t) 中。
@@ -290,9 +305,9 @@ class LAMDecoder(nn.Module):
             num_heads (int): 每个注意力模块的头数。
         """
         super().__init__()
-
+        self.positional_encoding = PositionalEncoding(model_dim=feature_dim)
         self.layers = nn.ModuleList([
-            DecoderBlock(
+            Attn_Crossn_Block(
                 feature_dim=feature_dim,
                 node_dim=node_dim,
                 num_heads=num_heads,
@@ -314,6 +329,7 @@ class LAMDecoder(nn.Module):
             torch.Tensor: 重建的后一帧特征 f_hat_t+1，形状 [B, K, D_feat]。
         """
         # 将 f_t 作为可更新的状态，依次通过所有解码器层
+        f_t = self.positional_encoding(f_t)
         reconstructed_features = f_t
         for layer in self.layers:
             reconstructed_features = layer(reconstructed_features, z_q)
@@ -426,7 +442,7 @@ class PhysicalGroundingLoss(nn.Module):
         lambda_mag_reg: float = 0.1,
         motion_threshold_beta: float = 0.01,  # 1cm
         motion_scale_alpha: float = 100.0,
-        huber_delta: float = 1.0
+        huber_delta: float = 0.1
     ):
         """
         初始化物理接地损失函数
@@ -511,12 +527,13 @@ class LatentLAMModel(nn.Module):
         num_queries: int = 4,
         # 新增：状态差预测器参数
         enable_state_delta_prediction: bool = True,
+        vision_model_id: str = "facebook/vjepa2-vitl-fpc64-256",
 
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # 集成视觉编码器：负责将 videos 编码为 [B, T, N, D] 特征
-        self.vision_encoder = VJEPAEncoder().to(self.device)
+        self.vision_encoder = VJEPAEncoder(vision_model_id).to(self.device)
         self.encoder = LAMEncoder(context_dim=dim, query_dim=code_dim, num_queries=num_queries, num_layers=enc_layers, dropout=dropout).to(self.device)
         self.decoder = LAMDecoder(dim, code_dim, dec_layers,  dropout=dropout).to(self.device)
         vq_kwargs = vq_kwargs or {}
@@ -573,7 +590,7 @@ class LatentLAMModel(nn.Module):
             features = self.vision_encoder.encode_video_frames(videos)
             # print(f"features.shape: {features.shape}")
             #features.shape: torch.Size([16, 2, 256, 1024])
-        nodes = self.encoder(features)  # [B, num_queries, code_dim]
+        nodes = self.encoder(features[:,0],features[:,1])  # [B, num_queries, code_dim]
         if vq_training:
             quantized, perplexity, indices = self.vq(nodes)
         else:
@@ -621,7 +638,7 @@ class LatentLAMModel(nn.Module):
             'quantized': quantized,
         }
 
-def load_latent_action_model(lam_path):
+def load_latent_action_model(lam_path, vision_model_id="facebook/vjepa2-vitl-fpc64-256"):
     latent_action_model = LatentLAMModel(
             dim=1024,
             enc_layers=6,
@@ -632,7 +649,8 @@ def load_latent_action_model(lam_path):
             dec_cross_heads=4,
             dropout=0.1,
             num_queries=4,
-    )
+            vision_model_id=vision_model_id,
+    ).to("cpu")
 
     lam_ckpt = torch.load(lam_path, map_location="cpu")['state_dict']
     new_ckpt = {}
@@ -640,6 +658,8 @@ def load_latent_action_model(lam_path):
         new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
 
     latent_action_model.load_state_dict(new_ckpt, strict=True)
+    for p in latent_action_model.parameters():
+        p.requires_grad = False
     return latent_action_model
 
 

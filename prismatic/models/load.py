@@ -49,7 +49,7 @@ def get_model_description(model_id_or_name: str) -> str:
 
 
 # === Load Pretrained Model ===
-def load_vlm(model_id, cache_dir=None,dtype=torch.bfloat16):
+def load_InternVL(model_id, cache_dir=None, dtype=torch.bfloat16):
     """加载预训练 VLM。"""
 
     vlm = InternVLForConditionalGeneration.from_pretrained(

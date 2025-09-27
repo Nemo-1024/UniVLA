@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from latent_action_model.core.lam_model import LatentLAMModel
 from latent_action_model.core.vq import NSVQ
-from prismatic.models.policy.flowmatching_expert import (
+from .flowmatching_expert import (
     ConditionalFlowMatchingHead,
 )
 
@@ -19,17 +19,6 @@ class FutureFeatureMode(str, enum.Enum):
     LAM_FROM_VLM = "lam_from_vlm"  # 使用VLM输出的z_a，经LAM decoder得到 h_{t+1}^hat
     LAM_FROM_GT = "lam_from_gt"  # 使用GT的z_a索引，经LAM decoder得到 h_{t+1}^hat
     VJEPA_GT = "vjepa_gt"  # 直接使用VJEPA对 I_{t+1} 的编码 h_{t+1}
-
-
-
-
-
-
-
- 
-
-
-
 
 
 @dataclass
@@ -72,7 +61,7 @@ class LatentWorldVLA(nn.Module):
         * LAM_FROM_GT:  使用GT latent action indices 通过 LAM Decoder 得到
         * VJEPA_GT:     直接VJEPA对 I_{t+1} 的编码
         * CFG_MASK:     置零（或按概率drop）
-    条件向量 = Enc(h_t) || Enc(h_{t+1}^*) || Enc(h_vlm) || Enc(q_t)
+    条件向量 = Eh_t || h_{t+1}^* || h_vlm || q_t
     送入 ConditionalFlowMatchingHead 预测速度场
     """
 
@@ -100,26 +89,14 @@ class LatentWorldVLA(nn.Module):
         self.flow = ConditionalFlowMatchingHead()
         self.code_book_size = self.lam.vq.get_codebook_size()
 
-
     def set_cfg_drop_prob(self, p: float) -> None:
         self.model_cfg.cfg_drop_prob = float(max(0.0, min(1.0, p)))
 
     # ------------------
     # 内部功能
     # ------------------
-    @torch.no_grad()
-    def _encode_vjepa_two_frames(self, image_t: torch.Tensor, image_t1: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 构造两帧视频 [B, T=2, C, H, W]
-        if image_t1 is None:
-            video = torch.stack([image_t, image_t], dim=1)
-        else:
-            video = torch.stack([image_t, image_t1], dim=1)
-        feats = self.lam.vision_encoder.encode_video_frames(video)  # [B, 2, K, D]
-        return feats[:, 0], feats[:, 1]
 
-
-
-    def _decode_lam_next(self, h_t: torch.Tensor, code_indices: torch.Tensor) -> torch.Tensor:
+    def world_imagine_next(self, h_t: torch.Tensor, code_indices: torch.Tensor) -> torch.Tensor:
         z_q = F.embedding(code_indices, self.lam.vq.codebooks)
         return self.lam.decoder(h_t, z_q)
 
@@ -134,7 +111,23 @@ class LatentWorldVLA(nn.Module):
         action_hidden, action_logits = [], []
         for b in range(hidden.size(0)):
             positions = torch.nonzero(hidden[b] >= self.model_cfg.action_token_begin_id, as_tuple=False).squeeze(1)
-            assert positions.numel() == 4, f"Batch {b} action token数量不为 {4}"
+            
+            # 检查action token数量，如果不为4则发出警告并截取最后4个
+            if positions.numel() != 4:
+                print(f"警告: Batch {b} action token数量为 {positions.numel()}，期望为 4，将截取最后4个token")
+                if positions.numel() > 4:
+                    positions = positions[-4:]  # 截取最后4个
+                else:
+                    # 如果不足4个，重复最后一个token
+                    if positions.numel() > 0:
+                        last_pos = positions[-1]
+                        positions = torch.cat([positions, last_pos.repeat(4 - positions.numel())])
+                    else:
+                        # 如果没有找到任何action token，使用序列末尾的位置
+                        seq_len = hidden.size(1)
+                        positions = torch.arange(seq_len - 4, seq_len, device=hidden.device)
+                        print(f"警告: Batch {b} 未找到action token，使用序列末尾4个位置")
+            
             action_hidden.append(hidden[b, positions, :])
             action_logits.append(logits[b, positions, :])
         action_hidden, action_logits = torch.stack(action_logits), torch.stack(action_hidden)
@@ -177,24 +170,29 @@ class LatentWorldVLA(nn.Module):
         *,
         pixel_values: torch.Tensor,      # [B, 3, H, W]  (VLM用)
         input_ids: torch.Tensor,         # [B, L]        (VLM用)
-        actions: torch.Tensor,           # [B, A]
-        latent_action_idx: torch.Tensor, # [B, Q]        (GT)
-        proprio: torch.Tensor,           # [B, Dq]
-        image_features : torch.Tensor,   # [B, 2, K, Dv]
-        attention_mask: torch.Tensor,    # [B, L]
         labels: torch.Tensor,            # [B, L]
+        attention_mask: torch.Tensor,    # [B, L]
+        actions: torch.Tensor,           # [B, T, Da]
+        latent_action_idx: torch.Tensor, # [B, Q]        (GT)
+        proprio: torch.Tensor,           # [B, T, Dq]
+        image_features : torch.Tensor,   # [B, 2, K, D]
     ) -> Dict[str, torch.Tensor]:
     
         h_t, h_t1 = image_features[:, 0, :, :], image_features[:, 1, :, :]
-        # 1) 无梯度：三路未来特征
-        with torch.no_grad():
-            out_dict = self.vlm(input_ids=input_ids, pixel_values=pixel_values, output_hidden_states=True,attention_mask=attention_mask,max_new_tokens=4)
-            hidden, logits = out_dict.hidden_states[-1], out_dict.logits  # [B, L, H], [B, L, V]
-            # VLM 路
-            h_vlm, vlm_idx = self.extract_action_idx_and_hidden_states(hidden, logits)
-            h_t1_lam_from_vlm = self._decode_lam_next(h_t, vlm_idx)
-            # GT-LAM 路
-            h_t1_lam_from_gt = self._decode_lam_next(h_t, latent_action_idx)
+        # 1) 计算 VLM 前向（保留梯度用于 LoRA 训练），但在后续 Flow 头中使用 detach 特征
+        out_dict = self.vlm(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            labels=labels,
+            output_hidden_states=True,
+            attention_mask=attention_mask,
+        )
+        hidden, logits = out_dict.hidden_states[-1], out_dict.logits  # [B, L, H], [B, L, V]
+        # VLM 路
+        h_vlm, vlm_idx = self.extract_action_idx_and_hidden_states(hidden, logits)
+        h_t1_lam_from_vlm = self.world_imagine_next(h_t, vlm_idx)
+        # GT-LAM 路
+        h_t1_lam_from_gt = self.world_imagine_next(h_t, latent_action_idx)
 
         # VJEPA-GT 路
         h_t1_vjepa = h_t1
@@ -203,42 +201,59 @@ class LatentWorldVLA(nn.Module):
         h_t1_star = self._ht1_sampling(h_t1_lam_from_vlm, h_t1_lam_from_gt, h_t1_vjepa)  # [B, ...]
 
 
-
+        # loss_vlm = nn.CrossEntropyLoss(logits.view(-1, logits.size(-1)), labels.view(-1))
         # 2) Flow Matching（训练期内部执行CFG-drop；噪声/时间由flow内部采样）
-        losses = self.flow(h_t=h_t.detach(), h_t1_star=h_t1_star.detach(), h_vlm=h_vlm.detach(), proprio=proprio, actions=actions)
+        losses = self.flow(
+            h_t=h_t.detach(),
+            h_t1_star=h_t1_star.detach(),
+            h_vlm=h_vlm,
+            proprio=proprio,
+            actions=actions,
+        )
+
+        # 返回 VLM 的 CE 损失（若不可用则置零张量，避免分支判断）
+        vlm_loss = getattr(out_dict, "loss", None)
+        if vlm_loss is None:
+            print("VLM 损失不可用，已置零！！！！！")
+            vlm_loss = torch.tensor(0.0, device=pixel_values.device, dtype=hidden.dtype)
+
+        # 计算动作 token 的准确率（对被监督的 label 位置，即 labels != -100）
+        with torch.no_grad():
+            preds = torch.argmax(logits, dim=-1)
+            valid_mask = (labels != -100)
+            denom = valid_mask.sum()
+            if denom.item() > 0:
+                correct = ((preds == labels) & valid_mask).sum()
+                action_accuracy = (correct.float() / denom.float())
+            else:
+                action_accuracy = torch.tensor(0.0, device=pixel_values.device, dtype=hidden.dtype)
 
         return {
-            "loss_flow_per_sample": losses,
+            "loss_flow": losses,
+            "loss_vlm": vlm_loss,
+            "vlm_action_accuracy": action_accuracy,
         }
 
     @torch.inference_mode()
-    def predict_action(
+    def generate(
         self,
         *,
         pixel_values: torch.Tensor,      # [B, 3, H, W]  (VLM用)
         input_ids: torch.Tensor,         # [B, L]        (VLM用)
         proprio: torch.Tensor,           # [B, Dq]
-        image_features: torch.Tensor,    # [B, 2, K, Dv]
         attention_mask: torch.Tensor,    # [B, L]
-        labels: torch.Tensor,            # [B, L]
         guidance_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        # 与 forward 对齐：构造三路未来特征并形成条件向量
-        h_t, h_t1 = image_features[:, 0, :, :], image_features[:, 1, :, :]
 
         with torch.no_grad():
             # 先前向一次 VLM，提取 hidden/logits，再得到 h_vlm 与索引
-            out_dict = self.vlm(input_ids=input_ids, pixel_values=pixel_values, output_hidden_states=True, attention_mask=attention_mask, max_new_tokens=4)
+            out_dict = self.vlm.generate(input_ids=input_ids, pixel_values=pixel_values, output_hidden_states=True, attention_mask=attention_mask, max_new_tokens=4)
             hidden, logits = out_dict.hidden_states[-1], out_dict.logits
             h_vlm, vlm_idx = self.extract_action_idx_and_hidden_states(hidden, logits)
             # 通过 LAM decoder 得到未来表征
-            h_t1_lam_from_vlm = self._decode_lam_next(h_t, vlm_idx)
-            # 推理期无 GT，可复用 VLM 路径作为占位
-            h_t1_lam_from_gt = h_t1_lam_from_vlm
-            # VJEPA-GT 路
-            h_t1_vjepa = h_t1
-            # 三源采样融合
-            h_t1_star = self._ht1_sampling(h_t1_lam_from_vlm, h_t1_lam_from_gt, h_t1_vjepa)
+            h_t = self.lam.vision_encoder.encode_video_frames(pixel_values.unsqueeze(1))
+            h_t1_star = self.world_imagine_next(h_t, vlm_idx)
+
 
         scale = self.model_cfg.cfg_guidance_scale if guidance_scale is None else float(guidance_scale)
         return self.flow.sample_actions_cfg(h_t=h_t.detach(), h_t1_star=h_t1_star.detach(), h_vlm=h_vlm.detach(), proprio=proprio, guidance_scale=scale)

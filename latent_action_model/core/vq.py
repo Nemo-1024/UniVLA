@@ -114,6 +114,8 @@ class NSVQ(nn.Module):
         返回:
             int: 被替换的未使用码字的数量。
         """
+        codebook_std = self.codebooks.data.std()
+        eps_noise = max(1e-5, 0.01 * codebook_std)  # 自适应噪声，保证不为0
         # 判断标准：使用频率低于阈值
         unused_mask = (self.node_count.float() / self.node_count.sum()) < self.discarding_threshold
         used_mask = ~unused_mask
@@ -128,7 +130,7 @@ class NSVQ(nn.Module):
         print("node_count",self.node_count)
         # 如果所有码字都未被使用，则添加少量噪声以重新激活
         if used_indices.numel() == 0:
-            self.codebooks.data += self.eps * torch.randn_like(self.codebooks.data)
+            self.codebooks.data += eps_noise * torch.randn_like(self.codebooks.data)
             
             print("All codebooks are unused, adding noise to reactivate")
             
@@ -142,7 +144,7 @@ class NSVQ(nn.Module):
             replacements = replacements[torch.randperm(replacements.size(0))][:num_unused]
 
             # 添加少量噪声以增加多样性
-            noise = self.eps * torch.randn_like(replacements)
+            noise = eps_noise * torch.randn_like(replacements)
             self.codebooks.data[unused_indices] = replacements + noise
             print("=" * 50)
             print("Replaced {} unused codebooks with noise".format(num_unused))

@@ -1,10 +1,10 @@
 from lightning.pytorch.cli import LightningCLI
-from core.lam_lightinng import VJEPA_LAM
-from genie.dataset import LightningOpenX
-from genie.model import DINO_LAM
-import torch
+from latent_action_model.core.lam_lightinng import VJEPA_LAM
+from latent_action_model.genie.dataset import LightningOpenX
 
-torch.cuda.empty_cache()
+
+
+
 
 cli = LightningCLI(
     VJEPA_LAM,

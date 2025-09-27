@@ -155,4 +155,4 @@ data/
 
 weights
 logs
-vla-scripts/extern/ego4d_rlds_dataset_builder/ego4d/univla-ego4d-rlds-dependencies
+vla_scripts/extern/ego4d_rlds_dataset_builder/ego4d/univla-ego4d-rlds-dependencies

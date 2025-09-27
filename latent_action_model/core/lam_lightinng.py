@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import Optimizer
 from lightning import LightningModule
-
+import lightning.pytorch as pl
 # 定义优化器回调类型
 OptimizerCallable = Callable[[Iterable], Optimizer]
 from accelerate import PartialState
@@ -14,6 +14,8 @@ import wandb
 from .lam_model import LatentLAMModel, PhysicalGroundingLoss
 import logging
 logging.basicConfig(format='%(message)s', level=logging.INFO)
+import os
+import shutil
 
 class VJEPA_LAM(LightningModule):
     """
@@ -43,16 +45,21 @@ class VJEPA_LAM(LightningModule):
         motion_threshold_beta: float = 0.01,  # 运动激活阈值 (1cm)
         motion_scale_alpha: float = 100.0,  # Sigmoid斜率
         # 训练参数
+        project: str = 'UniVLA-latent_action_model',
         task_name: str = 'vjepa_lam',
+        wandb_offline: bool = False,
         optimizer: OptimizerCallable = torch.optim.AdamW,
         weight_decay: float = 0.01,
         # 索引保存参数
         make_data_pair: bool = False,
         output_dir: str = "output_pairs",
+        vision_model_id: str = "facebook/vjepa2-vitl-fpc64-256",
         **kwargs
     ):
         super().__init__()
-        
+        torch.cuda.empty_cache()
+        torch.set_float32_matmul_precision('medium')
+
         # 保存超参数
         self.save_hyperparameters()
         
@@ -68,11 +75,10 @@ class VJEPA_LAM(LightningModule):
             dropout=dropout,
             num_queries=num_queries,
             enable_state_delta_prediction=enable_state_delta_prediction,
+            vision_model_id=vision_model_id,
         )
         
         # 训练参数
-
-        self.task_name = task_name
         self.optimizer = optimizer
         self.weight_decay = weight_decay
         self.codebook_size = codebook_size
@@ -93,10 +99,9 @@ class VJEPA_LAM(LightningModule):
         # 索引保存参数
         self.make_data_pair = make_data_pair
         self.output_dir = output_dir
-        self.task_name = task_name
         self.distributed_state = PartialState()
         if self.distributed_state.is_main_process:
-            wandb.init(name=task_name, reinit=True)
+            wandb.init(project=project, name=task_name, reinit=True, mode="offline" if wandb_offline else "online")
     
     def shared_step(self, batch: Dict) -> Tuple[Tensor, Dict]:
         """共享的训练/验证步骤（训练分支）。"""
@@ -324,3 +329,59 @@ class VJEPA_LAM(LightningModule):
         
         return loss
         
+
+class CodebookMaintenanceCallback(pl.Callback):
+    def __init__(self, interval_steps: int = 1000):
+        super().__init__()
+        self.interval_steps = interval_steps
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if (trainer.global_step + 1) % self.interval_steps == 0:
+            if hasattr(pl_module.lam.vq, 'replace_unused_codebooks'):
+                pl_module.lam.vq.replace_unused_codebooks()
+            if hasattr(pl_module.lam.vq, 'reset_node_count'):
+                pl_module.lam.vq.reset_node_count()
+
+
+class SaveConfigToCheckpointCallback(pl.Callback):
+    def __init__(self, config_path: str = "", filename: str = "lam-vjepa.yaml"):
+        super().__init__()
+        # 若未显式传入，则默认指向包内配置文件：latent_action_model/config/lam-vjepa.yaml
+        if not config_path:
+            from pathlib import Path
+            base_dir = Path(__file__).resolve().parents[1]
+            self.config_path = str(base_dir / "config" / "lam-vjepa.yaml")
+        else:
+            self.config_path = config_path
+        self.filename = filename
+
+    def on_fit_start(self, trainer, pl_module):
+        # 基于 logger 管理的目录保存，不依赖 ModelCheckpoint.dirpath
+        logger_obj = trainer.logger
+        if logger_obj is None:
+            pl_module.print("logger 未配置，跳过保存配置文件")
+            return
+
+        log_dir = None
+        if hasattr(logger_obj, 'log_dir') and logger_obj.log_dir is not None:
+            log_dir = logger_obj.log_dir
+        else:
+            save_dir = getattr(logger_obj, 'save_dir', None)
+            name = getattr(logger_obj, 'name', None)
+            version = getattr(logger_obj, 'version', None)
+            parts = [p for p in [save_dir, name, f"version_{version}" if version is not None else None] if p]
+            if parts:
+                log_dir = os.path.join(*parts)
+
+        if not log_dir:
+            pl_module.print("无法解析 logger 保存目录，跳过保存配置文件")
+            return
+
+        ckpt_dir = os.path.join(log_dir, 'checkpoints')
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            dst_path = os.path.join(ckpt_dir, self.filename)
+            shutil.copyfile(self.config_path, dst_path)
+            pl_module.print(f"Saved config to {dst_path}")
+        except Exception as e:
+            pl_module.print(f"Failed to save config: {e}")

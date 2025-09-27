@@ -3,7 +3,7 @@ from os import listdir, makedirs, path
 from random import choices, randint
 from typing import Any, Callable, Dict
 
-import cv2 as cv
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -192,7 +192,6 @@ class LightningOpenX(LightningDataset):
 
         self.batch_size = batch_size
         self.resolution = (resolution, resolution)
-        self.num_frames = num_frames
 
         self.episodic = episodic
         self.shuffle_buffer_size = shuffle_buffer_size

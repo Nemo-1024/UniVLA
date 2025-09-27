@@ -31,7 +31,15 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
         ("bridge_dataset", 1.0),
         ("ego4d", 1.0),
     ],
-    
+    "lam": [
+        ("libero_10_no_noops", 1.0),
+        ("libero_spatial_no_noops", 1.0),
+        ("libero_object_no_noops", 1.0),
+        ("libero_goal_no_noops", 1.0),
+        ("droid", 0.1),
+        ("bridge_dataset", 1.0),
+        ("ego4d", 1.0),
+    ],
     # === Human-data Only ===
     "Ego4D": [ 
         ("ego4d", 1.0),
@@ -189,5 +197,11 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
     "libero_combined": [
         ("libero_combined", 1.0),
     ],
+    "libero":[
+        ("libero_10_no_noops", 1.0),
+        ("libero_spatial_no_noops", 1.0),
+        ("libero_object_no_noops", 1.0),
+        ("libero_goal_no_noops", 1.0),
+    ]
 }
 # fmt: on

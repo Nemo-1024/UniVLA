@@ -6,7 +6,7 @@ General utilities and classes for facilitating data loading and collation.
 import re
 import string
 from dataclasses import dataclass
-from typing import Callable, Dict, Sequence, Tuple, Any
+from typing import Callable, Dict, Sequence, Tuple, Any, Optional, List
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -105,67 +105,119 @@ class PaddedCollatorForActionPrediction:
     model_max_length: int
     pad_token_id: int
     padding_side: str = "right"
-    pixel_values_dtype: torch.dtype = torch.float32
+    # 在 collate 阶段批处理 VQ 编码与文本模板（必需）
+    action_tokenizer: Any = None
+    base_tokenizer: Any = None
+    predict_stop_token: bool = False
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        input_ids_list, labels_list = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        pixel_values = [instance["pixel_values"] for instance in instances]
-        if "dataset_name" in instances[0]:
-            dataset_names = [instance["dataset_name"] for instance in instances]
-        else:
-            dataset_names = None
+        # 批量 VQ 编码 + 文本模板生成（仅支持新路径，不保留向后兼容）
+        assert self.action_tokenizer is not None and self.base_tokenizer is not None, (
+            "action_tokenizer 和 base_tokenizer 需要在 Collator 初始化时提供，用于批量 VQ 编码与模板生成"
+        )
 
-        # For now, we only support Tokenizers with `padding_side = "right"` during training
-        #   => Handle padding via RNN Utils => `pad_sequence`
+        # 收集批次数据
+        lang_instructions_list: List[Any] = [instance["language_instruction"] for instance in instances]
+        initial_pixel_values_list = [instance["initial_pixel_values"] for instance in instances]
+        target_pixel_values_list = [instance["target_pixel_values"] for instance in instances]
+        pixel_values_list = [instance["pixel_values"] for instance in instances]
+        dataset_names = [instance["dataset_name"] for instance in instances] if "dataset_name" in instances[0] else None
+
+        # 批量 VQ 编码
+        # video_batch: [B, 2, C, H, W]
+        pair_stack = [torch.stack([ip, tp], dim=0) for ip, tp in zip(initial_pixel_values_list, target_pixel_values_list)]
+        video_batch = torch.stack(pair_stack, dim=0).to(self.action_tokenizer.device)
+        with torch.no_grad():
+            vq_out = self.action_tokenizer.vq_encode(video_batch)
+            latent_action_idx_batch = vq_out['indices']  # [B, Q]
+
+        # 构建 input_ids/labels
+        input_ids_list: List[torch.Tensor] = []
+        labels_list: List[torch.Tensor] = []
+        for b, lang_raw in enumerate(lang_instructions_list):
+            lang: str = lang_raw.decode().lower()
+
+            latent_action_idx = latent_action_idx_batch[b]
+            action_tokens = ''.join([f'<ACT_{int(i.item())}>' for i in latent_action_idx])
+
+            image_tokens = "<IMG_CONTEXT>" * 256
+            messages = [
+                {"role": "system", "content": (
+                    "You are a robot controller. Based on visual input and instructions, always output exactly 4 latent action tokens chosen from <ACT_0> ... <ACT_15>."
+                )},
+                {"role": "user", "content": f"{image_tokens}\nWhat action should the robot take to {lang}?"},
+                {"role": "assistant", "content": action_tokens}
+            ]
+
+            prefix_ids = self.base_tokenizer.apply_chat_template(
+                messages[:2], tokenize=True, add_generation_prompt=True
+            )
+            input_ids = self.base_tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False
+            )
+            input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+            input_ids_list.append(input_ids_tensor)
+
+
+            labels = input_ids_tensor.clone()
+            prefix_len = len(prefix_ids)
+            labels[:prefix_len] = IGNORE_INDEX
+            if not self.predict_stop_token:
+                # 一般 chat 模板末尾含 <eos><eot>，忽略之
+                labels[-2:] = IGNORE_INDEX
+            labels_list.append(labels)
+
+        # padding_side check
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
-        # Target padded sequence length
-        target_len = 350
 
-        # Build attention lengths from original sequence lengths (cap at target_len)
+        # 目标长度
+        target_len = 350
         seq_lengths = [min(t.size(0), target_len) for t in input_ids_list]
 
-        # Pad sequences to the longest in batch first
+        # Pad input_ids
+        # input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)[:, :self.model_max_length]
+
         input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
-        labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
-
-        # Right-truncate to target_len if necessary
         input_ids = input_ids[:, :target_len]
-        labels = labels[:, :target_len]
-
-        # Right-pad to target_len if necessary
         if input_ids.size(1) < target_len:
             pad_amt = target_len - input_ids.size(1)
             input_ids = F.pad(input_ids, (0, pad_amt), value=self.pad_token_id)
+        # labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)[:, :self.model_max_length]
+        labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
+        labels = labels[:, :target_len]
+        if labels.size(1) < target_len:
+            pad_amt = target_len - labels.size(1)
             labels = F.pad(labels, (0, pad_amt), value=IGNORE_INDEX)
 
-        # Build attention_mask from lengths (True for real tokens, False for padding), shape [B, target_len]
+        # Attention mask
         lengths_tensor = torch.tensor(seq_lengths, dtype=torch.long)
         attention_mask = (torch.arange(target_len, dtype=torch.long).unsqueeze(0) < lengths_tensor.unsqueeze(1))
 
-        # [Contract] For VLA Training =>> No "Unimodal" Data!
-        assert all([pv is not None for pv in pixel_values]), "Invalid VLA Example with `pixel_values = None`!"
-
-        # Stack all `pixel_values` --> depending on type is torch.Tensor or Dict[str, torch.Tensor]
-        if isinstance(pixel_values[0], torch.Tensor):
-            pixel_values = torch.stack(pixel_values)
-        elif isinstance(pixel_values[0], dict):
+        # Stack pixel_values
+        if isinstance(pixel_values_list[0], torch.Tensor):
+            pixel_values = torch.stack(pixel_values_list)
+        elif isinstance(pixel_values_list[0], dict):
             pixel_values = {
-                k: torch.stack([pixel_values[idx][k] for idx in range(len(input_ids))]) for k in pixel_values[0]
+                k: torch.stack([pixel_values_list[idx][k] for idx in range(len(input_ids))]) for k in pixel_values_list[0]
             }
         else:
-            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values_list[0])}")
 
+        # 输出
         output = dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=labels,
         )
+        if labels is not None:
+            output["labels"] = labels
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+
         return output
 
 
+@dataclass
 class PaddedCollatorForActionPrediction_LIBERO:
     model_max_length: int
     pad_token_id: int
@@ -173,76 +225,69 @@ class PaddedCollatorForActionPrediction_LIBERO:
     pixel_values_dtype: torch.dtype = torch.float32
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        input_ids_list, labels_list = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        input_ids_list = [instance["input_ids"] for instance in instances]
+        labels_list = [instance["labels"] for instance in instances if "labels" in instance] or None
         pixel_values = [instance["pixel_values"] for instance in instances]
-        if "dataset_name" in instances[0]:
-            dataset_names = [instance["dataset_name"] for instance in instances]
-        else:
-            dataset_names = None
+        dataset_names = [instance["dataset_name"] for instance in instances] if "dataset_name" in instances[0] else None
 
-        # For now, we only support Tokenizers with `padding_side = "right"` during training
-        #   => Handle padding via RNN Utils => `pad_sequence`
+        # padding_side check
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
+
         # Target padded sequence length
         target_len = 350
-
-        # Build attention lengths from original sequence lengths (cap at target_len)
         seq_lengths = [min(t.size(0), target_len) for t in input_ids_list]
 
-        # Pad sequences to the longest in batch first
+        # Pad input_ids
         input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
-        labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
-
-        # Right-truncate to target_len if necessary
         input_ids = input_ids[:, :target_len]
-        labels = labels[:, :target_len]
-
-        # Right-pad to target_len if necessary
         if input_ids.size(1) < target_len:
             pad_amt = target_len - input_ids.size(1)
             input_ids = F.pad(input_ids, (0, pad_amt), value=self.pad_token_id)
-            labels = F.pad(labels, (0, pad_amt), value=IGNORE_INDEX)
 
-        # Build attention_mask from lengths (True for real tokens, False for padding), shape [B, target_len]
+        # Pad labels if exist
+        if labels_list is not None:
+            labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
+            labels = labels[:, :target_len]
+            if labels.size(1) < target_len:
+                pad_amt = target_len - labels.size(1)
+                labels = F.pad(labels, (0, pad_amt), value=IGNORE_INDEX)
+        else:
+            labels = None
+
+        # Attention mask
         lengths_tensor = torch.tensor(seq_lengths, dtype=torch.long)
         attention_mask = (torch.arange(target_len, dtype=torch.long).unsqueeze(0) < lengths_tensor.unsqueeze(1))
 
-        # For low-level policy training
-        actions = [torch.from_numpy(instance["actions"]) for instance in instances]
-        actions = torch.stack(actions, dim=0)
-        proprio = [torch.from_numpy(instance["proprio"]) for instance in instances]
-        proprio = torch.stack(proprio, dim=0)
-        # Get latent action indexes
-        latent_action_idx = [instance["latent_action_idx"] for instance in instances]
-        latent_action_idx = torch.stack(latent_action_idx, dim=0)
-        image_features = [instance["image_features"] for instance in instances]
-        image_features = torch.stack(image_features, dim=0)
-        # [Contract] For VLA Training =>> No "Unimodal" Data!
-        assert all([pv is not None for pv in pixel_values]), "Invalid VLA Example with `pixel_values = None`!"
+        # Low-level policy inputs
+        actions = torch.stack([torch.from_numpy(instance["actions"]) for instance in instances], dim=0)
+        proprio = torch.stack([torch.from_numpy(instance["proprio"]) for instance in instances], dim=0)
+        latent_action_idx = torch.stack([instance["latent_action_idx"] for instance in instances], dim=0)
+        image_features = torch.stack([instance["image_features"] for instance in instances], dim=0)
 
-        # Stack all `pixel_values` --> depending on type is torch.Tensor or Dict[str, torch.Tensor]
+        # pixel_values
         if isinstance(pixel_values[0], torch.Tensor):
             pixel_values = torch.stack(pixel_values)
         elif isinstance(pixel_values[0], dict):
-            pixel_values = {
-                k: torch.stack([pixel_values[idx][k] for idx in range(len(input_ids))]) for k in pixel_values[0]
-            }
+            pixel_values = {k: torch.stack([pixel_values[idx][k] for idx in range(len(input_ids))]) for k in pixel_values[0]}
         else:
-            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values[0])}")
 
         output = dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            labels=labels,
             actions=actions,
             latent_action_idx=latent_action_idx,
             proprio=proprio,
             image_features=image_features,
         )
+        if labels is not None:
+            output["labels"] = labels
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+
         return output
+
 
 @dataclass
 class PaddedCollatorForActionPrediction_R2R:

@@ -166,136 +166,117 @@ class RLDSBatchTransformLIBERO:
     base_tokenizer: PreTrainedTokenizerBase
     image_transform: ImageTransform
     image_transform_lam: ImageTransform
+    train: bool = True                 # True: 训练模式，False: eval/predict
+    return_labels_for_eval: bool = False,
     predict_stop_token: bool = False
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name = rlds_batch["dataset_name"]
-        # img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        """Unified transform for training and evaluation/prediction."""
+        dataset_name = rlds_batch.get("dataset_name", "")
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
-        img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
         pixel_values = self.image_transform(img)
 
-        with torch.no_grad():
-            initial_pixel_values = self.image_transform_lam(img)
-            target_pixel_values= self.image_transform_lam(img_k)
-            video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
-            features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
-            latent_action_idx = features['indices'].squeeze()
-            image_features = features['features'].detach().to("cpu")
-        action_vocab = [f'<ACT_{i.item()}>' for i in latent_action_idx]   # [ACT_1, ACT_2, ... ACT_K]
+        # 训练阶段才生成 ground truth latent action tokens
+        action_tokens = None
+        latent_action_idx = None
+        if self.train:
+            img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
+            with torch.no_grad():
+                initial_pixel_values = self.image_transform_lam(img)
+                target_pixel_values = self.image_transform_lam(img_k)
+                video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
+                features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
+                latent_action_idx = features['indices'].squeeze()
+                image_features = features['features'].detach().to("cpu")
+            action_tokens = ''.join([f'<ACT_{i.item()}>' for i in latent_action_idx])
+        else:
+            # eval/predict阶段也可以生成 image_features，但不生成 labels
+            with torch.no_grad():
+                initial_pixel_values = self.image_transform_lam(img)
+                video = initial_pixel_values.unsqueeze(0).to(self.action_tokenizer.device)
+                features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
+                latent_action_idx = features['indices'].squeeze()
+                image_features = features['features'].detach().to("cpu")
 
-        action_tokens = ''
-        for i, action in enumerate(action_vocab):
-            action_tokens += action
-        # print(action_tokens)
-
-        # 未使用system prompt，参照univla的实现
-        # 使用 HF 官方 chat_template 构造对话
+        # 构造 prompt
         image_tokens = "<IMG_CONTEXT>" * 256
         messages = [
             {"role": "system", "content": "You are a robot controller. Based on visual input and instructions, always output exactly 4 latent action tokens chosen from <ACT_0> ... <ACT_15>."},
-            # 为 InternVL 显式插入图像占位符，使 input_ids 中含有 <image> token
-            {"role": "user", "content": f"{image_tokens}\nWhat action should the robot take to {lang}?"},
-            {"role": "assistant", "content": action_tokens},
+            {"role": "user", "content": f"{image_tokens}\nWhat action should the robot take to {lang}?"}
         ]
+        if self.train and action_tokens is not None:
+            messages.append({"role": "assistant", "content": action_tokens})
 
-        # 始终使用 HF chat_template：前缀（仅 user，带 generation_prompt）与完整（含 assistant）
-        prefix_ids = self.base_tokenizer.apply_chat_template(
-            messages[:2], tokenize=True, add_generation_prompt=True
-        )
-        input_ids = self.base_tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=False
-        )
-        labels = list(input_ids)
+        # HF chat_template 生成 input_ids
+        prefix_ids = self.base_tokenizer.apply_chat_template(messages[:2], tokenize=True, add_generation_prompt=True)
+        input_ids = self.base_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+        input_ids = torch.tensor(input_ids)
 
-        # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
-        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
-        input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+        out = {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "image_features": image_features,
+            "latent_action_idx": latent_action_idx,
+            "proprio": np.array(rlds_batch["observation"]["proprio"]),
+            "actions": np.array(rlds_batch["action"])
+        }
 
+        # 训练阶段生成 labels 并 mask prefix
+        if self.train or self.return_labels_for_eval:
+            labels = torch.tensor(list(input_ids))
+            prefix_len = len(prefix_ids)
+            labels[:prefix_len] = IGNORE_INDEX
+            if not self.predict_stop_token:
+                labels[-2:] = IGNORE_INDEX
+            out["labels"] = labels
 
-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        # 仅监督 assistant 段（从 prefix 之后到结尾）
-        prefix_len = len(prefix_ids)
-        labels[:prefix_len] = IGNORE_INDEX
-        if not self.predict_stop_token:
-            labels[-2:] = IGNORE_INDEX
-
-
-        proprio = np.array(rlds_batch["observation"]["proprio"])
-        actions = np.array(rlds_batch["action"])
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels,image_features=image_features, actions=actions, latent_action_idx=latent_action_idx,proprio=proprio)
+        return out
 
 
 @dataclass
 class RLDSBatchTransformLatentAction:
-    action_tokenizer: nn.Module
-    base_tokenizer: PreTrainedTokenizerBase
-    image_transform: ImageTransform
-    image_transform_lam: ImageTransform
-    predict_stop_token: bool = False
+    image_transform: Any
+    image_transform_lam: Any
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name= rlds_batch["dataset_name"]
-        # img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
-        lang = rlds_batch["task"]["language_instruction"].decode().lower()
+        """
+        轻量化 Transform：仅提取必要的数据供 Collator 批量 VQ 编码。
+        返回内容：
+        - language_instruction: 原始字节串（不 decode）
+        - pixel_values: 供 VLA 模型使用的图像张量
+        - initial_pixel_values, target_pixel_values: 供 LAM 的 VQ 编码（两帧）
+        - dataset_name: 可选，若存在则透传
+        """
+        # 原始语言（bytes，不解码）
+        language_instruction = rlds_batch["task"]["language_instruction"]
 
-        # print(len(rlds_batch["observation"]["image_primary"]))
+        # 当前帧与目标帧
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
         img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
+
+        # 图像预处理
         pixel_values = self.image_transform(img)
+        initial_pixel_values = self.image_transform_lam(img)
+        target_pixel_values = self.image_transform_lam(img_k)
 
-        with torch.no_grad():
-            initial_pixel_values = self.image_transform_lam(img)
-            target_pixel_values = self.image_transform_lam(img_k)
-            video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
-            latent_action_idx = self.action_tokenizer.vq_encode(video)['indices'].squeeze()
+        out: Dict[str, Any] = {
+            "language_instruction": language_instruction,
+            "pixel_values": pixel_values,
+            "initial_pixel_values": initial_pixel_values,
+            "target_pixel_values": target_pixel_values,
+        }
 
-        action_vocab = [f'<ACT_{i.item()}>' for i in latent_action_idx]   # [ACT_1, ACT_2, ... ACT_K]
+        # # 透传数据集名称（若存在）
+        # if "dataset_name" in rlds_batch:
+        #     out["dataset_name"] = rlds_batch["dataset_name"]
 
-        action_tokens = ''
-        for i, action in enumerate(action_vocab):
-            action_tokens += action
-
-        # 未使用system prompt，参照univla的实现
-        # 使用 HF 官方 chat_template 构造对话
-        image_tokens = "<IMG_CONTEXT>" * 256
-        messages = [
-            {"role": "system", "content": "You are a robot controller. Based on visual input and instructions, always output exactly 4 latent action tokens chosen from <ACT_0> ... <ACT_15>."},
-            # 为 InternVL 显式插入图像占位符，使 input_ids 中含有 <image> token
-            {"role": "user", "content": f"{image_tokens}\nWhat action should the robot take to {lang}?"},
-            {"role": "assistant", "content": action_tokens},
-        ]
-
-        # 始终使用 HF chat_template：前缀（仅 user，带 generation_prompt）与完整（含 assistant）
-        prefix_ids = self.base_tokenizer.apply_chat_template(
-            messages[:2], tokenize=True, add_generation_prompt=True
-        )
-        input_ids = self.base_tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=False
-        )
-        labels = list(input_ids)
-
-        # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
-        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
-        input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
-
-
-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        # 仅监督 assistant 段（从 prefix 之后到结尾）
-        prefix_len = len(prefix_ids)
-        labels[:prefix_len] = IGNORE_INDEX
-        if not self.predict_stop_token:
-            labels[-2:] = IGNORE_INDEX
-
-
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+        return out
 
 
 
+datasets_image_obs_keys = {"droid": 2, "bridge_dataset": 3,"droid_100": 2}
 
 @dataclass
 class RLDSBatchTransformVideo:
@@ -307,12 +288,27 @@ class RLDSBatchTransformVideo:
         
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])#.copy()
+        # 从非None的观察条目中等概率抽取图像，仅在指定候选键内选择
+        # 候选键：primary, secondary, third, wrist（兼容误写 wirst）
+        candidate_suffixes = ["primary", "secondary", "third"]
+        available_image_keys = []
+        for suffix in candidate_suffixes:
+            key = f"image_{suffix}"
+            if key in rlds_batch["observation"] and rlds_batch["observation"][key] is not None:
+                available_image_keys.append(key)
+        
+        if not available_image_keys:
+            raise ValueError("No available image observations found in the batch")
+        
+        # 随机选择一个可用的图像键
+        selected_image_key = np.random.choice(available_image_keys)
+        
+        img = Image.fromarray(rlds_batch["observation"][selected_image_key][0])#.copy()
         initial_pixel_values = self.image_transform(img)
         
         # the frame interval is already tackled in RLDS dataloader
         target_frame_index = -1
-        img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][target_frame_index])#.copy()
+        img_k = Image.fromarray(rlds_batch["observation"][selected_image_key][target_frame_index])#.copy()
         # print(sum(np.array(img_k) - np.array(img)))
         target_pixel_values= self.image_transform(img_k)
 
@@ -419,6 +415,7 @@ class RLDSDataset(IterableDataset):
     def __len__(self) -> int:
         """返回预计算的数据集长度，已经反映了所有transformation的影响"""
         return int(self.dataset_length)
+        # return int(256000)
 
     # === Explicitly Unused ===
     def __getitem__(self, idx: int) -> None:

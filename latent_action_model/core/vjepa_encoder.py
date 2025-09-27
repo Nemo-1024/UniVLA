@@ -16,7 +16,7 @@ import warnings
 from typing import Optional, Tuple
 from pathlib import Path
 from torchvision import transforms
-
+from transformers import AutoModel
 warnings.filterwarnings('ignore')
 
 # 使用 timm 的 ImageNet 标准化参数
@@ -41,7 +41,7 @@ class VJEPAEncoder(nn.Module):
     
     def __init__(
         self, 
-        model_id: str = 'vjepa2_vit_large'
+        model_id: str = "facebook/vjepa2-vitl-fpc64-256"
     ):
         """
         初始化V-JEPA2特征编码器
@@ -73,25 +73,37 @@ class VJEPAEncoder(nn.Module):
     def _load_model(self):
         """加载V-JEPA2模型编码器部分"""
         # print(f"🔄 加载V-JEPA2编码器...")
+        # 本地缓存路径
+
+        # 加载模型
+        # model = torch.hub.load(
+        #     repo_or_dir=repo_dir,  # 本地仓库
+        #     model="vjepa2_vit_large",
+        #     source='local',        # 告诉 torch.hub 只从本地加载
+        #     force_reload=False,
+        # )
+        # encoder,_ = model
         
-     
         # 加载V-JEPA2模型 (编码器+预测器的tuple)
-        model= torch.hub.load('facebookresearch/vjepa2', self.model_id)
+        # model= torch.hub.load('facebookresearch/vjepa2', self.model_id)
         # print(type(model), dir(model))
-        encoder,_ = model
+
         
         # 将编码器注册为子模块（这样参数会被Lightning正确识别）
-        self.encoder = encoder.to(self.device)
+        # self.encoder = encoder.to(self.device)
 
-        self.encoder.eval()
+        # self.encoder.eval()
         
-        # 冻结参数
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        # # 冻结参数
+        # for param in self.encoder.parameters():
+        #     param.requires_grad = False
             
         # print(f"✅ 编码器加载成功")
-            
-
+        model = AutoModel.from_pretrained(self.model_id,trust_remote_code=True,device_map=self.device, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2"  )
+        model.eval()    
+        self.model=model.to(self.device)
+        for param in self.model.parameters():
+            param.requires_grad = False
     
     def _prepare_temporal_input(self, videos: torch.Tensor) -> torch.Tensor:
         """
@@ -101,7 +113,7 @@ class VJEPAEncoder(nn.Module):
             videos: 输入视频张量 [B, T, C, H, W]
             
         Returns:
-            prepared_input: [B*T, C, 2, H, W] 格式的标准化张量
+            prepared_input: [B*T, 2, C, H, W] 格式的标准化张量
         """
         B, T, C, H, W = videos.shape
         
@@ -112,7 +124,7 @@ class VJEPAEncoder(nn.Module):
         # frames = self.ImageNet_transform(frames)
         
         # 复制每一帧以满足时间维度步长=2的要求
-        frames_duplicated = frames.unsqueeze(2).repeat(1, 1, 2, 1, 1)  # [B*T, C, 2, H, W]
+        frames_duplicated = frames.unsqueeze(1).repeat(1, 2, 1, 1, 1)  # [B*T, 2, C, H, W]
         
         return frames_duplicated
     
@@ -160,7 +172,7 @@ class VJEPAEncoder(nn.Module):
         
         # 通过编码器提取特征
         with torch.no_grad():
-            encoded_features = self.encoder(prepared_input)  # [B*T, K, D]
+            encoded_features = self.model.get_vision_features(prepared_input)  # [B*T, K, D]
         
         # 恢复批次格式
         batch_features = self._restore_batch_format(encoded_features, original_shape)  # [B, T, K, D]
@@ -169,16 +181,7 @@ class VJEPAEncoder(nn.Module):
         return batch_features  # [B, T, K, D]
 
     
-    def get_model_info(self) -> dict:
-        """获取编码器信息"""
-        return {
-            'model_id': self.model_id,
-            'feature_dim': self.feature_dim,
-            'device': str(self.device),
-            'total_params': sum(p.numel() for p in self.encoder.parameters()),
-            'encoder_type': type(self.encoder).__name__,
-            'purpose': 'LAM潜空间训练的视觉特征提取'
-        }
+
     
     def __repr__(self):
         return f"VJEPAEncoder(model={self.model_id}, device={self.device}, feature_dim={self.feature_dim})"

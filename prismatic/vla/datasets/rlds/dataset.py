@@ -40,6 +40,9 @@ overwatch = initialize_overwatch(__name__)
 # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch)
 tf.config.set_visible_devices([], "GPU")
 
+#bridge_dataset: 5HZ
+#libero: 10HZ
+#droid: 15HZ
 # From 3Hz to 5Hz control frequency
 datasets_with_lower_frequency = ['fractal20220817_data', 'toto', 'berkeley_autolab_ur5',#'bridge_oxe' 
 'nyu_franka_play_dataset_converted_externally_to_rlds', 
@@ -250,16 +253,16 @@ def make_dataset_from_rlds(
         dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
 
     # construct the dataset
-    # if "val" not in builder.info.splits:
-    #     split = "train[:95%]" if train else "train[95%:]"
-    #     print("cannot find val split, use train[:95%]")
-    # else:
-    #     split = "train" if train else "val"
+    if "val" not in builder.info.splits:
+        split = "train[:95%]" if train else "train[95%:]"
+        print("cannot find val split, use train[:95%]")
+    else:
+        split = "train" if train else "val"
     
-    split = "train[:95%]" if train else "train[95%:]"
+    # split = "train[:95%]" if train else "train[95%:]"
     # special case with process ego4d dataset
-    # if 'ego4d' in name:
-    #     split = "train"
+    if 'ego4d' in name:
+        split = "train"
 
     # === Distributed sharding via manual percent slicing (train only) ===
     # Ensure each rank gets a disjoint percent range inside the current split expression.
@@ -421,7 +424,7 @@ def apply_trajectory_transforms(
         window_size = 2
 
     if name in datasets_with_lower_frequency:
-        window_size = random.randint(3,5) if training_phase == 'lam' else 3
+        window_size = random.randint(3,5) if training_phase == 'lam' else 5
     
     if name in datasets_with_higher_frequency:
         window_size = random.randint(15,20) if training_phase == 'lam' else 15
@@ -430,11 +433,13 @@ def apply_trajectory_transforms(
     # 选择chunking策略
     if training_phase == 'post-training':
         transform = traj_transforms.chunk_act_obs_libero        # 完整窗口，最大重叠
-    elif training_phase == 'lam':
+    # elif training_phase == 'lam':
+    #     transform = traj_transforms.chunk_act_obs_half_stride    # 半步长，平衡重叠
+    #     # transform = traj_transforms.chunk_act_obs               # 标准版本，无重叠
+    elif train==False:
         transform = traj_transforms.chunk_act_obs_half_stride    # 半步长，平衡重叠
-        # transform = traj_transforms.chunk_act_obs               # 标准版本，无重叠
     else:       
-        transform = traj_transforms.chunk_act_obs_half_stride               # 标准版本，无重叠
+        transform = traj_transforms.chunk_act_obs               # 标准版本，无重叠
 
     dataset = dataset.traj_map(
         partial(
@@ -594,16 +599,6 @@ def make_interleaved_dataset(
         traj_read_threads: total number of parallel read workers for trajectory transforms, distributed across
             datasets according to their sampling weights. If None, defaults to AUTOTUNE for every dataset.
     """
-    # Set RNG seeds per-rank for determinism across hosts (TF, NumPy, Python)
-    try:
-        base_seed = int(os.environ.get("EXPERIMENT_GLOBAL_SEED", 42))
-        rank_seed = base_seed + overwatch.rank()
-        tf.random.set_seed(rank_seed)
-        np.random.seed(rank_seed)
-        random.seed(rank_seed)
-    except Exception:
-        pass
-
     # Default to uniform sampling (if `sample_weights` is not specified)
     if not sample_weights:
         sample_weights = [1.0] * len(dataset_kwargs_list)
@@ -615,158 +610,32 @@ def make_interleaved_dataset(
     if (traj_transform_kwargs is None) or (frame_transform_kwargs is None):
         raise ValueError("Missing `traj_transform_kwargs` and `frame_transform_kwargs`!")
 
-    # Helper: compute cardinality after trajectory chunking (before decode/augment)
-    def compute_post_chunk_frame_count(
-        base_dataset: dl.DLataset,
-        dataset_name: str,
-        rng_seed: int,
-    ):
-        # Ensure deterministic window selection per dataset
-        try:
-            random.seed(rng_seed)
-            np.random.seed(rng_seed)
-        except Exception:
-            pass
-
-        ds = apply_trajectory_transforms(
-            base_dataset,
-            **traj_transform_kwargs,
-            train=train,
-            name=dataset_name,
-            training_phase=training_phase,
-        ).flatten()
-
-        # Prefer TF cardinality; fallback to manual iteration if unknown
-        try:
-            card = ds.cardinality().numpy()
-        except Exception:
-            card = tf.data.UNKNOWN_CARDINALITY
-        if card in (tf.data.UNKNOWN_CARDINALITY, tf.data.INFINITE_CARDINALITY):
-            count = 0
-            iterator = ds.iterator()
-            if hasattr(overwatch, 'is_rank_zero') and overwatch.is_rank_zero():
-                iterator = tqdm(iterator, desc=f"Counting post-chunk frames: {dataset_name}", unit="chunk")
-            for _ in iterator:
-                count += 1
-            card = count
-        return int(card)
-
-    # Unique cache for normalized weights and dataset_len computed on rank0
-    cache_payload = {
-        "datasets": [{"name": d["name"], "data_dir": d.get("data_dir", "")} for d in dataset_kwargs_list],
-        "train": bool(train),
-        "training_phase": str(training_phase),
-        "traj_transform": {
-            "window_size": (traj_transform_kwargs or {}).get("window_size"),
-            "future_action_window_size": (traj_transform_kwargs or {}).get("future_action_window_size"),
-            "skip_unlabeled": (traj_transform_kwargs or {}).get("skip_unlabeled"),
-            "goal_relabeling_strategy": (traj_transform_kwargs or {}).get("goal_relabeling_strategy"),
-        },
-        "balance_weights": bool(balance_weights),
-        "world_size": int(overwatch.world_size()),
-        # Include raw user-provided sample weights so cache is invalidated when weights change
-        "sample_weights": [float(w) for w in (sample_weights or [])],
-    }
-    cache_key = hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode("utf-8"), usedforsecurity=False).hexdigest()
-    cache_dir = os.path.join(dataset_kwargs_list[0].get("data_dir", "."), "post_chunk_cache")
-    cache_path = os.path.join(cache_dir, f"post_chunk_{cache_key}.json")
-
-    # Compute per-dataset statistics and (on rank0 only) post-chunk frame counts
-    dataset_frame_counts, all_dataset_statistics = [], {}
-    # Prepare per-dataset seeds (deterministic across ranks)
-    per_ds_seeds = []
-    for ds_idx in range(len(dataset_kwargs_list)):
-        per_ds_seeds.append((rank_seed + ds_idx) if 'rank_seed' in locals() else (42 + ds_idx))
-
-    # Rank0 computes counts and writes cache; others wait
-    with overwatch.rank_zero_first():
-        if not tf.io.gfile.exists(cache_dir):
-            try:
-                tf.io.gfile.makedirs(cache_dir)
-            except Exception:
-                pass
-
-        if not tf.io.gfile.exists(cache_path):
-            tmp_frame_counts = []
-            for ds_idx, dataset_kwargs in enumerate(dataset_kwargs_list):
-                data_kwargs = copy.deepcopy(dataset_kwargs)
-                if "dataset_frame_transform_kwargs" in data_kwargs:
-                    data_kwargs.pop("dataset_frame_transform_kwargs")
-                base_dataset, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
-                all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
-                # Compute post-chunk frame count on non-repeated, non-decoded dataset
-                frame_count = compute_post_chunk_frame_count(base_dataset, dataset_kwargs["name"], per_ds_seeds[ds_idx])
-                tmp_frame_counts.append(frame_count)
-
-            # Derive normalized weights and dataset_len (use default sample_weights if None)
-            eff_weights = sample_weights if sample_weights else [1.0] * len(dataset_kwargs_list)
-            eff_weights = np.array(eff_weights, dtype=float)
-            if balance_weights:
-                eff_weights = eff_weights * np.array(tmp_frame_counts, dtype=float)
-            if eff_weights.sum() == 0:
-                eff_weights = np.array([1.0] * len(dataset_kwargs_list), dtype=float)
-            norm_weights = (eff_weights / eff_weights.sum()).tolist()
-
-            primary_dataset_indices = np.array([idx for idx in range(len(norm_weights)) if (sample_weights and sample_weights[idx] == 1.0)])
-            if primary_dataset_indices.size == 0:
-                primary_dataset_indices = np.arange(len(norm_weights))
-            dataset_len_rank0 = int((np.array(tmp_frame_counts, dtype=float) / np.array(norm_weights, dtype=float))[primary_dataset_indices].max())
-
-            meta = {"dataset_len": dataset_len_rank0, "sample_weights": norm_weights, "frame_counts": tmp_frame_counts}
-            try:
-                with tf.io.gfile.GFile(cache_path, "w") as f:
-                    json.dump(meta, f)
-            except Exception as e:
-                overwatch.warning(f"Failed to write post-chunk cache: {e}")
-
-    # All ranks read cache produced by rank0
-    try:
-        with tf.io.gfile.GFile(cache_path, "r") as f:
-            meta = json.load(f)
-        cached_norm_weights = np.array(meta.get("sample_weights"), dtype=float)
-        dataset_len = int(meta.get("dataset_len"))
-    except Exception as e:
-        # Fallback: compute locally (should be rare)
-        overwatch.warning(f"Post-chunk cache missing; computing locally on rank={overwatch.rank()} due to: {e}")
-        tmp_frame_counts = []
-        for ds_idx, dataset_kwargs in enumerate(dataset_kwargs_list):
-            data_kwargs = copy.deepcopy(dataset_kwargs)
-            if "dataset_frame_transform_kwargs" in data_kwargs:
-                data_kwargs.pop("dataset_frame_transform_kwargs")
-            base_dataset, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
-            all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
-            frame_count = compute_post_chunk_frame_count(base_dataset, dataset_kwargs["name"], per_ds_seeds[ds_idx])
-            tmp_frame_counts.append(frame_count)
-        eff_weights = sample_weights if sample_weights else [1.0] * len(dataset_kwargs_list)
-        eff_weights = np.array(eff_weights, dtype=float)
-        if balance_weights:
-            eff_weights = eff_weights * np.array(tmp_frame_counts, dtype=float)
-        if eff_weights.sum() == 0:
-            eff_weights = np.array([1.0] * len(dataset_kwargs_list), dtype=float)
-        cached_norm_weights = eff_weights / eff_weights.sum()
-        primary_dataset_indices = np.array([idx for idx in range(len(cached_norm_weights)) if (sample_weights and sample_weights[idx] == 1.0)])
-        if primary_dataset_indices.size == 0:
-            primary_dataset_indices = np.arange(len(cached_norm_weights))
-        dataset_len = int((np.array(tmp_frame_counts, dtype=float) / np.array(cached_norm_weights, dtype=float))[primary_dataset_indices].max())
+    # Get Dataset Sizes
+    dataset_sizes, all_dataset_statistics = [], {}
+    for dataset_kwargs in dataset_kwargs_list:
+        data_kwargs = copy.deepcopy(dataset_kwargs)
+        if "dataset_frame_transform_kwargs" in data_kwargs:
+            data_kwargs.pop("dataset_frame_transform_kwargs")
+        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
+        dataset_sizes.append(dataset_statistics["num_transitions"])
+        all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
 
     # Get the indices of the "primary" datasets (i.e., datasets with sample_weight == 1.0)
     primary_dataset_indices = np.array([idx for idx in range(len(sample_weights)) if sample_weights[idx] == 1.0])
-    if primary_dataset_indices.size == 0:
-        primary_dataset_indices = np.arange(len(sample_weights))
 
-    # Use cached normalized weights to ensure all ranks share identical sampling
-    sample_weights = cached_norm_weights
-    pprint_data_mixture(dataset_kwargs_list, sample_weights.tolist())
+    # Balance and Normalize Weights
+    if balance_weights:
+        sample_weights = np.array(sample_weights) * np.array(dataset_sizes)
+    sample_weights = np.array(sample_weights) / np.sum(sample_weights)
+    pprint_data_mixture(dataset_kwargs_list, sample_weights)
 
     # Effective Dataset Length = Number of samples until each dataset has completed at least one epoch
     #   =>> Note :: Only counting the "primary" datasets (i.e., datasets with sample_weight == 1.0)
-    # Use rank0 computed dataset_len to enforce identical epoch length across ranks
-    dataset_len = int(dataset_len)
+    dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices].max())
 
     # Allocate Threads based on Weights
-    weights_np = np.array(sample_weights, dtype=float)
-    threads_per_dataset = allocate_threads(traj_transform_threads, weights_np)
-    reads_per_dataset = allocate_threads(traj_read_threads, weights_np)
+    threads_per_dataset = allocate_threads(traj_transform_threads, sample_weights)
+    reads_per_dataset = allocate_threads(traj_read_threads, sample_weights)
 
     overwatch.info("Threads per Dataset: %s", threads_per_dataset)
     overwatch.info("Reads per Dataset: %s", reads_per_dataset)
@@ -774,30 +643,24 @@ def make_interleaved_dataset(
     # Construct Datasets
     overwatch.info("Constructing datasets...")
     datasets = []
-    for ds_idx, (dataset_kwargs, threads, reads) in enumerate(zip(
+    for dataset_kwargs, threads, reads in zip(
         dataset_kwargs_list,
         threads_per_dataset,
         reads_per_dataset,
-    )):
+    ):
         dataset_frame_transform_kwargs = (
             dataset_kwargs.pop("dataset_frame_transform_kwargs")
             if "dataset_frame_transform_kwargs" in dataset_kwargs
             else {}
         )
-        # Ensure trajectory random choices (e.g., window size) match the count pass
-        try:
-            per_ds_seed = rank_seed + ds_idx if 'rank_seed' in locals() else (42 + ds_idx)
-            random.seed(per_ds_seed)
-            np.random.seed(per_ds_seed)
-        except Exception:
-            pass
         dataset, _ = make_dataset_from_rlds(
             **dataset_kwargs,
             train=train,
             num_parallel_calls=threads,
             num_parallel_reads=reads,
-            dataset_statistics=all_dataset_statistics.get(dataset_kwargs["name"]),
+            dataset_statistics=all_dataset_statistics[dataset_kwargs["name"]],
         )
+        dataset = dataset.ignore_errors()
         dataset = apply_trajectory_transforms(
             dataset.repeat(),
             **traj_transform_kwargs,
@@ -807,14 +670,10 @@ def make_interleaved_dataset(
             training_phase=training_phase,
         ).flatten(num_parallel_calls=threads)
         dataset = apply_per_dataset_frame_transforms(dataset, **dataset_frame_transform_kwargs)
-        
-        # 为每个数据集添加 ignore_errors 以跳过有问题的样本
-        dataset = dataset.ignore_errors()
-        
         datasets.append(dataset)
-
+        dataset = dataset.ignore_errors()
     # Interleave at the Frame Level
-    dataset: dl.DLataset = dl.DLataset.sample_from_datasets(datasets, weights_np)
+    dataset: dl.DLataset = dl.DLataset.sample_from_datasets(datasets, sample_weights)
 
     # Validation =>> fix a single shuffle buffer of data and cache it in RAM; prevents gradual memory increase!
     if not train:
@@ -827,9 +686,6 @@ def make_interleaved_dataset(
     # Apply Frame Transforms
     overwatch.info("Applying frame transforms on dataset...")
     dataset = apply_frame_transforms(dataset, **frame_transform_kwargs, train=train)
-    
-    # 在帧变换后再次添加 ignore_errors 以跳过变换过程中的错误
-    dataset = dataset.ignore_errors()
 
     # [Contract] When training VLA Policies, we let the Collator handle Batching!
     if batch_size is not None:
@@ -837,5 +693,8 @@ def make_interleaved_dataset(
 
     # Note =>> Seems to reduce memory usage without affecting speed?
     dataset = dataset.with_ram_budget(1)
+
+    # Save for Later
+    dataset.sample_weights = sample_weights
 
     return dataset, dataset_len, all_dataset_statistics
