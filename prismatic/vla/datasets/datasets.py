@@ -162,75 +162,42 @@ class RLDSBatchTransformLIBERO_withHis:
 
 @dataclass
 class RLDSBatchTransformLIBERO:
-    action_tokenizer: nn.Module
-    base_tokenizer: PreTrainedTokenizerBase
-    image_transform: ImageTransform
-    image_transform_lam: ImageTransform
-    train: bool = True                 # True: 训练模式，False: eval/predict
-    return_labels_for_eval: bool = False,
-    predict_stop_token: bool = False
+    image_transform: Any
+    image_transform_lam: Any
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Unified transform for training and evaluation/prediction."""
-        dataset_name = rlds_batch.get("dataset_name", "")
-        lang = rlds_batch["task"]["language_instruction"].decode().lower()
+        """
+        轻量化 Transform：仅提取必要的数据供 Collator 批量 VQ 编码。
+        返回内容：
+        - language_instruction: 原始字节串（不 decode）
+        - pixel_values: 供 VLA 模型使用的图像张量
+        - initial_pixel_values, target_pixel_values: 供 LAM 的 VQ 编码（两帧）
+        - dataset_name: 可选，若存在则透传
+        """
+        # 原始语言（bytes，不解码）
+        language_instruction = rlds_batch["task"]["language_instruction"]
 
+        # 当前帧与目标帧
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
+
+        # 图像预处理
         pixel_values = self.image_transform(img)
+        initial_pixel_values = self.image_transform_lam(img)
+        target_pixel_values = self.image_transform_lam(img_k)
 
-        # 训练阶段才生成 ground truth latent action tokens
-        action_tokens = None
-        latent_action_idx = None
-        if self.train:
-            img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
-            with torch.no_grad():
-                initial_pixel_values = self.image_transform_lam(img)
-                target_pixel_values = self.image_transform_lam(img_k)
-                video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
-                features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
-                latent_action_idx = features['indices'].squeeze()
-                image_features = features['features'].detach().to("cpu")
-            action_tokens = ''.join([f'<ACT_{i.item()}>' for i in latent_action_idx])
-        else:
-            # eval/predict阶段也可以生成 image_features，但不生成 labels
-            with torch.no_grad():
-                initial_pixel_values = self.image_transform_lam(img)
-                video = initial_pixel_values.unsqueeze(0).to(self.action_tokenizer.device)
-                features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
-                latent_action_idx = features['indices'].squeeze()
-                image_features = features['features'].detach().to("cpu")
-
-        # 构造 prompt
-        image_tokens = "<IMG_CONTEXT>" * 256
-        messages = [
-            {"role": "system", "content": "You are a robot controller. Based on visual input and instructions, always output exactly 4 latent action tokens chosen from <ACT_0> ... <ACT_15>."},
-            {"role": "user", "content": f"{image_tokens}\nWhat action should the robot take to {lang}?"}
-        ]
-        if self.train and action_tokens is not None:
-            messages.append({"role": "assistant", "content": action_tokens})
-
-        # HF chat_template 生成 input_ids
-        prefix_ids = self.base_tokenizer.apply_chat_template(messages[:2], tokenize=True, add_generation_prompt=True)
-        input_ids = self.base_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-        input_ids = torch.tensor(input_ids)
-
-        out = {
+        out: Dict[str, Any] = {
+            "language_instruction": language_instruction,
             "pixel_values": pixel_values,
-            "input_ids": input_ids,
-            "image_features": image_features,
-            "latent_action_idx": latent_action_idx,
+            "initial_pixel_values": initial_pixel_values,
+            "target_pixel_values": target_pixel_values,
             "proprio": np.array(rlds_batch["observation"]["proprio"]),
             "actions": np.array(rlds_batch["action"])
         }
 
-        # 训练阶段生成 labels 并 mask prefix
-        if self.train or self.return_labels_for_eval:
-            labels = torch.tensor(list(input_ids))
-            prefix_len = len(prefix_ids)
-            labels[:prefix_len] = IGNORE_INDEX
-            if not self.predict_stop_token:
-                labels[-2:] = IGNORE_INDEX
-            out["labels"] = labels
+        # # 透传数据集名称（若存在）
+        # if "dataset_name" in rlds_batch:
+        #     out["dataset_name"] = rlds_batch["dataset_name"]
 
         return out
 

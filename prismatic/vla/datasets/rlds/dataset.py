@@ -632,6 +632,8 @@ def make_interleaved_dataset(
     # Effective Dataset Length = Number of samples until each dataset has completed at least one epoch
     #   =>> Note :: Only counting the "primary" datasets (i.e., datasets with sample_weight == 1.0)
     dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices].max())
+    if train==False:
+        dataset_len = min(dataset_len, shuffle_buffer_size)
 
     # Allocate Threads based on Weights
     threads_per_dataset = allocate_threads(traj_transform_threads, sample_weights)

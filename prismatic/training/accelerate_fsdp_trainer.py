@@ -129,7 +129,7 @@ class BatchActionAccuracyAndBestCallback(TrainerCallback):
 
 
 
-class LoggingAndWandbCallback(TrainerCallback):
+class LoggingCallback(TrainerCallback):
     """同时写入本地日志与 wandb，并处理 train/val 前缀。"""
 
     def __init__(self, overwatch=None, log_to_local=True):
@@ -249,7 +249,7 @@ def run_latent_action_training(
         SaveProcessorCallback(processor=getattr(vlm, "processor", None), tokenizer=tokenizer),
         BatchActionAccuracyAndBestCallback(action_token_begin_id=action_begin, run_dir=ckpt_output_dir, overwatch=overwatch),
         # 避免与 report_to=["wandb"] 重复上报，这里仅做本地日志
-        LoggingAndWandbCallback(overwatch=overwatch, log_to_local=True),
+        LoggingCallback(overwatch=overwatch, log_to_local=True),
     ]
 
 
@@ -257,78 +257,26 @@ def run_latent_action_training(
     # 评估指标：基于 token id/labels 计算 action accuracy
     # 为减少内存与通信，将 logits 在设备上转为 token id 再传入 metrics
     def preprocess_logits_for_metrics_fn(logits, labels):
-        """在设备上将 logits->argmax 的 token ids，显著降低从 GPU→CPU 的数据量。
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]
+        pred_ids = logits.argmax(dim=-1)
 
-        返回的对象会被作为 predictions 传入 compute_metrics。
-        兼容形态：
-        - logits: Tensor 或 (loss, logits) 或 (logits,) 等。
-        - labels: 可能为 None 或张量，原样返回即可。
-        """
-        try:
-            # 解包常见元组： (loss, logits) 或 (logits, ...)
-            if isinstance(logits, (tuple, list)):
-                logits = logits[0] if len(logits) > 0 else logits
-            # 形状 [B, T, V] → argmax
-            if hasattr(logits, "ndim") and logits.ndim >= 3:
-                pred_ids = logits.argmax(dim=-1)
-            else:
-                pred_ids = logits
-            # 保持在 GPU 上，等待 Accelerate 在内部进行 all_gather；仅返回 token ids
-            pred_ids = pred_ids.detach().to(torch.int64).contiguous()
+        if labels is None:
             return pred_ids
-        except Exception:
-            # 回退：不做预处理
-            return logits
 
-    def _to_numpy_safe(x):
-        # 已是 numpy 则原样；是 Tensor（可能在 GPU），则搬到 CPU 再转；其他尽力 asarray
-        try:
-            import numpy as _np
-            if isinstance(x, torch.Tensor):
-                return x.detach().to("cpu").numpy()
-            if hasattr(x, "numpy"):
-                return x.numpy()
-            return _np.asarray(x)
-        except Exception:
-            return x
+        mask = (labels != -100) & (labels >= action_begin)
+        correct = ((pred_ids == labels) & mask).sum(dim=-1)  # [B]
+        total = mask.sum(dim=-1)                              # [B]
 
-    # 注意：compute_metrics 现在假设 predictions 已是 token id（由 preprocess_logits_for_metrics 提供）
-    def compute_metrics_fn(eval_pred: EvalPrediction) -> Dict[str, float]:
-        """从 EvalPrediction 计算动作 token 精度（predictions 已为 token ids）。
+        return torch.stack([correct, total], dim=-1)  # [B, 2]
 
-        仅在 labels 中 >= action_begin 的位置计算精度，并 mask 掉 -100。
-        """
-        predictions = eval_pred.predictions
-        labels = eval_pred.label_ids
 
-        # 取第一项（有些版本会包一层 list/tuple）
-        if isinstance(predictions, (tuple, list)):
-            predictions = predictions[0]
-        if isinstance(labels, (tuple, list)):
-            labels = labels[0]
-
-        pred_ids = _to_numpy_safe(predictions)
-        lab = _to_numpy_safe(labels)
-
-        # 对齐长度
-        try:
-            min_len = min(pred_ids.shape[-1], lab.shape[-1])
-            pred_ids = pred_ids[..., :min_len]
-            lab = lab[..., :min_len]
-        except Exception:
-            return {"action_accuracy": 0.0}
-
-        # mask: 有效标签且为动作 token 区间
-        mask = (lab != -100) & (lab >= action_begin)
-        try:
-            total = mask.sum()
-            if total == 0:
-                return {"action_accuracy": 0.0}
-            correct = (pred_ids[mask] == lab[mask]).sum()
-            acc = float(correct) / float(total)
-        except Exception:
-            return {"action_accuracy": 0.0}
-        return {"action_accuracy": acc}
+    def compute_metrics_fn(eval_pred: EvalPrediction):
+        preds = eval_pred.predictions  # numpy array, shape [N, 2]
+        correct = preds[:, 0].sum(dtype=np.int64)
+        total = preds[:, 1].sum(dtype=np.int64)
+        acc = (correct / total) if total > 0 else 0.0
+        return {"action_accuracy": float(acc)}
 
     trainer = Seq2SeqTrainer(
         model=vlm,
