@@ -13,16 +13,16 @@ V-JEPA2 特征编码器
 import torch
 import torch.nn as nn
 import warnings
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, Sequence
 from pathlib import Path
-from torchvision import transforms
 from transformers import AutoModel
+from .cosmos_tokenizer.image_lib import ImageTokenizer
 warnings.filterwarnings('ignore')
-
-# 使用 timm 的 ImageNet 标准化参数
+from torchvision import transforms
+import math
+import torch.nn.functional as F
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
-
 
 class VJEPAEncoder(nn.Module):
     """
@@ -58,132 +58,255 @@ class VJEPAEncoder(nn.Module):
         # self.encoder = None
         self.feature_dim = 1024  # V-JEPA2 ViT Large 特征维度
         
-        #  标准化转换
-        # self.ImageNet_transform = transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
-        
-        # 加载模型
-        self._load_model()
-        
-        # print(f"✅ V-JEPA2特征编码器初始化完成")
-        # print(f"   - 设备: {self.device}")
-        # print(f"   - 模型: {self.model_id}")
-        # print(f"   - 特征维度: {self.feature_dim}")
-        # print(f"   - 用途: LAM潜空间训练的视觉特征提取")
-    
-    def _load_model(self):
-        """加载V-JEPA2模型编码器部分"""
-        # print(f"🔄 加载V-JEPA2编码器...")
-        # 本地缓存路径
 
         # 加载模型
-        # model = torch.hub.load(
-        #     repo_or_dir=repo_dir,  # 本地仓库
-        #     model="vjepa2_vit_large",
-        #     source='local',        # 告诉 torch.hub 只从本地加载
-        #     force_reload=False,
-        # )
-        # encoder,_ = model
-        
-        # 加载V-JEPA2模型 (编码器+预测器的tuple)
-        # model= torch.hub.load('facebookresearch/vjepa2', self.model_id)
-        # print(type(model), dir(model))
-
-        
-        # 将编码器注册为子模块（这样参数会被Lightning正确识别）
-        # self.encoder = encoder.to(self.device)
-
-        # self.encoder.eval()
-        
-        # # 冻结参数
-        # for param in self.encoder.parameters():
-        #     param.requires_grad = False
-            
-        # print(f"✅ 编码器加载成功")
-        model = AutoModel.from_pretrained(self.model_id,trust_remote_code=True,device_map=self.device, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2"  )
-        model.eval()    
-        self.model=model.to(self.device)
+        self.model = AutoModel.from_pretrained(self.model_id,trust_remote_code=True,device_map=self.device, dtype=torch.bfloat16)    
+        self.model.to(self.device).eval()
         for param in self.model.parameters():
             param.requires_grad = False
-    
-    def _prepare_temporal_input(self, videos: torch.Tensor) -> torch.Tensor:
-        """
-        将视频数据转换为3D patch编码器的输入格式，包含ImageNet标准化
-        
-        Args:
-            videos: 输入视频张量 [B, T, C, H, W]
-            
-        Returns:
-            prepared_input: [B*T, 2, C, H, W] 格式的标准化张量
-        """
-        B, T, C, H, W = videos.shape
-        
-        # 重塑为 [B*T, C, H, W]
-        frames = videos.view(-1, C, H, W)  # [B*T, C, H, W]
-        
-        # 应用 ImageNet 标准化转换
-        # frames = self.ImageNet_transform(frames)
-        
-        # 复制每一帧以满足时间维度步长=2的要求
-        frames_duplicated = frames.unsqueeze(1).repeat(1, 2, 1, 1, 1)  # [B*T, 2, C, H, W]
-        
-        return frames_duplicated
-    
-    def _restore_batch_format(self, features: torch.Tensor, original_shape: Tuple[int, ...]) -> torch.Tensor:
-        """
-        将编码器输出恢复为批次格式
-        
-        Args:
-            features: 编码器输出 [B, T, S, K]
-            original_shape: 原始输入形状 (B, T, C, H, W)
-            
-        Returns:
-            reshaped_features: [B, T, S, K] 格式的特征，S为空间特征数，K为特征维度
-        """
-        B, T = original_shape[:2]
-        BT, S, K = features.shape #S=256,K=1024
-        
-        # 恢复为 [B, T, S, K]
-        return features.view(B, T, S, K)
-    
-    def encode_video_frames(
+    @torch.no_grad()
+    def encode(
         self, 
-        videos: torch.Tensor, 
+        images: torch.Tensor, 
+        norm_latents: bool = False,
+        n: int=-1
     ) -> torch.Tensor:
         """
-        编码视频帧序列为特征表示
-        
-        Args:
-            videos: 输入视频张量 [B, T, C, H, W]
-            return_sequence: 是否返回完整序列特征，否则返回时间平均特征
-            
-        Returns:
-            features: 特征张量
-                - return_sequence=True: [B, T, K, D] K为空间特征数，D为特征维度
-                - return_sequence=False: [B, K, D] 时间维度平均后的特征
+        输入：[B*T, C, H, W]
+        输出：[B*T, K, D]
         """
-        if videos.dim() != 5:
-            raise ValueError(f"期望5D张量 [B, T, C, H, W]，得到: {videos.shape}")
-        
-        original_shape = videos.shape
-        B, T = original_shape[:2]
-        
-        # 转换数据格式以适配3D patch编码器（包含标准化）
-        prepared_input = self._prepare_temporal_input(videos.to(self.device))
-        
+        if images.dim() != 4:
+            B, T, C, H, W = images.shape
+            images = images.reshape(-1, C, H, W)
+        else:
+            B, C, H, W = images.shape
+            T=1
+        assert images.dim() == 4, f"期望4D张量 [B*T, C, H, W]，得到: {images.shape}，图片维度不正确"
+        video_like = images.unsqueeze(1).repeat(1, 2, 1, 1, 1)  # [B*T, 2, C, H, W]
         # 通过编码器提取特征
+
+        encoded_features = self.model.get_vision_features(video_like)  # [B*T, K, D]
+        if norm_latents:
+            encoded_features = F.normalize(encoded_features, dim=-1)
+        # print(encoded_features.min(), encoded_features.max(), encoded_features.mean(), encoded_features.std())
+        return encoded_features.reshape(B, T, encoded_features.shape[-2], encoded_features.shape[-1]).detach()  # [B, T, K, D]
+        
+    @torch.no_grad()
+    def encode_video(
+        self, 
+        videos: torch.Tensor, 
+        norm_latents: bool = False,
+    ) -> torch.Tensor:
+        """
+        输入：[B, T, C, H, W]
+        输出：[B, T//2, 256, D]
+        """
+        B, T, C, H, W = videos.shape
         with torch.no_grad():
-            encoded_features = self.model.get_vision_features(prepared_input)  # [B*T, K, D]
-        
-        # 恢复批次格式
-        batch_features = self._restore_batch_format(encoded_features, original_shape)  # [B, T, K, D]
-        
-
-        return batch_features  # [B, T, K, D]
-
-    
-
-    
-    def __repr__(self):
-        return f"VJEPAEncoder(model={self.model_id}, device={self.device}, feature_dim={self.feature_dim})"
+            encoded_features = self.model.get_vision_features(videos)
+        if norm_latents:
+            encoded_features = F.normalize(encoded_features, dim=-1)
+        return encoded_features.reshape(B, T//2, 256, self.feature_dim).detach()
 
 
+class DINOv3Encoder(nn.Module):
+    def __init__(
+        self,
+        model_id: str = "facebook/dinov3-vitl16-pretrain-lvd1689m",
+    ):
+        super().__init__()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_id = model_id
+        # 加载 DINOv3 模型
+        model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True)
+        model.eval()
+        self.model = model.to(self.device)
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # 记录特征维度
+        hidden_size = getattr(self.model.config, 'hidden_size', None)
+        self.feature_dim = int(hidden_size) if hidden_size is not None else 1024
+
+    @torch.no_grad()
+    def encode(self, images: torch.Tensor, norm_latents: bool = False, remove_cls: bool = True, n: Union[int, Sequence] = [4, 11, 17, -1] ) -> torch.Tensor:
+        """
+        输入：[B, T, C, H, W]
+        输出：[B, T, K, D]
+        """
+        if images.dim() != 4:
+            B, T, C, H, W = images.shape
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        else:
+            B, C, H, W = images.shape
+            T=1
+        # 若仅需要最后一层，避免请求所有 hidden_states 以减少内存与时延
+        need_all_layers = not (isinstance(n, int) and n == -1)
+        outputs = self.model(pixel_values=images, output_hidden_states=need_all_layers)
+        if not need_all_layers:
+            last = outputs.last_hidden_state  # [B*T, 5+K, D]（含若干特殊token）
+            if remove_cls:
+                tokens = last[:, 5:, :]
+            else:
+                tokens = last
+            features = tokens.reshape(B, T, -1, self.feature_dim)
+            if norm_latents:
+                features = F.normalize(features, dim=-1)
+            return features.detach()
+        else:
+            hidden_states = outputs.hidden_states
+            if isinstance(n, int):
+                list_n = [n]
+            else:
+                list_n = n
+            if remove_cls:
+                features = [hidden_states[i][:, 5:, :].reshape(B, T, -1, self.feature_dim) for i in list_n]
+            else:
+                features = [hidden_states[i].reshape(B, T, -1, self.feature_dim) for i in list_n]
+            if norm_latents:
+                features = [F.normalize(i, dim=-1) for i in features]
+            return features[0].detach() if isinstance(n, int) else [i.detach() for i in features]
+
+class CosmosAutoencoder(nn.Module):
+    """
+    Cosmos 图像自编码器（支持编码与解码）。
+
+    包装 `cosmos_tokenizer.ImageTokenizer`，提供：
+    - encode:  输入 [B*T,3,H,W]（ImageNet 标准化）→ 内部反标准化→[-1,1]→连续/离散潜变量
+    - decode:  输入潜变量 → [B,3,H,W]（[-1,1] 范围）
+    - autoencode: 编解码合一
+    - encode_video_frames / decode_video_frames: 处理 [B,T,3,H,W]
+
+    说明（简化策略）：
+    - `model_id` 必须是一个本地目录路径，且目录中包含权重文件。
+    - 优先加载 `autoencoder.jit`；否则使用 `encoder.jit` 与 `decoder.jit`。
+    - 输入假定为 ImageNet 标准化（(x-mean)/std），类内会先反标准化到 [0,1]，再映射到 [-1,1] 后交由编码器。
+    """
+
+    def __init__(
+        self,
+        model_id: str = "cosmos:Cosmos-0.1-Tokenizer-CI16x16",
+        encoder_ckpt: Optional[str] = None,
+        decoder_ckpt: Optional[str] = None,
+        device: Optional[str] = None,
+        dtype: str = "bfloat16",
+        tokenizer_config: Optional[dict] = None,
+    ):
+        super().__init__()
+        self.model_id = model_id
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype_str = dtype
+
+        # 严格场景：model_id 必须是目录；优先 autoencoder.jit，否则 encoder/decoder.jit
+        model_path = Path(self.model_id)
+        if not (model_path.exists() and model_path.is_dir()):
+            raise ValueError("CosmosAutoencoder 期望 model_id 为本地目录路径，且包含权重文件。")
+
+        ae = model_path / "autoencoder.jit"
+        enc = model_path / "encoder.jit"
+        dec = model_path / "decoder.jit"
+
+        # 优先使用独立的 encoder/decoder 以支持 encode/decode 接口；若缺失再退回完整 autoencoder
+        if enc.exists() and dec.exists():
+            self.tokenizer = ImageTokenizer(
+                checkpoint_enc=str(enc),
+                checkpoint_dec=str(dec),
+                tokenizer_config=tokenizer_config,
+                device=self.device,
+                dtype=self.dtype_str,
+            )
+        elif ae.exists():
+            self.tokenizer = ImageTokenizer(
+                checkpoint=str(ae),
+                tokenizer_config=tokenizer_config,
+                device=self.device,
+                dtype=self.dtype_str,
+            )
+        else:
+            raise FileNotFoundError(
+                f"未找到有效权重：{ae} 或者成对的 {enc} 与 {dec}"
+            )
+                # 冻结视觉编码器参数，避免其参与训练图却未产生梯度被 DDP 标记为未使用
+        for p in self.tokenizer.parameters():
+            p.requires_grad = False
+        self.tokenizer.eval()
+        # 预定义 ImageNet 反标准化参数（match torchvision/timm）
+        self._imagenet_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+        self._imagenet_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+
+    @torch.no_grad()
+    def _denormalize_imagenet_to_unit(self, images: torch.Tensor) -> torch.Tensor:
+        """将 ImageNet 标准化张量还原到 [0,1]，输入 [B*T,3,H,W]。"""
+        images = images.float() * self._imagenet_std + self._imagenet_mean
+        return images
+
+    @torch.no_grad()
+    def _unit_to_negone_posone(self, images01: torch.Tensor) -> torch.Tensor:
+        """将 [0,1] 映射到 [-1,1]。"""
+        return images01.mul(2.0).sub(1.0).clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def encode(self, images: torch.Tensor, norm_latents: bool = False):
+        """编码图像为潜变量（输入为 ImageNet 标准化的 [B*T,3,H,W]）。
+            连续 CI：Tuple(Tensor[B*T,h*w,16])
+        """
+        if images.dim() != 4:
+            B, T, C, H, W = images.shape
+            images = images.reshape(-1, images.shape[-3], images.shape[-2], images.shape[-1])
+        else:
+            B, C, H, W = images.shape
+            T=1
+        images = self._denormalize_imagenet_to_unit(images)
+        imgs11 = self._unit_to_negone_posone(images).to(getattr(torch, self.dtype_str))
+        (token,) = self.tokenizer.encode(imgs11)
+        BT, K, H, W = token.shape
+        token = token.reshape(B, T, K, H*W).permute(0, 1, 3, 2).contiguous().detach()
+        return token 
+
+    @torch.no_grad()
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """从潜变量解码图像。
+
+        Args:
+            latent: 连续 CI [B, h*w, K]
+        Returns:
+            Tensor[B,3,H,W]，范围[-1,1]
+        """
+        assert latent.shape[1] == 256, f"期望256个token，得到: {latent.shape[1]}"
+        latent = latent.permute(0, 2, 1).contiguous()
+        latent = latent.reshape(latent.shape[0], -1, 16, 16)
+        return self.tokenizer.decode(latent).clamp(-1.0,1.0)
+
+    @torch.no_grad()
+    def autoencode(self, images: torch.Tensor) -> torch.Tensor:
+        """图像自编码（输入为 ImageNet 标准化的 [B*T,3,H,W]，输出范围[-1,1]）。"""
+        if images.dim() != 4:
+            raise ValueError(f"期望 4D [B*T,3,H,W]，得到: {images.shape}")
+        imgs01 = self._denormalize_imagenet_to_unit(images)
+        imgs11 = self._unit_to_negone_posone(imgs01).to(getattr(torch, self.dtype_str))
+        return self.tokenizer.autoencode(imgs11).clamp(-1.0,1.0)
+
+ 
+
+def build_vision_encoder(model_id: str) -> nn.Module:
+    """
+    根据 model_id 中的关键词选择并构建视觉编码器实例。
+
+    规则：
+    - 包含 "dino" -> 返回 DINOv3Encoder
+    - 包含 "vjepa" 或 "jepa" -> 返回 VJEPAEncoder
+    - 包含 "cosmos" -> 返回 CosmosAutoencoder
+    - 否则抛出异常
+    """
+
+    key = model_id.lower()
+    if "dino" in key:
+        return DINOv3Encoder(model_id="/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" ), 1024
+    elif "vjepa" in key or "jepa" in key:
+        return VJEPAEncoder(model_id="/mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256"), 1024
+    elif "cosmos" in key:
+        return CosmosAutoencoder(model_id="/mnt/mnt/public/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"), 16
+
+    else:
+        print(f"未使用预训练模型，采用PatchEmbed编码器")
+        return None, 0

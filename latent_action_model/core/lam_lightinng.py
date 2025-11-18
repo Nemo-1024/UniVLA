@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Optional, Callable, Iterable
+from typing import Dict, Tuple, Optional, Callable, Iterable, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,11 +11,14 @@ OptimizerCallable = Callable[[Iterable], Optimizer]
 from accelerate import PartialState
 import wandb
 # 导入 core 中的模型组件
-from .lam_model import LatentLAMModel, PhysicalGroundingLoss
+from .lam_model import LatentLAMModel
 import logging
 logging.basicConfig(format='%(message)s', level=logging.INFO)
 import os
 import shutil
+from .utils.utils import eef_reconstruction_loss
+import importlib
+
 
 class VJEPA_LAM(LightningModule):
     """
@@ -29,21 +32,19 @@ class VJEPA_LAM(LightningModule):
         self,
         # 模型架构参数
         dim: int = 1024,
+        num_heads: int = 16,
+        ffn_expansion_factor: int = 2,
         enc_layers: int = 4,
         codebook_size: int = 16,
         code_dim: int = 128,
+        num_frames: int = 5,
+        ar_prediction: bool = False,
+        vq_kwargs: Optional[Dict[str, Any]] = None,
         dec_layers: int = 4,
-        dec_self_heads: int = 4,
-        dec_cross_heads: int = 4,
         dropout: float = 0.1,
-        num_queries: int = 4,
         # 物理接地参数
-        enable_state_delta_prediction: bool = True,
         lambda_aux: float = 0.2,  # 辅助损失的总体权重
-        lambda_dir: float = 1.0,  # 方向损失权重
-        lambda_mag_reg: float = 0.1,  # 幅度正则化权重
-        motion_threshold_beta: float = 0.01,  # 运动激活阈值 (1cm)
-        motion_scale_alpha: float = 100.0,  # Sigmoid斜率
+        loss_type: str = "l1",
         # 训练参数
         project: str = 'UniVLA-latent_action_model',
         task_name: str = 'vjepa_lam',
@@ -54,6 +55,12 @@ class VJEPA_LAM(LightningModule):
         make_data_pair: bool = False,
         output_dir: str = "output_pairs",
         vision_model_id: str = "facebook/vjepa2-vitl-fpc64-256",
+        # 学习率调度与预热
+        warmup_steps: int = 0,
+        lambda_diversity: float = 0.1,
+        norm_latents: bool = False,
+        disable_vq: bool = False,
+        vq_type: str = "nsvq",
         **kwargs
     ):
         super().__init__()
@@ -66,43 +73,40 @@ class VJEPA_LAM(LightningModule):
         # 初始化 LAM 模型
         self.lam = LatentLAMModel(
             dim=dim,
+            num_heads=num_heads,
+            ffn_expansion_factor=ffn_expansion_factor,
             enc_layers=enc_layers,
             codebook_size=codebook_size,
             code_dim=code_dim,
+            num_frames=num_frames,
+            ar_prediction=ar_prediction,
             dec_layers=dec_layers,
-            dec_self_heads=dec_self_heads,
-            dec_cross_heads=dec_cross_heads,
             dropout=dropout,
-            num_queries=num_queries,
-            enable_state_delta_prediction=enable_state_delta_prediction,
             vision_model_id=vision_model_id,
+            vq_kwargs=vq_kwargs,
+            norm_latents=norm_latents,
+            disable_vq=disable_vq,
+            vq_type=vq_type
         )
         
         # 训练参数
         self.optimizer = optimizer
         self.weight_decay = weight_decay
         self.codebook_size = codebook_size
+        self.warmup_steps = int(warmup_steps)
         
         # 物理接地参数
-        self.enable_state_delta_prediction = enable_state_delta_prediction
         self.lambda_aux = lambda_aux
-        
-        # 初始化物理接地损失函数（如果启用）
-        if enable_state_delta_prediction:
-            self.physical_grounding_loss = PhysicalGroundingLoss(
-                lambda_dir=lambda_dir,
-                lambda_mag_reg=lambda_mag_reg,
-                motion_threshold_beta=motion_threshold_beta,
-                motion_scale_alpha=motion_scale_alpha
-            )
-        
+        self.lambda_diversity = lambda_diversity
+
         # 索引保存参数
         self.make_data_pair = make_data_pair
         self.output_dir = output_dir
         self.distributed_state = PartialState()
         if self.distributed_state.is_main_process:
             wandb.init(project=project, name=task_name, reinit=True, mode="offline" if wandb_offline else "online")
-    
+
+        self.loss_type = loss_type
     def shared_step(self, batch: Dict) -> Tuple[Tensor, Dict]:
         """共享的训练/验证步骤（训练分支）。"""
         return self._compute_step(batch=batch, vq_training=True)
@@ -143,49 +147,58 @@ class VJEPA_LAM(LightningModule):
             (loss, logs)
         """
         videos = batch["videos"]
+        states = batch["proprio"]
+        dec_videos = batch["dec_videos"]
+        # print("videos shape:", videos.shape)
         # VQ 路径区分在模型内部（视觉编码也已迁移到 LAM 内部）
         if vq_training:
-            recon, perplexity, indices, delta_s_pred, features,_ = self.lam(videos)
+            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam(videos, states, dec_videos)
         else:
-            recon, perplexity, indices, delta_s_pred, features,_ = self.lam.inference(videos)
+            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam.inference(videos, states, dec_videos)
 
-        target = features[:, 1]
+        target = tgt
         # recon_loss = F.mse_loss(recon, target)
-        recon_loss = F.l1_loss(recon, target)
-        total_loss = recon_loss
-
+        if self.loss_type == "l1":
+            recon_loss = F.l1_loss(recon, target)
+            loss = recon_loss
+        elif self.loss_type == "cosine":
+            cos_sim = F.cosine_similarity(recon, target, dim=-1).mean()
+            recon_loss = F.l1_loss(recon, target)
+            loss = recon_loss + (1 - cos_sim)
+        elif self.loss_type == "delta":
+            recon_loss = F.l1_loss(recon, target-dec_in)
+            loss = recon_loss
+        else:
+            recon_loss = F.mse_loss(recon, target)
+            loss = recon_loss
+        entropy_loss = self.lambda_diversity * entropy_loss
+        total_loss = loss + entropy_loss + vq_loss
+        # total_loss = loss
         aux_loss = torch.tensor(0.0, device=self.device)
         aux_loss_logs: Dict[str, Tensor] = {}
 
-        if self.enable_state_delta_prediction and "proprio" in batch and delta_s_pred is not None:
+        if "proprio" in batch and delta_s_pred is not None:
             states = batch["proprio"]
             robot_indices = self._detect_robot_data(states)
             if len(robot_indices) > 0:
                 delta_s_pred_robot = delta_s_pred[robot_indices]
                 states_robot = states[robot_indices]
-                s_t_robot = states_robot[:, 0, :3]
-                s_t_plus_1_robot = states_robot[:, 1, :3]
-                delta_s_gt = s_t_plus_1_robot - s_t_robot
-                grounding_loss_dict = self.physical_grounding_loss(delta_s_pred_robot, delta_s_gt)
-                aux_loss = self.lambda_aux * grounding_loss_dict["total_loss"]
-                aux_loss_logs = {f"aux/{k}": v for k, v in grounding_loss_dict.items()}
-                aux_loss_logs["aux/robot_data_count"] = torch.tensor(len(robot_indices), device=self.device)
-                total_loss = recon_loss + aux_loss
+                state_loss = eef_reconstruction_loss(states_robot, delta_s_pred_robot)
+                aux_loss = self.lambda_aux * state_loss
+                aux_loss_logs["state_loss"] = aux_loss.item()
+                # aux_loss_logs["robot_data_count"] = torch.tensor(len(robot_indices), device=self.device)
+                total_loss = total_loss + aux_loss
 
-        with torch.no_grad():
-            unique, counts = torch.unique(indices, return_counts=True)
-            index_counts = torch.zeros(self.codebook_size, dtype=torch.long, device=indices.device)
-            index_counts[unique] = counts
-            code_usage = (index_counts != 0).float().mean()
-
-        logs: Dict[str, Tensor] = {
-            "recon_loss": recon_loss,
-            "aux_loss": aux_loss,
-            "perplexity": perplexity,
-            "code_usage": code_usage,
-            **aux_loss_logs,
-        }
-
+            logs: Dict[str, Tensor] = {
+                "recon_loss": recon_loss,
+                "vq_loss": vq_loss,
+                "perplexity": perplexity,
+                **aux_loss_logs,
+            }
+            if self.loss_type == "cosine":
+                logs["cos_sim"] = cos_sim
+            if self.lambda_diversity >0:
+                logs["entropy_loss"] = entropy_loss
         return total_loss, logs
 
     def training_step(self, batch: Dict, batch_idx: int) -> Tensor:
@@ -237,18 +250,37 @@ class VJEPA_LAM(LightningModule):
             wandb.log(wandb_logs, step=self.global_step)
         return loss
     
-
+    def on_after_backward(self) -> None:
+        if not getattr(self.trainer, "is_global_zero", True):
+            return
+        unused = []
+        for name, p in self.named_parameters():
+            if p.requires_grad and p.grad is None:
+                unused.append(name)
+        if unused:
+            self.print(f"UNUSED params ({len(unused)}): " + ", ".join(unused))
     
-    def on_train_epoch_end(self):
-        """训练 epoch 结束时的回调"""
-        # 1. 先替换未使用的码本条目（基于当前的使用统计）
-        if hasattr(self.lam.vq, 'replace_unused_codebooks'):
-            # 这里需要传入累计的批次数，可以根据实际情况调整
-            self.lam.vq.replace_unused_codebooks()
-        
-        # 2. 然后重置码本使用统计（为下一个 epoch 做准备）
-        if hasattr(self.lam.vq, 'reset_node_count'):
-            self.lam.vq.reset_node_count()
+    # def on_train_epoch_end(self):
+    #     """训练 epoch 结束时的回调"""
+    #     # 在分布式场景下，仅在 rank0 执行维护逻辑，并将更新后的状态同步到所有 rank
+    #     is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+
+    #     if is_distributed:
+    #         self.trainer.strategy.barrier()
+
+    #     if getattr(self.trainer, "is_global_zero", True):
+    #         with torch.no_grad():
+    #             if hasattr(self.lam.vq, 'replace_unused_codebooks'):
+    #                 self.lam.vq.replace_unused_codebooks()
+    #             if hasattr(self.lam.vq, 'reset_node_count'):
+    #                 self.lam.vq.reset_node_count()
+
+    #     if is_distributed:
+    #         state_list = [self.lam.vq.state_dict()] if getattr(self.trainer, "is_global_zero", True) else [None]
+    #         torch.distributed.broadcast_object_list(state_list, src=0)
+    #         with torch.no_grad():
+    #             self.lam.vq.load_state_dict(state_list[0])
+    #         self.trainer.strategy.barrier()
 
     def on_test_epoch_end(self):
         """测试 epoch 结束时的回调 - 保存索引和可视化"""
@@ -306,9 +338,32 @@ class VJEPA_LAM(LightningModule):
         plt.savefig(f"{filename}.png", bbox_inches="tight", pad_inches=0.0)
         plt.close()
 
-    def configure_optimizers(self) -> Optimizer:
-        """配置优化器"""
+    def configure_optimizers(self) -> Any:
+        """配置优化器与可选的线性预热调度器。
+
+        当 ``self.warmup_steps > 0`` 时，使用 ``LambdaLR`` 在前 ``warmup_steps`` 个
+        优化步内将学习率从 0 线性提升到基础学习率，之后保持常数学习率。
+        以 step 为粒度进行调度。
+        """
         optim = self.optimizer(self.parameters())
+        # optim = self.optimizer(filter(lambda p: p.requires_grad, self.parameters()))
+        if self.warmup_steps > 0:
+            def lr_lambda(current_step: int) -> float:
+                # 线性预热：从 0 -> 1.0
+                if current_step < self.warmup_steps:
+                    return float(current_step + 1) / float(self.warmup_steps)
+                return 1.0
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_lambda)
+            return {
+                "optimizer": optim,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+
         return optim
 
 
@@ -335,49 +390,85 @@ class CodebookMaintenanceCallback(pl.Callback):
         super().__init__()
         self.interval_steps = interval_steps
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if (trainer.global_step + 1) % self.interval_steps == 0:
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+    # def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.global_step% self.interval_steps != 0:
+            return
+
+        # 额外检查：确保 kmeans 初始化已完成
+        # replace_unused_codebooks 内部也会检查，但这里提前检查可以避免不必要的同步
+        if hasattr(pl_module.lam.vq, 'initialized'):
+            if not bool(pl_module.lam.vq.initialized.item()):
+                return
+
+        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+
+        # 使用 torch.distributed.barrier() 确保跨节点同步（支持多节点训练）
+        if is_distributed:
+            torch.distributed.barrier()
+
+        # 重要：所有 rank 都需要调用，以便内部 all_reduce 能够正确聚合
+        with torch.no_grad():
             if hasattr(pl_module.lam.vq, 'replace_unused_codebooks'):
                 pl_module.lam.vq.replace_unused_codebooks()
+            # 计数器在各 rank 本地清零，避免后续累计偏差
             if hasattr(pl_module.lam.vq, 'reset_node_count'):
                 pl_module.lam.vq.reset_node_count()
+
+        # 使用 torch.distributed.barrier() 确保跨节点同步（支持多节点训练）
+        if is_distributed:
+            torch.distributed.barrier()
 
 
 class SaveConfigToCheckpointCallback(pl.Callback):
     def __init__(self, config_path: str = "", filename: str = "lam-vjepa.yaml"):
         super().__init__()
-        # 若未显式传入，则默认指向包内配置文件：latent_action_model/config/lam-vjepa.yaml
+        # 若未显式传入：优先使用环境变量 LAM_CONFIG_PATH，其次回落到默认包内配置
+        origin = "default"
         if not config_path:
-            from pathlib import Path
-            base_dir = Path(__file__).resolve().parents[1]
-            self.config_path = str(base_dir / "config" / "lam-vjepa.yaml")
+            env_config_path = os.environ.get("LAM_CONFIG_PATH", "")
+            if env_config_path:
+                self.config_path = env_config_path
+                origin = "env"
+            else:
+                from pathlib import Path
+                base_dir = Path(__file__).resolve().parents[1]
+                self.config_path = str(base_dir / "config" / "lam-vjepa.yaml")
+                origin = "default"
         else:
             self.config_path = config_path
+            origin = "arg"
+
+        # 目标文件名：若来源为 env/arg 且未显式自定义文件名，则使用源配置名
         self.filename = filename
+        if (not self.filename or self.filename == "lam-vjepa.yaml") and origin in ("env", "arg"):
+            try:
+                self.filename = os.path.basename(self.config_path)
+            except Exception:
+                self.filename = filename or "lam-vjepa.yaml"
+
+    def _resolve_log_dir(self, trainer) -> Optional[str]:
+        logger_obj = trainer.logger
+        if logger_obj is None:
+            return None
+        if hasattr(logger_obj, 'log_dir') and logger_obj.log_dir is not None:
+            return logger_obj.log_dir
+        save_dir = getattr(logger_obj, 'save_dir', None)
+        name = getattr(logger_obj, 'name', None)
+        version = getattr(logger_obj, 'version', None)
+        parts = [p for p in [save_dir, name, f"version_{version}" if version is not None else None] if p]
+        if parts:
+            return os.path.join(*parts)
+        return None
 
     def on_fit_start(self, trainer, pl_module):
         # 基于 logger 管理的目录保存，不依赖 ModelCheckpoint.dirpath
-        logger_obj = trainer.logger
-        if logger_obj is None:
-            pl_module.print("logger 未配置，跳过保存配置文件")
-            return
-
-        log_dir = None
-        if hasattr(logger_obj, 'log_dir') and logger_obj.log_dir is not None:
-            log_dir = logger_obj.log_dir
-        else:
-            save_dir = getattr(logger_obj, 'save_dir', None)
-            name = getattr(logger_obj, 'name', None)
-            version = getattr(logger_obj, 'version', None)
-            parts = [p for p in [save_dir, name, f"version_{version}" if version is not None else None] if p]
-            if parts:
-                log_dir = os.path.join(*parts)
-
+        log_dir = self._resolve_log_dir(trainer)
         if not log_dir:
             pl_module.print("无法解析 logger 保存目录，跳过保存配置文件")
             return
 
-        ckpt_dir = os.path.join(log_dir, 'checkpoints')
+        ckpt_dir = log_dir
         try:
             os.makedirs(ckpt_dir, exist_ok=True)
             dst_path = os.path.join(ckpt_dir, self.filename)
@@ -385,3 +476,30 @@ class SaveConfigToCheckpointCallback(pl.Callback):
             pl_module.print(f"Saved config to {dst_path}")
         except Exception as e:
             pl_module.print(f"Failed to save config: {e}")
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        # 在每个训练 epoch 结束时，将外部 shell 日志复制到与 checkpoints 同级的日志目录
+        # 这会覆写之前的日志文件，确保始终保存最新的完整训练记录
+        log_dir = self._resolve_log_dir(trainer)
+        if not log_dir:
+            return
+        self._copy_external_log(log_dir, pl_module)
+
+    def _copy_external_log(self, log_dir: str, pl_module) -> None:
+        src_log = os.environ.get("LAM_TRAIN_LOG_FILE", "")
+        if not src_log:
+            return
+        try:
+            if os.path.isfile(src_log):
+                dst_log = os.path.join(log_dir, "train.log")
+                shutil.copyfile(src_log, dst_log)
+                pl_module.print(f"Copied training log to {dst_log}")
+        except Exception:
+            pass
+
+    def on_exception(self, trainer, pl_module, exception):
+        # 发生异常（包括 Ctrl-C）时，也复制训练日志
+        log_dir = self._resolve_log_dir(trainer)
+        if not log_dir:
+            return
+        self._copy_external_log(log_dir, pl_module)

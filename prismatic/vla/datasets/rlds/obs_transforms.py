@@ -122,7 +122,8 @@ def decode_and_resize(
         image = tf.convert_to_tensor(image)
         if name in resize_size:
             # 使用center crop + resize 保持物体比例关系不变
-            image = center_crop_and_resize_tf(image, target_size=resize_size[name])
+            # image = center_crop_and_resize_tf(image, target_size=resize_size[name]) #此方法会使得droid关键物体显示不全
+            image = dl.transforms.resize_image(image, size=resize_size[name])
         obs[f"image_{name}"] = image
 
     for name in depth_names:

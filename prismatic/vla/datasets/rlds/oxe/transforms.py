@@ -119,6 +119,29 @@ def rt1_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     trajectory["language_instruction"] = trajectory["observation"]["natural_language_instruction"]
     return trajectory
 
+def fractal_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    # make gripper action absolute action, +1 = open, 0 = close
+    gripper_action = trajectory["action"]["gripper_closedness_action"][:, 0]
+    gripper_action = rel2abs_gripper_actions(gripper_action)
+
+    trajectory["action"] = tf.concat(
+        (
+            trajectory["action"]["world_vector"],
+            trajectory["action"]["rotation_delta"],
+            gripper_action[:, None],
+            
+        ),
+        axis=-1,
+    )
+    trajectory["language_instruction"] = trajectory["observation"]["natural_language_instruction"]
+
+    import tensorflow_graphics.geometry.transformation as tft
+    base_pose = trajectory["observation"]["base_pose_tool_reached"]
+    pos = base_pose[:, :3]
+    euler = tft.euler.from_quaternion(base_pose[:, 3:7])
+    trajectory["observation"]["EEF_state"] = tf.concat((pos, euler), axis=-1)
+    trajectory["observation"]["gripper_state"] = trajectory["observation"]["gripper_closed"]
+    return trajectory
 
 def kuka_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     # make gripper action absolute action, +1 = open, 0 = close
@@ -147,6 +170,14 @@ def kuka_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     #     tf.shape(trajectory["observation"]["natural_language_instruction"]), ""
     # )  # delete uninformative language instruction
     trajectory["language_instruction"] = trajectory["observation"]["natural_language_instruction"]
+
+    import tensorflow_graphics.geometry.transformation as tft
+    base_pose = trajectory["observation"]["clip_function_input/base_pose_tool_reached"]
+    pos = base_pose[:, :3]
+    euler = tft.euler.from_quaternion(base_pose[:, 3:7])
+    trajectory["observation"]["EEF_state"] = tf.concat((pos, euler), axis=-1)
+    trajectory["observation"]["gripper_state"] = trajectory["observation"]["gripper_closed"]
+    
     return trajectory
 
 
@@ -891,7 +922,7 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "ppgm": ppgm_dataset_transform,
     "ppgm_static": ppgm_dataset_transform,
     "ppgm_wrist": ppgm_dataset_transform,
-    "fractal20220817_data": rt1_dataset_transform,
+    "fractal20220817_data": fractal_dataset_transform,
     "kuka": kuka_dataset_transform,
     "taco_play": taco_play_dataset_transform,
     "jaco_play": jaco_play_dataset_transform,
@@ -969,6 +1000,7 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "libero_goal_no_noops_quad": libero_dataset_transform,
     "libero_10_no_noops_quad": libero_dataset_transform,
     "libero_combined": libero_dataset_transform,
+    "libero_90_rlds": libero_dataset_transform,
     ### Human Dataset
     "ego4d": human_dataset_transform,
 

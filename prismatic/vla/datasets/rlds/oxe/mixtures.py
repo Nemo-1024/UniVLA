@@ -40,6 +40,15 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
         ("bridge_dataset", 1.0),
         ("ego4d", 1.0),
     ],
+    "lam_plus": [
+        ("libero_90_rlds", 3.0),
+        ("droid", 0.5),
+        ("bridge_dataset", 1.0),
+        ("kuka", 1.0),
+        ("fractal20220817_data", 1.0),
+        ("taco_play", 1.0),
+        ("jaco_play", 1.0),
+    ],
     # === Human-data Only ===
     "Ego4D": [ 
         ("ego4d", 1.0),

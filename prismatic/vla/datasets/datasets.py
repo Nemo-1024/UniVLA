@@ -7,8 +7,11 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type
-
+from typing import Any, Dict, Tuple, Type, Optional
+from IPython.display import Video
+from torchvision import transforms
+import torchvision.transforms.v2.functional as F
+from torchvision.transforms import v2
 import random
 import numpy as np
 import torch
@@ -16,6 +19,8 @@ import torch.nn as nn
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
+import threading
+from queue import Queue, Full
 
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
@@ -162,83 +167,49 @@ class RLDSBatchTransformLIBERO_withHis:
 
 @dataclass
 class RLDSBatchTransformLIBERO:
-    action_tokenizer: nn.Module
-    base_tokenizer: PreTrainedTokenizerBase
-    image_transform: ImageTransform
-    image_transform_lam: ImageTransform
-    train: bool = True                 # True: 训练模式，False: eval/predict
-    return_labels_for_eval: bool = False,
-    predict_stop_token: bool = False
+    image_transform_lam: Optional[Any] = None
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Unified transform for training and evaluation/prediction."""
-        dataset_name = rlds_batch.get("dataset_name", "")
-        lang = rlds_batch["task"]["language_instruction"].decode().lower()
+        """
+        轻量化 Transform：仅提取必要的数据供 Collator 批量 VQ 编码。
+        返回内容：
+        - language_instruction: 原始字节串（不 decode）
+        - pixel_values: 供 VLA 模型使用的图像张量
+        - initial_pixel_values, target_pixel_values: 供 LAM 的 VQ 编码（两帧）
+        - dataset_name: 可选，若存在则透传
+        """
+        # 原始语言（bytes，不解码）
+        language_instruction = rlds_batch["task"]["language_instruction"]
+        # ---- 获取视频帧 ----
+        video = np.array(rlds_batch["observation"]["image_primary"])  # [T, H, W, C]（固定长度）
+        # 当前帧
+        img = Image.fromarray(video[0])
+        total_frames = len(video)
+        assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
-        pixel_values = self.image_transform(img)
+        # ---- 视频采样与预处理 ----
+        # 直接使用全部帧
+        # 如果 image_transform 是 torch Transform，则逐帧应用（先将 numpy 转为 PIL 或 Tensor）
 
-        # 训练阶段才生成 ground truth latent action tokens
-        action_tokens = None
-        latent_action_idx = None
-        if self.train:
-            img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
-            with torch.no_grad():
-                initial_pixel_values = self.image_transform_lam(img)
-                target_pixel_values = self.image_transform_lam(img_k)
-                video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
-                features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
-                latent_action_idx = features['indices'].squeeze()
-                image_features = features['features'].detach().to("cpu")
-            action_tokens = ''.join([f'<ACT_{i.item()}>' for i in latent_action_idx])
-        else:
-            # eval/predict阶段也可以生成 image_features，但不生成 labels
-            with torch.no_grad():
-                initial_pixel_values = self.image_transform_lam(img)
-                video = initial_pixel_values.unsqueeze(0).to(self.action_tokenizer.device)
-                features = self.action_tokenizer.vision_encoder.encode_video_frames(video)
-                latent_action_idx = features['indices'].squeeze()
-                image_features = features['features'].detach().to("cpu")
 
-        # 构造 prompt
-        image_tokens = "<IMG_CONTEXT>" * 256
-        messages = [
-            {"role": "system", "content": "You are a robot controller. Based on visual input and instructions, always output exactly 4 latent action tokens chosen from <ACT_0> ... <ACT_15>."},
-            {"role": "user", "content": f"{image_tokens}\nWhat action should the robot take to {lang}?"}
-        ]
-        if self.train and action_tokens is not None:
-            messages.append({"role": "assistant", "content": action_tokens})
-
-        # HF chat_template 生成 input_ids
-        prefix_ids = self.base_tokenizer.apply_chat_template(messages[:2], tokenize=True, add_generation_prompt=True)
-        input_ids = self.base_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-        input_ids = torch.tensor(input_ids)
-
-        out = {
-            "pixel_values": pixel_values,
-            "input_ids": input_ids,
-            "image_features": image_features,
-            "latent_action_idx": latent_action_idx,
+        out: Dict[str, Any] = {
+            "language_instruction": language_instruction,
+            "img": img,
+            "video": video,
             "proprio": np.array(rlds_batch["observation"]["proprio"]),
             "actions": np.array(rlds_batch["action"])
         }
 
-        # 训练阶段生成 labels 并 mask prefix
-        if self.train or self.return_labels_for_eval:
-            labels = torch.tensor(list(input_ids))
-            prefix_len = len(prefix_ids)
-            labels[:prefix_len] = IGNORE_INDEX
-            if not self.predict_stop_token:
-                labels[-2:] = IGNORE_INDEX
-            out["labels"] = labels
+        # # 透传数据集名称（若存在）
+        # if "dataset_name" in rlds_batch:
+        #     out["dataset_name"] = rlds_batch["dataset_name"]
 
         return out
 
 
 @dataclass
 class RLDSBatchTransformLatentAction:
-    image_transform: Any
-    image_transform_lam: Any
+    image_transform_lam: Optional[Any] = None
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -252,20 +223,17 @@ class RLDSBatchTransformLatentAction:
         # 原始语言（bytes，不解码）
         language_instruction = rlds_batch["task"]["language_instruction"]
 
-        # 当前帧与目标帧
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
-        img_k = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
+        # ---- 获取视频帧 ----
+        video = np.array(rlds_batch["observation"]["image_primary"])  # [T, H, W, C]（固定长度）
+        total_frames = len(video)
+        assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
-        # 图像预处理
-        pixel_values = self.image_transform(img)
-        initial_pixel_values = self.image_transform_lam(img)
-        target_pixel_values = self.image_transform_lam(img_k)
-
+        img = Image.fromarray(video[0])
         out: Dict[str, Any] = {
             "language_instruction": language_instruction,
-            "pixel_values": pixel_values,
-            "initial_pixel_values": initial_pixel_values,
-            "target_pixel_values": target_pixel_values,
+            "video": video,
+            "img": img,
+            "proprio": np.array(rlds_batch["observation"]["proprio"]),
         }
 
         # # 透传数据集名称（若存在）
@@ -274,60 +242,61 @@ class RLDSBatchTransformLatentAction:
 
         return out
 
-
-
-datasets_image_obs_keys = {"droid": 2, "bridge_dataset": 3,"droid_100": 2}
-
+## 过去用于按等距采样视频帧的工具已不需要（上游已提供固定长度窗口）
 @dataclass
 class RLDSBatchTransformVideo:
-    image_transform: ImageTransform
+    image_transform: Optional[Any] = None  # 可额外叠加的增强
+    random_resized_crop: bool = True
+    scale: tuple = (0.8, 1.0)
+    # ratio: tuple = (0.5625, 1.0)
+    ratio: tuple = (0.9, 1.1)
+
+
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, action = rlds_batch["dataset_name"], np.array(rlds_batch["action"])
-        
+        """将 RLDS 批次转换为训练所需格式（支持视频与独立首帧增强）"""
+        action = np.array(rlds_batch["action"])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
-        # 从非None的观察条目中等概率抽取图像，仅在指定候选键内选择
-        # 候选键：primary, secondary, third, wrist（兼容误写 wirst）
-        candidate_suffixes = ["primary", "secondary", "third"]
-        available_image_keys = []
-        for suffix in candidate_suffixes:
-            key = f"image_{suffix}"
-            if key in rlds_batch["observation"] and rlds_batch["observation"][key] is not None:
-                available_image_keys.append(key)
-        
-        if not available_image_keys:
-            raise ValueError("No available image observations found in the batch")
-        
-        # 随机选择一个可用的图像键
-        selected_image_key = np.random.choice(available_image_keys)
-        
-        img = Image.fromarray(rlds_batch["observation"][selected_image_key][0])#.copy()
-        initial_pixel_values = self.image_transform(img)
-        
-        # the frame interval is already tackled in RLDS dataloader
-        target_frame_index = -1
-        img_k = Image.fromarray(rlds_batch["observation"][selected_image_key][target_frame_index])#.copy()
-        # print(sum(np.array(img_k) - np.array(img)))
-        target_pixel_values= self.image_transform(img_k)
+        # ---- 获取视频帧 ----
+        video_frames = np.array(rlds_batch["observation"]["image_primary"])  # [T, H, W, C]
+        total_frames = len(video_frames)
+        assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
-        # 提取状态数据（用于CollatorForLatentAction）
-        proprio = None
-        if "proprio" in rlds_batch["observation"]:
-            # 提取时间序列的状态数据 [T, state_dim]
-            proprio = np.array(rlds_batch["observation"]["proprio"])
+        # ---- 转为 Tensor 并归一化到 [0,1] ----
+        video = torch.as_tensor(video_frames).permute(0, 3, 1, 2).float().mul_(1.0 / 255.0)  # [T, C, H, W]
+        # 直接从 video 取切片会产生 view；下游对 video 的就地标准化可能影响到这些 view。
+        # 这里显式 clone，避免存储别名导致的偶发数值异常（例如可视化时某些样本颜色失真）。
+        dec_video = video.clone()
+        image_size = video.shape[2]
+        # 🎯 1️⃣ 时序一致裁剪（视频）
+        if self.random_resized_crop:
+            # 手动采样一次参数，复用于所有帧
+            # 直接使用 Tensor 采样参数，避免不必要的 PIL 转换
+            i, j, h, w = transforms.RandomResizedCrop.get_params(
+                video[0], scale=self.scale, ratio=self.ratio
+            )
+            # ✅ 时序一致裁剪
+            video = F.resized_crop(video, i, j, h, w, size=(image_size,image_size))
+
+        # 🎯 2️⃣ 独立随机裁剪第一帧（Decoder 输入）
+        if self.random_resized_crop:
+            i, j, h, w = transforms.RandomResizedCrop.get_params(
+                dec_video[0], scale=self.scale, ratio=self.ratio
+            )
+            dec_video = F.resized_crop(dec_video, i, j, h, w, size=(image_size, image_size))
         
-        result = dict(initial_pixel_values=initial_pixel_values, target_pixel_values=target_pixel_values, 
-                    task_instruction=lang, action=action, dataset_name=dataset_name)
-        
-        # 只在状态数据存在时添加到结果中
-        if proprio is not None:
-            result["proprio"] = proprio
-            
+        proprio = np.array(rlds_batch["observation"]["proprio"])
+
+        # 📦 输出
+        result = {
+            "video": video,      # [T, 3, H, W]
+            "dec_video": dec_video,    # [T, 3, H, W]
+            "task_instruction": lang,
+            "action": action,
+            "proprio": proprio,
+        }
         return result
-
-
 
 
 class RLDSDataset(IterableDataset):
@@ -342,10 +311,17 @@ class RLDSDataset(IterableDataset):
         train: bool = True,
         image_aug: bool = False,
         training_phase: str = 'lam',
+        async_prefetch: bool = False,
+        async_prefetch_size: int = 64,
+        async_transform: bool = False,
+        debug_repeat_batch: bool = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
-
+        self.async_prefetch: bool = async_prefetch
+        self.async_prefetch_size: int = int(async_prefetch_size)
+        self.async_transform: bool = async_transform
+        self.debug_repeat_batch: bool = debug_repeat_batch
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
             mixture_spec = OXE_NAMED_MIXTURES[self.data_mix]
@@ -386,12 +362,17 @@ class RLDSDataset(IterableDataset):
 
         # If applicable, enable image augmentations
         if image_aug:
+            # 使用显式关键字参数形式，避免 dlimp/TF 在内部与 seed 关键字冲突（"Got multiple values for argument 'seed'"）
             rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
-                random_resized_crop=dict(scale=[0.8, 1.0], ratio=[1.0, 1.0]),
-                random_brightness=[0.2],
-                random_contrast=[0.8, 1.2],
-                random_saturation=[0.8, 1.2],
-                random_hue=[0.05],
+                random_resized_crop=dict(scale=[1.0, 1.0], ratio=[1.0, 1.0]) if training_phase == 'lam' else dict(scale=[0.8, 1.0], ratio=[0.75, 1.0]),
+                # TF: random_brightness(image, max_delta, seed)
+                random_brightness=dict(max_delta=0.1),
+                # TF: random_contrast(image, lower, upper, seed)
+                random_contrast=dict(lower=0.9, upper=1.1),
+                # TF: random_saturation(image, lower, upper, seed)
+                random_saturation=dict(lower=0.9, upper=1.1),
+                # TF: random_hue(image, max_delta, seed)
+                random_hue=dict(max_delta=0.05),
                 augment_order=[
                     "random_resized_crop",
                     "random_brightness",
@@ -409,14 +390,86 @@ class RLDSDataset(IterableDataset):
         return make_interleaved_dataset(**rlds_config)
 
     def __iter__(self) -> Dict[str, Any]:
-        for rlds_batch in self.dataset.as_numpy_iterator():
-            yield self.batch_transform(rlds_batch)
+        iterator = self.dataset.as_numpy_iterator()
+        # === 🧠 调试模式：重复返回同一个 batch ===
+        if self.debug_repeat_batch:
+            first_batch = next(iterator)
+            first_batch = self.batch_transform(first_batch)
+            print("[RLDSDataset] Debug mode: Repeating the same batch indefinitely.")
+            while True:
+                yield first_batch
+            return
+        # === 正常模式 ===
+        if not self.async_prefetch:
+            for rlds_batch in iterator:
+                yield self.batch_transform(rlds_batch)
+            return
+
+        queue: "Queue[Any]" = Queue(maxsize=max(1, self.async_prefetch_size))
+        stop_event = threading.Event()
+        sentinel: object = object()
+        producer_exception: Dict[str, BaseException] = {}
+
+        def producer() -> None:
+            try:
+                for rlds_batch in iterator:
+                    if stop_event.is_set():
+                        break
+                    item: Any
+                    if self.async_transform:
+                        item = self.batch_transform(rlds_batch)
+                    else:
+                        item = rlds_batch
+                    while not stop_event.is_set():
+                        try:
+                            queue.put(item, timeout=0.1)
+                            break
+                        except Full:
+                            if stop_event.is_set():
+                                break
+                            continue
+            except BaseException as exc:  # noqa: BLE001
+                producer_exception["exc"] = exc
+            finally:
+                # Signal end-of-stream
+                try:
+                    while True:
+                        try:
+                            queue.put(sentinel, timeout=0.1)
+                            break
+                        except Full:
+                            if stop_event.is_set():
+                                break
+                            continue
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=producer, name="RLDSDatasetPrefetch", daemon=True)
+        thread.start()
+
+        try:
+            while True:
+                item = queue.get()
+                if item is sentinel:
+                    # propagate background exception if any
+                    if "exc" in producer_exception:
+                        raise producer_exception["exc"]
+                    break
+                if not self.async_transform:
+                    yield self.batch_transform(item)
+                else:
+                    yield item
+                if "exc" in producer_exception:
+                    raise producer_exception["exc"]
+        finally:
+            stop_event.set()
 
     def __len__(self) -> int:
-        """返回预计算的数据集长度，已经反映了所有transformation的影响"""
+        """返回预计算的数据集长度，考虑分布式训练时的数据分割"""
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            return int(self.dataset_length // world_size)
         return int(self.dataset_length)
-        # return int(256000)
-
     # === Explicitly Unused ===
     def __getitem__(self, idx: int) -> None:
         raise NotImplementedError("IterableDataset does not implement map-style __getitem__; see __iter__ instead!")

@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../dinov3"
+		},
+		{
+			"path": "../WAFT/model"
+		},
+		{
+			"path": "../vjepa2/src"
+		}
+	],
+	"settings": {}
+}

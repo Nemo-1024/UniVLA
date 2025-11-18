@@ -254,8 +254,9 @@ class DiT(ModelMixin, ConfigMixin):
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
         self.proj_out_2 = nn.Sequential(
-                                nn.Linear(self.inner_dim, self.config.output_dim),
-                                nn.Tanh(),
+                                nn.Linear(self.inner_dim, self.config.output_dim*4),
+                                nn.ReLU(),
+                                nn.Linear(self.config.output_dim*4, self.config.output_dim)
                     )
         # print(
         #     "Total number of DiT parameters: ",

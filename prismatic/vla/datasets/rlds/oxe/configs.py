@@ -55,18 +55,19 @@ OXE_DATASET_CONFIGS = {
     "fractal20220817_data": {
         "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
-        "state_obs_keys": ["base_pose_tool_reached", "gripper_closed"],
-        "state_encoding": StateEncoding.POS_QUAT,
+        "state_obs_keys": ["EEF_state", None, "gripper_state"],
+        "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
     "kuka": {
         "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
         "state_obs_keys": [
-            "clip_function_input/base_pose_tool_reached",
-            "gripper_closed",
+            "EEF_state",
+             None,
+            "gripper_state",
         ],
-        "state_encoding": StateEncoding.POS_QUAT,
+        "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
     "bridge_oxe": {  # Version of Bridge V2 in Open X-Embodiment mixture
@@ -91,7 +92,7 @@ OXE_DATASET_CONFIGS = {
         "action_encoding": ActionEncoding.EEF_POS,
     },
     "bridge_dataset": {  # Original version of Bridge V2 from project website
-        "image_obs_keys": {"primary": "image_0", "secondary": "image_1","third": "image_2", "wrist": None},
+        "image_obs_keys": {"primary": "image_0", "secondary": "image_1","wrist": None},
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
         "state_obs_keys": ["EEF_state", None, "gripper_state"],
         "state_encoding": StateEncoding.POS_EULER,
@@ -742,4 +743,12 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
+        "libero_90_rlds": {
+        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": "wrist_image"},
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        "state_obs_keys": ["EEF_state", "gripper_state"],
+        "state_encoding": StateEncoding.POS_EULER,
+        "action_encoding": ActionEncoding.EEF_POS,
+    },
+        
 }

@@ -2,510 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Any
-from .vq import NSVQ
-from .vjepa_encoder import VJEPAEncoder
+from .vq import VQ, NSVQ
+from .vjepa_encoder import build_vision_encoder
 
 import torch
 import torch.nn as nn
 import math
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, model_dim: int, max_len: int = 5000):
-        super().__init__()
-        pe = torch.zeros(max_len, model_dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, model_dim, 2).float() * -(math.log(10000.0) / model_dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pos_enc', pe.unsqueeze(0))  # [1, max_len, model_dim]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, seq_len, model_dim]
-        return x + self.pos_enc[:, :x.size(1), :].to(x.device)
-
-class QFormerBlock(nn.Module):
-    """
-    一个完整的 Q-Former 构建块。
-    它包含：
-    1. 在查询向量上的自注意力 (Self-Attention)
-    2. 从上下文到查询的交叉注意力 (Cross-Attention)
-    3. 一个前馈网络 (Feed-Forward Network)
-    
-    使用了前置层归一化（Pre-LayerNorm）和残差连接，以获得更好的训练稳定性。
-    """
-    def __init__(self, query_dim, context_dim=None, num_heads=8, ffn_expansion_factor=4, dropout=0.1):
-        """
-        初始化 QFormerBlock。
-        
-        参数:
-            query_dim (int): 查询向量和输出的维度 (d)。
-            context_dim (int, optional): 上下文特征的维度 (D)。如果为 None，则默认为 query_dim。
-            num_heads (int): 多头注意力的头数。
-            ffn_expansion_factor (int): FFN 中间隐藏层的扩展因子。
-            dropout (float): Dropout 的比率。
-        """
-        super().__init__()
-        
-        # 如果没有提供 context_dim，则假设它与 query_dim 相同（用于自注意力场景）
-        if context_dim is None:
-            context_dim = query_dim
-
-        # 1. 自注意力部分
-        self.norm_sa = nn.LayerNorm(query_dim)
-        self.attn_sa = nn.MultiheadAttention(
-            embed_dim=query_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-
-        # 2. 交叉注意力部分
-        self.norm_ca = nn.LayerNorm(query_dim)
-        self.attn_ca = nn.MultiheadAttention(
-            embed_dim=query_dim,
-            kdim=context_dim,  # Key 的维度来自上下文
-            vdim=context_dim,  # Value 的维度来自上下文
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-
-        # 3. 前馈网络部分
-        self.norm_ffn = nn.LayerNorm(query_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(query_dim, query_dim * ffn_expansion_factor),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(query_dim * ffn_expansion_factor, query_dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, queries, context):
-        """
-        前向传播。
-        
-        参数:
-            queries (torch.Tensor): 查询张量，形状为 [B, n, d]。
-            context (torch.Tensor): 上下文张量，形状为 [B, N, D]。
-                                    (其中 N = 2*K)
-        返回:
-            torch.Tensor: 处理后的查询张量，形状为 [B, n, d]。
-        """
-        # 1. 自注意力 + 残差连接
-        sa_output, _ = self.attn_sa(self.norm_sa(queries), self.norm_sa(queries), self.norm_sa(queries))
-        queries = queries + sa_output
-
-        # 2. 交叉注意力 + 残差连接
-        ca_output, _ = self.attn_ca(query=self.norm_ca(queries), key=context, value=context)
-        queries = queries + ca_output
-
-        # 3. 前馈网络 + 残差连接
-        ffn_output = self.ffn(self.norm_ffn(queries))
-        queries = queries + ffn_output
-        
-        return queries
-
-
-class QFormer(nn.Module):
-    """
-    Q-Former 模型。
-    通过堆叠多个 QFormerBlock，使用一组可学习的查询向量从给定的上下文中提取特征。
-    """
-    def __init__(self, query_dim, context_dim,num_queries=4, num_layers=6, num_heads=8, ffn_expansion_factor=4, dropout=0.1):
-        """
-        初始化 QFormer 模型。
-        
-        参数:
-            num_queries (int): 可学习的查询向量数量 (n)。
-            query_dim (int): 查询向量和最终输出的维度 (d)。
-            context_dim (int): 输入上下文特征的维度 (D)。
-            num_layers (int): QFormerBlock 的堆叠层数。
-            num_heads (int): 每个注意力模块的头数。
-            ffn_expansion_factor (int): FFN 的扩展因子。
-            dropout (float): Dropout 比率。
-        """
-        super().__init__()
-
-        # 可学习的查询向量，形状为 [1, n, d]，可以广播到整个 batch
-        self.queries = nn.Parameter(torch.randn(1, num_queries, query_dim))
-
-        # 堆叠多个 QFormerBlock
-        self.layers = nn.ModuleList([
-            QFormerBlock(
-                query_dim=query_dim,
-                context_dim=context_dim,
-                num_heads=num_heads,
-                ffn_expansion_factor=ffn_expansion_factor,
-                dropout=dropout
-            ) for _ in range(num_layers)
-        ])
-        
-    def forward(self, context):
-        """
-        前向传播。
-        
-        参数:
-            context (torch.Tensor): 来自时空主干的输出特征，
-                                    形状应为 [B, N, D]，其中 N = 2*K。
-        返回:
-            torch.Tensor: 经过 Q-Former 提取和处理后的特征，
-                          形状为 [B, n, d]，可以直接用于 VQ 量化。
-        """
-        batch_size = context.shape[0]
-        
-        # 将可学习的查询广播到当前 batch 的大小
-        queries = self.queries.expand(batch_size, -1, -1)
-        
-        # 依次通过每个 QFormerBlock
-        for layer in self.layers:
-            queries = layer(queries, context)
-            
-        return queries
-
-
-class SpatioTemporalBlock(nn.Module):
-    """
-    一个空间-时间交替的Transformer Block。
-    """
-    def __init__(self, dim: int, space_heads: int=12, time_heads: int=12, dropout: float = 0.0):
-        super().__init__()
-        self.spatio_transformer_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=space_heads, batch_first=True,activation="gelu",dropout=dropout)
-        self.temporal_transformer_layer = nn.TransformerEncoderLayer(d_model=dim, nhead=time_heads, batch_first=True,activation="gelu",dropout=dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, N, D = x.shape
-        x_space = x.reshape(B * T, N, D)
-        x_space = self.spatio_transformer_layer(x_space)
-        x_space = x_space.reshape(B, T, N, D)
-        x_time = x_space.permute(0, 2, 1, 3)
-        x_time = x_time.reshape(B * N, T, D)
-        x_time = self.temporal_transformer_layer(x_time, is_causal=True)
-        x_time = x_time.reshape(B, N, T, D).permute(0, 2, 1, 3)
-        return x_time
-
-class LAMEncoder(nn.Module):
-    """
-    LAM编码器：多层空间-时间交替Transformer。
-    """
-    def __init__(self, context_dim: int, query_dim: int, num_queries: int=4, num_layers: int=4, dropout: float = 0.0):
-        super().__init__()
-        # self.blocks = nn.ModuleList([
-        #     SpatioTemporalBlock(dim, dropout=dropout) for _ in range(num_layers)
-        # ])
-        self.positional_encoding = PositionalEncoding(model_dim=context_dim)
-        self.QFormer = QFormer(query_dim=query_dim, context_dim=context_dim, num_queries=num_queries, num_layers=num_layers, dropout=dropout)
-        # 0 代表 t, 1 代表 t+1
-        self.temporal_embeddings = nn.Embedding(2, context_dim)
-    def forward(self, f_t: torch.Tensor, f_t1: torch.Tensor) -> torch.Tensor:
-        B, K, D = f_t.shape
-        # 给所有 t 时刻的 K 个 token 加上 t 时刻的嵌入
-        time_ids_t = torch.zeros(B, K, dtype=torch.long, device=f_t.device)
-        f_t_enhanced = f_t + self.temporal_embeddings(time_ids_t)
-        f_t_enhanced = self.positional_encoding(f_t_enhanced)
-
-        # 给所有 t+1 时刻的 K 个 token 加上 t+1 时刻的嵌入
-        time_ids_t1 = torch.ones(B, K, dtype=torch.long, device=f_t1.device)
-        f_t1_enhanced = f_t1 + self.temporal_embeddings(time_ids_t1)
-        f_t1_enhanced = self.positional_encoding(f_t1_enhanced)
-        context = torch.cat([f_t_enhanced, f_t1_enhanced], dim=1) # Shape: [B, 2*K, dim]
-        latents=self.QFormer(context)
-    
-        return latents
-
-class Attn_Crossn_Block(nn.Module):
-    """
-    LAMDecoder 的核心构建块。
-    它将“动作”信息 (z_q) 融合到“状态”特征 (f_t) 中。
-    """
-    def __init__(self, feature_dim, node_dim, num_heads=8, ffn_expansion_factor=4, dropout=0.1):
-        """
-        初始化 DecoderBlock。
-        
-        参数:
-            feature_dim (int): 状态特征 f_t 的维度 (D_feat)。
-            node_dim (int): 动作特征 z_q 的维度 (d)。
-            num_heads (int): 多头注意力的头数。
-            ffn_expansion_factor (int): FFN 中间层的扩展因子。
-            dropout (float): Dropout 比率。
-        """
-        super().__init__()
-
-        # 1. 自注意力 (在状态 f_t 上)
-        self.norm_sa = nn.LayerNorm(feature_dim)
-
-        self.attn_sa = nn.MultiheadAttention(
-            embed_dim=feature_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-
-        # 2. 交叉注意力 (从动作 z_q 到状态 f_t)
-        self.norm_ca = nn.LayerNorm(feature_dim)
-
-        self.attn_ca = nn.MultiheadAttention(
-            embed_dim=feature_dim,   # Query (和输出) 的维度
-            kdim=node_dim,       # Key 的维度
-            vdim=node_dim,       # Value 的维度
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # 3. 前馈网络
-        self.norm_ffn = nn.LayerNorm(feature_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim * ffn_expansion_factor),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(feature_dim * ffn_expansion_factor, feature_dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, state_features, LAM_features):
-        """
-        前向传播。
-        
-        参数:
-            state_features (torch.Tensor): f_t，形状为 [B, K, D_feat]。
-            LAM_features (torch.Tensor): z_q，形状为 [B, 4, d]。
-        返回:
-            torch.Tensor: 更新后的状态特征，形状为 [B, K, D_feat]。
-        """
-        # print("state_features shape:", state_features.shape)
-        # print("LAM_features shape:", LAM_features.shape)
-        # 自注意力 + 残差连接 (在 state_features 上)
-        sa_output, _ = self.attn_sa(self.norm_sa(state_features), self.norm_sa(state_features), self.norm_sa(state_features))
-        state_features = state_features + sa_output
-        
-        # 交叉注意力 + 残差连接
-        # Query 来自 state，Key 和 Value 来自 LAM
-        ca_output, _ = self.attn_ca(query=self.norm_ca(state_features), key=LAM_features, value=LAM_features)
-        state_features = state_features + ca_output
-
-        # 前馈网络 + 残差连接
-        ffn_output = self.ffn(self.norm_ffn(state_features))
-        state_features = state_features + ffn_output
-
-        return state_features
-
-
-class LAMDecoder(nn.Module):
-    """
-    通过堆叠多个 DecoderBlock，将动作应用到状态上，以重建下一帧的特征。
-    """
-    def __init__(self, feature_dim, node_dim, num_layers=6, num_heads=8, dropout=0.1):
-        """
-        初始化 LAMDecoder。
-        
-        参数:
-            feature_dim (int): 状态特征 f_t 的维度 (D_feat)。
-            node_dim (int): 动作特征 z_q 的维度 (d)。
-            num_layers (int): DecoderBlock 的堆叠层数。
-            num_heads (int): 每个注意力模块的头数。
-        """
-        super().__init__()
-        self.positional_encoding = PositionalEncoding(model_dim=feature_dim)
-        self.layers = nn.ModuleList([
-            Attn_Crossn_Block(
-                feature_dim=feature_dim,
-                node_dim=node_dim,
-                num_heads=num_heads,
-                dropout=dropout
-            ) for _ in range(num_layers)
-        ])
-        
-        # 注意：输入的 f_t 通常已经包含了 ViT 的位置编码，这里无需再添加。
-
-    def forward(self, f_t, z_q):
-        """
-        前向传播。
-        
-        参数:
-            f_t (torch.Tensor): 前一帧的特征，形状 [B, K, D_feat]。
-            z_q (torch.Tensor): VQ量化后的4个动作code，形状 [B, 4, d]。
-            
-        返回:
-            torch.Tensor: 重建的后一帧特征 f_hat_t+1，形状 [B, K, D_feat]。
-        """
-        # 将 f_t 作为可更新的状态，依次通过所有解码器层
-        f_t = self.positional_encoding(f_t)
-        reconstructed_features = f_t
-        for layer in self.layers:
-            reconstructed_features = layer(reconstructed_features, z_q)
-            
-        return reconstructed_features
+import yaml
+from .utils.lam_encoder import LAMEncoder
+from .utils.lam_decoder import LAMDecoder, LAMDecoder_v2
+from .utils.modules import PatchEmbed
 
 
 
-class StateDeltaPredictor(nn.Module):
-    """
-    物理接地状态差解码器 (Physical Grounding State-Delta Decoder)
-    
-    将潜动作向量 z_t 通过内置自注意力机制处理后映射到预测的末端执行器状态差 delta_s_xyz
-    输入形状固定为 [B, num_queries, latent_dim]
-    """
-    def __init__(
-        self, 
-        latent_dim: int, 
-        dropout: float = 0.1,
-    ):
-        """
-        初始化状态差预测器
-        
-        Args:
-            latent_dim (int): 潜动作向量的维度 (与 z_t 的维度相同)
-            dropout (float): Dropout 比率
-        """
-        super().__init__()
-        
-        self.attention_dim = latent_dim * 2
-        
-        # 自注意力投影层
-        self.query_proj = nn.Linear(latent_dim, self.attention_dim)
-        self.key_proj = nn.Linear(latent_dim, self.attention_dim)
-        self.value_proj = nn.Linear(latent_dim, latent_dim)
-        self.out_proj = nn.Linear(latent_dim, latent_dim)
-        
-        # 注意力层归一化
-        self.layer_norm = nn.LayerNorm(latent_dim)
-        
-        # 全局聚合层：将多个query聚合为单个表示
-        self.global_aggregator = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 4),
-            nn.ReLU(),
-            nn.Linear(latent_dim // 4, 3)  # 修复：输入维度应该是latent_dim // 4
-        )
-        
-        
-    def _self_attention(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        内置自注意力机制
-        
-        Args:
-            x (torch.Tensor): 输入张量，形状为 [B, num_queries, latent_dim]
-            
-        Returns:
-            torch.Tensor: 注意力处理后的张量，形状为 [B, num_queries, latent_dim]
-        """
-        # 计算 Query, Key, Value
-        Q = self.query_proj(x)  # [B, num_queries, attention_dim]
-        K = self.key_proj(x)    # [B, num_queries, attention_dim]
-        V = self.value_proj(x)  # [B, num_queries, latent_dim]
-
-        attended_values = F.scaled_dot_product_attention(
-        Q, K, V, 
-        dropout_p=0.1 if self.training else 0.0
-        )
-        
-        # 输出投影
-        output = self.out_proj(attended_values)  # [B, num_queries, latent_dim]
-        
-        # 残差连接和Layer Normalization
-        output = self.layer_norm(x + output)
-        
-        return output
-        
-    def forward(self, z_t: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-        
-        Args:
-            z_t (torch.Tensor): 潜动作向量，形状为 [B, num_queries, latent_dim]
-            
-        Returns:
-            torch.Tensor: 预测的状态差，形状为 [B, 3]
-        """
-        # 自注意力处理query间的交互
-        z_t_attended = self._self_attention(z_t)  # [B, num_queries, latent_dim]
-        
-        z_t_aggregated = torch.mean(z_t_attended, dim=1)  # [B, latent_dim]
-
-        # 通过全局聚合器进一步处理
-        delta_s_pred = self.global_aggregator(z_t_aggregated)  # [B, 3]
-        
-        return delta_s_pred
-
-
-class PhysicalGroundingLoss(nn.Module):
-    """
-    物理接地混合损失函数
-    
-    包含：
-    1. 方向损失 (Direction Loss) - 余弦相似度
-    2. 幅度正则化 (Magnitude Regularizer) - Huber损失
-    3. 运动权重 (Movement Weighting) - Sigmoid激活
-    """
-    def __init__(
-        self, 
-        lambda_dir: float = 1.0,
-        lambda_mag_reg: float = 0.1,
-        motion_threshold_beta: float = 0.01,  # 1cm
-        motion_scale_alpha: float = 100.0,
-        huber_delta: float = 0.1
-    ):
-        """
-        初始化物理接地损失函数
-        
-        Args:
-            lambda_dir (float): 方向损失权重（主要）
-            lambda_mag_reg (float): 幅度正则化权重（次要）
-            motion_threshold_beta (float): 运动激活阈值
-            motion_scale_alpha (float): Sigmoid斜率参数
-            huber_delta (float): Huber损失的delta参数
-        """
-        super().__init__()
-        self.lambda_dir = lambda_dir
-        self.lambda_mag_reg = lambda_mag_reg
-        self.motion_threshold_beta = motion_threshold_beta
-        self.motion_scale_alpha = motion_scale_alpha
-        self.huber_delta = huber_delta
-        
-    def forward(self, delta_s_pred: torch.Tensor, delta_s_gt: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        计算物理接地损失
-        
-        Args:
-            delta_s_pred (torch.Tensor): 预测的状态差，形状 [B, 3]
-            delta_s_gt (torch.Tensor): 真实的状态差，形状 [B, 3]
-            
-        Returns:
-            Dict[str, torch.Tensor]: 包含各种损失项的字典
-        """
-        # 1. 方向损失 (Direction Loss) - 余弦相似度
-        # 避免零向量导致的数值不稳定
-        eps = 1e-8
-        cosine_sim = F.cosine_similarity(delta_s_pred, delta_s_gt, dim=-1, eps=eps)
-        direction_loss = 1.0 - cosine_sim  # [B]
-        
-        # 2. 幅度正则化 (Magnitude Regularizer) - Huber损失
-        pred_magnitude = torch.norm(delta_s_pred, p=2, dim=-1)  # [B]
-        gt_magnitude = torch.norm(delta_s_gt, p=2, dim=-1)      # [B]
-        magnitude_loss = F.huber_loss(pred_magnitude, gt_magnitude, reduction='none', delta=self.huber_delta)  # [B]
-        
-        # 3. 运动权重 (Movement Weighting) - Sigmoid激活
-        with torch.no_grad():
-            # 只有当真实运动幅度超过阈值时，损失才会被显著计入
-            motion_weight = torch.sigmoid(
-                self.motion_scale_alpha * (gt_magnitude - self.motion_threshold_beta)
-            )  # [B]
-        
-        # 4. 组合损失
-        combined_loss_per_sample = motion_weight * (
-            self.lambda_dir * direction_loss + 
-            self.lambda_mag_reg * magnitude_loss
-        )  # [B]
-        
-        # 5. 平均损失
-        total_loss = combined_loss_per_sample.mean()
-        
-        # 返回详细的损失信息用于日志记录
-        return {
-            'total_loss': total_loss,
-            'magnitude_loss': magnitude_loss.mean(),
-            'motion_weight': motion_weight.mean(),
-            'cosine_similarity': cosine_sim.mean()
-        }
 
 
 class LatentLAMModel(nn.Module):
@@ -516,100 +25,162 @@ class LatentLAMModel(nn.Module):
     def __init__(
         self,
         dim: int=1024,
+        num_heads: int = 16,
+        ffn_expansion_factor: int = 2,
         enc_layers: int = 6,
         codebook_size: int = 16,
         code_dim: int = 256,
+        num_frames: int = 5,
+        ar_prediction: bool = False,
         vq_kwargs: Optional[Dict[str, Any]] = None,
         dec_layers: int = 6,
-        dec_self_heads: int = 4,
-        dec_cross_heads: int = 4,
         dropout: float = 0.1,
-        num_queries: int = 4,
         # 新增：状态差预测器参数
         enable_state_delta_prediction: bool = True,
+        vq_type: str = "nsvq",
+        disable_vq: bool = False,
+        norm_latents: bool = False,
         vision_model_id: str = "facebook/vjepa2-vitl-fpc64-256",
-
+        **kwargs
     ):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # 集成视觉编码器：负责将 videos 编码为 [B, T, N, D] 特征
-        self.vision_encoder = VJEPAEncoder(vision_model_id).to(self.device)
-        self.encoder = LAMEncoder(context_dim=dim, query_dim=code_dim, num_queries=num_queries, num_layers=enc_layers, dropout=dropout).to(self.device)
-        self.decoder = LAMDecoder(dim, code_dim, dec_layers,  dropout=dropout).to(self.device)
-        vq_kwargs = vq_kwargs or {}
-        self.vq = NSVQ(
-            code_seq_len=num_queries,
-            codebook_size=codebook_size,
-            code_dim=code_dim,
-            **vq_kwargs
-        ).to(self.device)
-
-        self.num_queries = num_queries
+        encoder_obj, input_dim = build_vision_encoder(vision_model_id)
+        if encoder_obj is None:
+            # 未使用预训练视觉编码器，回退到可学习的 PatchEmbed 层
+            self.vision_encoder = PatchEmbed(patch_size=16, embed_dim=dim, in_chans=3).to(self.device)
+            self.input_dim = self.vision_encoder.feature_dim
+            self.train_in_latent = False
+        else:
+            self.vision_encoder = encoder_obj.to(self.device)
+            self.input_dim = input_dim
+            self.train_in_latent = True
+        self.ar_prediction = ar_prediction
+        self.num_frames = num_frames
+        if self.ar_prediction:
+            self.frame_to_pre = self.num_frames - 1
+            self.decoder = LAMDecoder(feature_dim=dim, node_dim=code_dim, input_dim=self.input_dim, frame_to_pre=self.frame_to_pre, num_layers=dec_layers, num_heads=num_heads, dropout=dropout, train_in_latent=self.train_in_latent, ffn_expansion_factor=ffn_expansion_factor).to(self.device)
+        else:
+            self.frame_to_pre = 1
+            self.decoder = LAMDecoder_v2(feature_dim=dim, node_dim=code_dim, input_dim=self.input_dim, num_layers=dec_layers, num_heads=num_heads, dropout=dropout, train_in_latent=self.train_in_latent, ffn_expansion_factor=ffn_expansion_factor).to(self.device)
+        self.norm_latents = norm_latents
+        self.encoder = LAMEncoder(context_dim=dim, query_dim=code_dim, input_dim=self.input_dim, ar_query=self.ar_prediction, num_layers=enc_layers, num_heads=num_heads, dropout=dropout, ffn_expansion_factor=ffn_expansion_factor, num_frames=self.num_frames).to(self.device)
         
-        # 新增：状态差预测器
-        self.enable_state_delta_prediction = enable_state_delta_prediction
-        if enable_state_delta_prediction:
-            self.state_delta_predictor = StateDeltaPredictor(
-                latent_dim=code_dim, 
-                dropout=dropout
+        vq_kwargs = vq_kwargs or {}
+        if vq_type == "nsvq":
+            self.vq = NSVQ(
+            codebook_size=codebook_size,
+                code_dim=code_dim,
+                use_diveq=False,
+                **vq_kwargs
             ).to(self.device)
-
-    def forward(self, videos: torch.Tensor, state_pair: Optional[torch.Tensor] = None):
+        elif vq_type == "vq":
+            self.vq = VQ(
+                codebook_size=codebook_size,
+                code_dim=code_dim,
+                **vq_kwargs
+            ).to(self.device)
+        else:
+            self.vq = NSVQ(
+                codebook_size=codebook_size,
+                code_dim=code_dim,
+                **vq_kwargs
+            ).to(self.device)
+        self.disable_vq = disable_vq
+        # 新增：状态差预测器
+        # self.state_delta_predictor = StatePredictor(
+        #         latent_dim=code_dim, 
+        #         dropout=dropout
+        #     ).to(self.device)
+        self.code_book_size = codebook_size
+    def forward(self, videos: torch.Tensor, states: torch.Tensor, dec_videos: torch.Tensor):
         """
         Args:
             videos: 视频帧张量，形状取决于 VJEPAEncoder 的实现，例如 [B, T, C, H, W]
             state_pair: [B, T, state_dim] # 可选的状态信息，用于状态差预测
         Returns:
-            tuple: (recon, perplexity, indices, delta_s_pred, features)
+            tuple: (recon, perplexity, indices, delta_s_pred, features, quantized, slot_diversity_loss, commitment_loss)
                 recon: [B, N, D] 重建的下一帧 patch 特征
                 perplexity: 标量 VQ困惑度
                 indices: [B, num_queries] VQ索引
                 delta_s_pred: [B, 3] 预测的状态差（如果启用）或 None
                 features: [B, T, N, D] 由视觉编码器得到的特征
         """
-        return self._run(videos=videos, vq_training=True)
-
+        return self._run(videos=videos,states=states, dec_videos=dec_videos, vq_training=True)
 
     
     def _run(
         self,
-        videos: torch.Tensor,
+        videos: torch.Tensor,   #[B, T, C,H,W]
+        states: torch.Tensor,  #[B,T,8]
+        dec_videos: torch.Tensor,  #[B,T,C,H,W]
         user_specific: Optional[int] = None,
         vq_training: bool = True,
+        predict_future_frame: bool = True,
+
     ):
         """统一的执行路径，仅在 VQ 调用上区分训练/推理。
         Args:
             videos: 原始视频帧张量
+            states: 状态张量
+            dec_videos: 解码器用
             user_specific: 指定 codebook（仅推理时生效）
             vq_training: True 使用 self.vq(...)，False 使用 self.vq.inference(...)
         Returns:
-            (recon, perplexity, indices, delta_s_pred, features)
+            (recon, perplexity, indices, delta_s_pred, features, quantized, codebook_loss, entropy_loss, commitment_loss)
         """
         # 冻结视觉编码器参数，与原 Lightning 行为保持一致
-        with torch.no_grad():
-            features = self.vision_encoder.encode_video_frames(videos)
-            # print(f"features.shape: {features.shape}")
-            #features.shape: torch.Size([16, 2, 256, 1024])
-        nodes = self.encoder(features[:,0],features[:,1])  # [B, num_queries, code_dim]
-        if vq_training:
-            quantized, perplexity, indices = self.vq(nodes)
+        
+        if self.train_in_latent:
+            T =videos.shape[1]
+            assert T == self.num_frames, f"videos must have the same number of frames as self.num_frames. get T={T}, self.num_frames={self.num_frames}"
+            all_features = self.vision_encoder.encode(torch.cat([videos, dec_videos], dim=1), norm_latents=self.norm_latents, n=-1)
+            # breakpoint()
+            enc_in = all_features[:,:T] #[B,T,K,D]
+            if not self.ar_prediction:  
+                dec_in = all_features[:,T:T+1]  # [B,1, K,D]
+                tgt = all_features[:,-1:]  # [B,1, K,D]
+                dec_states = states[:,:1]
+            else:
+                dec_in = all_features[:,T:T*2-1]  # [B,T-1, K,D]
+                tgt = all_features[:,T+1:]  # [B,T-1, K,D]
+                dec_states = states[:, :T-1] # [B,T-1, 8]
+            vision_features = torch.stack([dec_in, tgt], dim=1)  
         else:
-            quantized, perplexity, indices = self.vq.inference(nodes, user_specific=user_specific)
+            vision_features = dec_videos
+            vision_features = self.vision_encoder.encode(vision_features)
+            dec_in, tgt = vision_features[:,:1], vision_features[:,-1:]
+            vision_features = torch.stack([dec_in, tgt], dim=1)
 
-        recon = self.decoder(features[:, 0], quantized)
+        nodes = self.encoder(enc_in, states)  # [B, num_queries, code_dim]
+        # nodes = self.encoder(video_feature)
+        if vq_training:
+            quantized, perplexity, indices, entropy_loss, vq_loss = self.vq(nodes)
+        else:
+            quantized, indices = self.vq.inference(nodes, user_specific=user_specific)
+            perplexity, entropy_loss, vq_loss = 0.0, 0.0, 0.0
+        if self.disable_vq:
+            # quantized = torch.zeros_like(nodes)
+            quantized = nodes
+        recon = None
+        s_pred = None
+        # delta_s_pred = self.state_delta_predictor(quantized, state_0=states[:,0])
+        if predict_future_frame:
+            # 使用潜动作表示进行解码；当禁用 VQ 时，quantized 等同于 nodes
+            recon, s_pred = self.decoder(features=dec_in, actions=quantized, states=dec_states)
+        # with torch.no_grad():
+        #     print(tgt.mean(), tgt.std())
+        #     delta = tgt-dec_in
+        #     print(delta.mean(), delta.std())
+        return recon, dec_in, tgt, perplexity, indices, s_pred, vision_features, quantized, entropy_loss, vq_loss
+        
+    @torch.inference_mode()
+    def inference(self, videos: torch.Tensor, states: torch.Tensor, dec_videos: torch.Tensor):
+        return self._run(videos=videos, states=states, dec_videos=dec_videos, vq_training=False, predict_future_frame=True)
 
-        delta_s_pred = None
-        if self.enable_state_delta_prediction:
-            delta_s_pred = self.state_delta_predictor(quantized)
-
-        return recon, perplexity, indices, delta_s_pred, features, quantized
-
-
-    def inference(self, videos: torch.Tensor, user_specific=None):
-        return self._run(videos=videos, user_specific=user_specific, vq_training=False)
-
-    @torch.no_grad()
-    def vq_encode(self, videos: torch.Tensor, user_specific=None):
+    @torch.inference_mode()
+    def vq_encode(self, videos: torch.Tensor, states: torch.Tensor, dec_videos: Optional[torch.Tensor] = None, predict_future_frame: bool = True, user_specific=None):
         """
         推理流程：videos -> 视觉编码 -> 编码 -> VQ.inference(user_specific) -> 解码
         Args:
@@ -623,39 +194,99 @@ class LatentLAMModel(nn.Module):
                 indices: [B, num_queries]
                 delta_s_pred: [B, 3] 或 None（若未启用）
         """
-        
-        recon, perplexity, indices, delta_s_pred, features, quantized =  self._run(
+        if dec_videos is None:
+            dec_videos = videos
+        recon, dec_in, tgt,perplexity, indices, s_pred, features, quantized, *_=  self._run(
             videos=videos,
+            states=states,
+            dec_videos=dec_videos,
             user_specific=user_specific,
             vq_training=False,
+            predict_future_frame=predict_future_frame,
         )
         return {
             'recon': recon,
+            'dec_in': dec_in,
+            'tgt': tgt,
             'perplexity': perplexity,
             'indices': indices,
-            'delta_s_pred': delta_s_pred,
+            's_pred': s_pred,
             'features': features,
             'quantized': quantized,
         }
 
-def load_latent_action_model(lam_path, vision_model_id="facebook/vjepa2-vitl-fpc64-256"):
-    latent_action_model = LatentLAMModel(
-            dim=1024,
-            enc_layers=6,
-            codebook_size=16,
-            code_dim=256,
-            dec_layers=6,
-            dec_self_heads=4,
-            dec_cross_heads=4,
-            dropout=0.1,
-            num_queries=4,
-            vision_model_id=vision_model_id,
-    ).to("cpu")
+def load_latent_action_model(ckpt_path, yaml_path):
+    # 1) 读取 YAML 配置，并获取 model 配置段
+    with open(yaml_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    model_cfg = cfg.get('model', cfg) or {}
 
-    lam_ckpt = torch.load(lam_path, map_location="cpu")['state_dict']
+    # 2) 严格使用 YAML 中提供的参数，不做默认回退
+    #    - 缺失关键键则报错；允许存在额外键但仅传递被允许的模型构造键
+    required_keys = {
+        'vision_model_id',
+        'dim',
+        'enc_layers',
+        'dec_layers',
+        'code_dim',
+        'codebook_size',
+        'ar_prediction',
+    }
+    missing = sorted(list(required_keys - set(model_cfg.keys())))
+    if missing:
+        raise ValueError(f"YAML缺少以下关键模型参数：{missing}")
+
+    allowed_keys = {
+        'dim',
+        'num_heads',
+        'ffn_expansion_factor',
+        'enc_layers',
+        'codebook_size',
+        'code_dim',
+        'vq_kwargs',
+        'dec_layers',
+        'dropout',
+        'enable_state_delta_prediction',
+        'disable_vq',
+        'norm_latents',
+        'vision_model_id',
+        'ar_prediction',
+        'vq_type',
+        'num_frames',  # 添加 num_frames 以支持从配置加载
+    }
+    init_kwargs = {k: model_cfg[k] for k in allowed_keys if k in model_cfg}
+
+    # 3) 构建模型（放置到 CPU 以保证权重加载兼容性）
+    latent_action_model = LatentLAMModel(**init_kwargs).to("cpu")
+
+    # 5) 加载 checkpoint 并严格对齐键与形状
+    lam_ckpt = torch.load(ckpt_path, map_location="cpu")['state_dict']
     new_ckpt = {}
     for key in lam_ckpt.keys():
         new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
+    model_state = latent_action_model.state_dict()
+    model_keys = set(model_state.keys())
+    ckpt_keys = set(new_ckpt.keys())
+
+    missing_keys = sorted(list(model_keys - ckpt_keys))
+    unexpected_keys = sorted(list(ckpt_keys - model_keys))
+    shape_mismatches = []
+    for k in sorted(model_keys & ckpt_keys):
+        if model_state[k].shape != new_ckpt[k].shape:
+            shape_mismatches.append((k, tuple(model_state[k].shape), tuple(new_ckpt[k].shape)))
+
+    if missing_keys or unexpected_keys or shape_mismatches:
+        error_lines = ["加载 LAM 权重失败："]
+        if missing_keys:
+            error_lines.append(f"缺失的键（模型需要但权重中不存在）数量 {len(missing_keys)}：")
+            error_lines += [f"  - {k}" for k in missing_keys]
+        if unexpected_keys:
+            error_lines.append(f"多余的键（权重中存在但模型未使用）数量 {len(unexpected_keys)}：")
+            error_lines += [f"  - {k}" for k in unexpected_keys]
+        if shape_mismatches:
+            error_lines.append(f"形状不匹配的键数量 {len(shape_mismatches)}：")
+            error_lines += [f"  - {k}: 模型{ms} vs 权重{cs}" for k, ms, cs in shape_mismatches]
+        raise RuntimeError("\n".join(error_lines))
 
     latent_action_model.load_state_dict(new_ckpt, strict=True)
     for p in latent_action_model.parameters():

@@ -6,11 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from latent_action_model.core.lam_model import LatentLAMModel
-from latent_action_model.core.vq import NSVQ
-from .flowmatching_expert import (
-    ConditionalFlowMatchingHead,
-)
+from latent_action_model.core.lam_model import load_latent_action_model
+from .flowmatching_expert import ConditionalFlowMatchingHead
+from prismatic.models.load import load_InternVL, freeze_internvl
 
 
 class FutureFeatureMode(str, enum.Enum):
@@ -19,6 +17,9 @@ class FutureFeatureMode(str, enum.Enum):
     LAM_FROM_VLM = "lam_from_vlm"  # 使用VLM输出的z_a，经LAM decoder得到 h_{t+1}^hat
     LAM_FROM_GT = "lam_from_gt"  # 使用GT的z_a索引，经LAM decoder得到 h_{t+1}^hat
     VJEPA_GT = "vjepa_gt"  # 直接使用VJEPA对 I_{t+1} 的编码 h_{t+1}
+
+
+HOME_PATH = "/mnt/mnt/public/jlchen"
 
 
 @dataclass
@@ -32,16 +33,10 @@ class LatentWorldVLAConfig:
 
     # codebook 与 LAM 超参（用于检查与构造）
     num_queries: int = 4
-
-    # flow matching 头部参数
-    flow_hidden_dim: int = 512
-    flow_num_layers: int = 4
-    flow_num_steps: int = 50
-
     # 三源混合概率（总和应为1.0）
-    p_lam_from_vlm: float = 0.34
-    p_lam_from_gt: float = 0.33
-    p_vjepa_gt: float = 0.33
+    p_lam_from_vlm: float = 0.2
+    p_lam_from_gt: float = 0.3
+    p_vjepa_gt: float = 0.5
 
     # 动作token起始ID，用于 VLM 生成token -> 码本索引的映射
     action_token_begin_id: int = 151679
@@ -49,6 +44,19 @@ class LatentWorldVLAConfig:
     # CFG 超参：训练掉落概率（在Flow头部内部使用），推理guidance scale
     cfg_drop_prob: float = 0.1
     cfg_guidance_scale: float = 1.5
+
+    # ===== 新增：模型加载相关参数（由原 FinetuneConfig 迁移而来）=====
+    # Base VLM & LAM
+    model_id: str = HOME_PATH + "/code/UniVLA/vla_scripts/vla_log/1027_122446+nsvq_bridgensvq_bridge/checkpoints/checkpoint-4000"
+    lam_ckpt_path: str = HOME_PATH + "/code/UniVLA/latent_action_model/logs/dino_bridge_bi_cls/version_1/checkpoints/epoch=17.ckpt"
+    lam_yaml_path: str = HOME_PATH + "/code/UniVLA/latent_action_model/logs/dino_bridge_bi_cls/version_1/dino_bridge.yaml"
+
+    # LAM/codebook
+    codebook_size: int = 16
+
+
+    # VLM 精度
+    vlm_dtype: torch.dtype = torch.bfloat16
 
 
 class LatentWorldVLA(nn.Module):
@@ -67,101 +75,99 @@ class LatentWorldVLA(nn.Module):
 
     def __init__(
         self,
-        lam: LatentLAMModel,
         model_cfg: LatentWorldVLAConfig,
-        vlm: nn.Module,
     ) -> None:
         super().__init__()
 
-        self.lam = lam.eval()
-        for p in self.lam.parameters():
-            p.requires_grad_(False)
-        self.vlm = vlm.eval()
-        for p in self.vlm.parameters():
-            p.requires_grad_(False)
-
         self.model_cfg = model_cfg
 
+        # 1) 加载基础 InternVL 模型与 Processor
+        self.vlm, self.processor = load_InternVL(
+            self.model_cfg.model_id,
+            dtype=self.model_cfg.vlm_dtype,
+        )
+        # 便捷引用 tokenizer
+        self.tokenizer = self.processor.tokenizer
+
+        # 2) 向 tokenizer 注入离散动作 tokens，并根据 tokenizer 计算 action_token_begin_id
+        special_tokens_dict = {"additional_special_tokens": [f"<ACT_{i}>" for i in range(self.model_cfg.codebook_size)]}
+        try:
+            num_added_toks = self.tokenizer.add_special_tokens(special_tokens_dict)  # type: ignore[attr-defined]
+        except Exception:
+            num_added_toks = 0
+        if num_added_toks > 0 and hasattr(self.vlm, "resize_token_embeddings"):
+            self.vlm.resize_token_embeddings(len(self.tokenizer))
+
+        # 根据 tokenizer 中 ACT_ token 的起始 id 校准 action_token_begin_id（若可用）
+        act_tokens = [f"<ACT_{i}>" for i in range(self.model_cfg.codebook_size)]
+        act_ids = self.tokenizer.convert_tokens_to_ids(act_tokens)
+        if isinstance(act_ids, list) and len(act_ids) > 0 and min(act_ids) != -1:
+            self.model_cfg.action_token_begin_id = min(act_ids)
+
+        # 3) 冻结策略：根据配置冻结/解冻 VLM 各部分
+        if self.model_cfg.freeze_vlm:
+            freeze_internvl(self.vlm, True, True, True, True)
+        else:
+            freeze_internvl(self.vlm, False, False, False, False)
+
+        # 4) 加载 LAM（含 VJEPA Encoder 与 Decoder），默认 eval 与冻结参数
+        lam_model = load_latent_action_model(self.model_cfg.lam_ckpt_path, self.model_cfg.lam_yaml_path)
+        self.lam = lam_model.eval()
         # 可学习编码器已迁移至 flowmatching_expert，由 Flow 头内部管理
 
 
         # Flow Matching 头（内部自配置）
         self.flow = ConditionalFlowMatchingHead()
-        self.code_book_size = self.lam.vq.get_codebook_size()
+        self.code_book_size = self.lam.codebook_size
+        self.norm_stats = None
 
     def set_cfg_drop_prob(self, p: float) -> None:
         self.model_cfg.cfg_drop_prob = float(max(0.0, min(1.0, p)))
 
-    # ------------------
-    # 内部功能
-    # ------------------
-
     def world_imagine_next(self, h_t: torch.Tensor, code_indices: torch.Tensor) -> torch.Tensor:
         z_q = F.embedding(code_indices, self.lam.vq.codebooks)
-        return self.lam.decoder(h_t, z_q)
+        return self.lam.decoder(h_t, z_q).to(h_t.dtype)
 
 
     @torch.no_grad()
-    def extract_action_idx_and_hidden_states(self, hidden: torch.Tensor, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """直接用一次 forward 获取 hidden_states 与 index，提取两项：
-        - h_vlm: 最后Q个token隐状态的均值 [B, Dvlm]
-        - vlm_action_idx: 在 <ACT_*> 子词表上的 argmax 索引 [B, Q] (0..K-1)
+    def extract_action_idx_and_hidden_states(
+        self,
+        hidden: torch.Tensor,   # [B, L, D], 模型最后一层 hidden states
+        logits: torch.Tensor,   # [B, L, V], 模型输出的 logits
+        labels: Optional[torch.Tensor] = None,  # [B, L], 若提供则按 labels 精确定位动作 token
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        基于 labels 精确提取 Q(=num_queries) 个 latent action tokens 对应的 hidden 与预测 index。
+        - 若 labels 提供：使用 (labels != -100) 作为掩码定位动作 token，按时间顺序提取。
+        - 若 labels 缺失：回退为取序列最后 Q 个位置（仅用于推理/生成场景）。
+        返回：
+          vlm_hidden: [B, L, D]
+          action_idx:    [B, Q] （码本内索引 0..code_book_size-1）
         """
 
-        action_hidden, action_logits = [], []
-        for b in range(hidden.size(0)):
-            positions = torch.nonzero(hidden[b] >= self.model_cfg.action_token_begin_id, as_tuple=False).squeeze(1)
-            
-            # 检查action token数量，如果不为4则发出警告并截取最后4个
-            if positions.numel() != 4:
-                print(f"警告: Batch {b} action token数量为 {positions.numel()}，期望为 4，将截取最后4个token")
-                if positions.numel() > 4:
-                    positions = positions[-4:]  # 截取最后4个
-                else:
-                    # 如果不足4个，重复最后一个token
-                    if positions.numel() > 0:
-                        last_pos = positions[-1]
-                        positions = torch.cat([positions, last_pos.repeat(4 - positions.numel())])
-                    else:
-                        # 如果没有找到任何action token，使用序列末尾的位置
-                        seq_len = hidden.size(1)
-                        positions = torch.arange(seq_len - 4, seq_len, device=hidden.device)
-                        print(f"警告: Batch {b} 未找到action token，使用序列末尾4个位置")
-            
-            action_hidden.append(hidden[b, positions, :])
-            action_logits.append(logits[b, positions, :])
-        action_hidden, action_logits = torch.stack(action_logits), torch.stack(action_hidden)
+        B, L, D = hidden.shape
+        act_begin = self.model_cfg.action_token_begin_id
+        act_end = act_begin + self.code_book_size
+        Q = int(self.model_cfg.num_queries)
 
-        # 在 <ACT_*> 子词表上取 argmax
-        act_ids = torch.arange(
-            self.model_cfg.action_token_begin_id,
-            self.model_cfg.action_token_begin_id + self.code_book_size,
-            device=action_logits.device,
-            dtype=torch.long,
-        )
-        action_logits = action_logits.index_select(dim=-1, index=act_ids)  # [B,Q,K]
-        action_idx = torch.argmax(action_logits, dim=-1)  # [B,Q]
-        return action_hidden, action_idx
+        # 基于 (labels != -100) 的掩码定位动作 token，保证每个样本恰有 Q 个
+        valid_mask = (labels != -100)  # [B, L]
+        # 将无效位置赋值为 -1，有效位置为其时间索引，随后取 topk 得到每样本 Q 个位置
+        time_indices = torch.arange(L, device=labels.device).unsqueeze(0).expand(B, L)
+        scores = torch.where(valid_mask, time_indices, torch.full_like(time_indices, -1))  # [B, L]
+        positions = torch.topk(scores, k=Q, dim=1).indices  # [B, Q]（按时间索引降序）
+        positions, _ = torch.sort(positions, dim=1)  # 升序保证时间顺序
 
-    def _ht1_sampling(self, h_t1_lam_from_vlm: torch.Tensor, h_t1_lam_from_gt: torch.Tensor, h_t1_vjepa: torch.Tensor) -> torch.Tensor:
-        B = h_t1_vjepa.shape[0]
-        # 三源采样概率
-        probs = torch.tensor([
-            self.model_cfg.p_lam_from_vlm,
-            self.model_cfg.p_lam_from_gt,
-            self.model_cfg.p_vjepa_gt,
-        ], device=h_t1_vjepa.device, dtype=torch.float32)
-        probs = probs / probs.sum()  # 归一化
+        # 矢量化 gather 取出对应 hidden / logits
+        # vlm_hidden = hidden.gather(dim=1, index=positions.unsqueeze(-1).expand(B, Q, D))  # [B, Q, D]
+        action_logits_full = logits.gather(dim=1, index=positions.unsqueeze(-1).expand(B, Q, logits.size(-1)))  # [B, Q, V]
 
-        # Categorical 分布采样
-        modes = torch.distributions.Categorical(probs).sample(torch.Size([B]))  # [B], 值为 0/1/2
-
-        # 将三种来源堆叠
-        h_sources = torch.stack([h_t1_lam_from_vlm, h_t1_lam_from_gt, h_t1_vjepa], dim=0)  # [3, B, ...]
-        # 矢量化索引选择
-        h_t1_star = h_sources[modes, torch.arange(B)]  # [B, ...]
-        return h_t1_star
-
+        # 限制到 <ACT_*> 子词表并求 argmax，得到码本内索引
+        act_ids = torch.arange(act_begin, act_end, device=hidden.device)
+        act_logits = action_logits_full.index_select(dim=-1, index=act_ids)  # [B, Q, code_book_size]
+        action_idx = torch.argmax(act_logits, dim=-1)  # [B, Q]
+        vlm_hidden = hidden[:,261:]         # [B, Q, D]   当前从language emb的第一个token选起
+        return vlm_hidden, action_idx
     # ------------------
     # 前向接口
     # ------------------
@@ -174,12 +180,13 @@ class LatentWorldVLA(nn.Module):
         attention_mask: torch.Tensor,    # [B, L]
         actions: torch.Tensor,           # [B, T, Da]
         latent_action_idx: torch.Tensor, # [B, Q]        (GT)
-        proprio: torch.Tensor,           # [B, T, Dq]
+        proprio: torch.Tensor,           # [B, Dq]
         image_features : torch.Tensor,   # [B, 2, K, D]
     ) -> Dict[str, torch.Tensor]:
     
-        h_t, h_t1 = image_features[:, 0, :, :], image_features[:, 1, :, :]
+        h_t, h_t1 = image_features[:, 0, :, :], image_features[:, -1, :, :]
         # 1) 计算 VLM 前向（保留梯度用于 LoRA 训练），但在后续 Flow 头中使用 detach 特征
+        # 只要对VLM传入labels，就一定会返回loss键  odict_keys(['loss', 'logits', 'past_key_values', 'hidden_states'])
         out_dict = self.vlm(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -188,8 +195,8 @@ class LatentWorldVLA(nn.Module):
             attention_mask=attention_mask,
         )
         hidden, logits = out_dict.hidden_states[-1], out_dict.logits  # [B, L, H], [B, L, V]
-        # VLM 路
-        h_vlm, vlm_idx = self.extract_action_idx_and_hidden_states(hidden, logits)
+        # VLM 路：基于 labels 精确提取动作 token 的 hidden 与索引
+        h_vlm, vlm_idx = self.extract_action_idx_and_hidden_states(hidden, logits, labels=labels)
         h_t1_lam_from_vlm = self.world_imagine_next(h_t, vlm_idx)
         # GT-LAM 路
         h_t1_lam_from_gt = self.world_imagine_next(h_t, latent_action_idx)
@@ -235,27 +242,57 @@ class LatentWorldVLA(nn.Module):
         }
 
     @torch.inference_mode()
-    def generate(
+    def predict_action(
         self,
         *,
-        pixel_values: torch.Tensor,      # [B, 3, H, W]  (VLM用)
+        pixel_values: torch.Tensor,      # [B, 3, H, W]  (VLM用)  448*448
         input_ids: torch.Tensor,         # [B, L]        (VLM用)
-        proprio: torch.Tensor,           # [B, Dq]
-        attention_mask: torch.Tensor,    # [B, L]
-        guidance_scale: Optional[float] = None,
+        attention_mask: Optional[torch.Tensor] = None,    # [B, L]
+        image_4_jepa: Optional[torch.Tensor] = None,      # [B, 3, H, W]  (VJEPA用) 256*256
+        proprio: torch.Tensor,           # [B, Dq]        (Flow用)
+        guidance_scale: Optional[float] = 1.5,
+        window_size: int = 10,
+        image_feat_4_lam: Optional[torch.Tensor] = None,  #直接提供jepa特征，无需image_4_jepa，用于eval
+        **kwargs  # 捕获额外参数
     ) -> torch.Tensor:
 
-        with torch.no_grad():
-            # 先前向一次 VLM，提取 hidden/logits，再得到 h_vlm 与索引
-            out_dict = self.vlm.generate(input_ids=input_ids, pixel_values=pixel_values, output_hidden_states=True, attention_mask=attention_mask, max_new_tokens=4)
-            hidden, logits = out_dict.hidden_states[-1], out_dict.logits
-            h_vlm, vlm_idx = self.extract_action_idx_and_hidden_states(hidden, logits)
-            # 通过 LAM decoder 得到未来表征
-            h_t = self.lam.vision_encoder.encode_video_frames(pixel_values.unsqueeze(1))
-            h_t1_star = self.world_imagine_next(h_t, vlm_idx)
+        # 先前向一次 VLM，提取 hidden/logits，再得到 h_vlm 与索引
+        out_dict = self.vlm.generate(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask if attention_mask is not None else None,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            output_scores=True,
+            min_new_tokens=self.model_cfg.num_queries,
+            max_new_tokens=self.model_cfg.num_queries,
+            do_sample=False
+        )
 
+        # 在 codebook 范围内用每步 logits 选取索引
+        act_begin = int(self.model_cfg.action_token_begin_id)
+        act_end = act_begin + int(self.code_book_size)
+        act_ids = torch.arange(act_begin, act_end, device=pixel_values.device)
+        # scores 为长度为 Q 的列表，每个元素形状 [B, V]
+        latent_action_idx = torch.stack(
+            [torch.argmax(s.index_select(-1, act_ids), dim=-1) for s in out_dict.scores],
+            dim=1
+        )
+
+        # 从每步生成返回的 hidden_states 中取出该步新 token 的最后一层隐状态并堆叠
+        last_hidden_per_step = [hs[-1][:, -1, :] for hs in out_dict.hidden_states]  # Q 个 [B, D]
+        h_vlm = torch.stack(last_hidden_per_step, dim=1)  # [B, Q, D]
+        # 通过 LAM decoder 得到未来表征
+        if image_4_jepa is not None:
+            # 统一使用 encode 接口，传入 [B, C, H, W]，返回 [B, 1, K, D]
+            feats_bt_k_d = self.lam.vision_encoder.encode(image_4_jepa)
+            h_t = feats_bt_k_d[:, 0, :, :].to(dtype=h_vlm.dtype, device=pixel_values.device)
+        else:
+            h_t = image_feat_4_lam[:, 0, :, :].to(dtype=h_vlm.dtype, device=pixel_values.device)
+        h_t1_star = self.world_imagine_next(h_t, latent_action_idx)
 
         scale = self.model_cfg.cfg_guidance_scale if guidance_scale is None else float(guidance_scale)
-        return self.flow.sample_actions_cfg(h_t=h_t.detach(), h_t1_star=h_t1_star.detach(), h_vlm=h_vlm.detach(), proprio=proprio, guidance_scale=scale)
+        actions = self.flow.sample_actions_cfg(h_t=h_t, h_t1_star=h_t1_star, h_vlm=h_vlm, proprio=proprio, cfg_scale=scale,action_horizon=window_size)
+        return actions
 
 

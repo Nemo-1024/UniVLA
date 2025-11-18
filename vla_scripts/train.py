@@ -4,7 +4,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Tuple, Union, Dict, Any
 from datetime import datetime
-
+import draccus
+from tensorflow.python.data.util.structure import NoneTensorSpec
 import torch
 import torch.distributed as dist
 import yaml
@@ -31,7 +32,7 @@ overwatch = initialize_overwatch(__name__)
 # 🔢 对应的 token ID: [151679, 151680, 151681, 151682, 151683, 151684, 151685, 151686, 151687, 151688, 151689, 151690, 151691, 151692, 151693, 151694]
 # 🎯 action_token_begin_id = 151679
 # 📊 ID 范围: 151679 - 151694
-
+home_path = "/mnt/mnt/public/jlchen"
 @dataclass
 class TrainConfig:
     # fmt: off
@@ -40,22 +41,26 @@ class TrainConfig:
     # 路径与资源
     # =========================
     # Directory Paths
-    data_root_dir: Path = Path("/mnt/public_zgc/home/jlchen/datasets")
+    data_root_dir: Path = Path(home_path + "/datasets")
     run_root_dir: Path = Path(__file__).resolve().parent / "vla_log"    # Store logs & checkpoints under vla_scripts/
 
     # Hugging Face 模型标识（或本地权重目录）；用于 PrismaticVLM.from_pretrained()
-    model_id: str = '/mnt/public_zgc/home/jlchen/weights/InternVL3_5-1B-Instruct-HF'
+    model_id: str = home_path + "/weights/InternVL3_5-1B-Instruct-HF"
     hf_cache_dir: Optional[Path] = None
-    lam_path: str = "/mnt/public_zgc/home/jlchen/code/UniVLA/latent_action_model/logs/version_1/checkpoints/epoch=49_step=50000.ckpt"
+    lam_ckpt_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_bridge_noar_noposnos_nsvq_5-7/version_1/checkpoints/epoch=19.ckpt"
+    lam_yaml_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_bridge_noar_noposnos_nsvq_5-7/version_1/dino_bridge.yaml"
 
     # =========================
     # 数据与预处理
     # =========================
     # 数据混合与缓冲
-    data_mix: str = "droid_100"
-    shuffle_buffer_size: int = 20_000
+    data_mix: str = "bridge_dataset"
+    shuffle_buffer_size: int = 10240
     image_resolution: int = 448
     image_aug: bool = True                                          # Whether to enable image augmentations
+    # DataLoader
+    dataloader_num_workers: int = 0
+    dataloader_pin_memory: bool = True
 
     # =========================
     # 模型冻结策略
@@ -70,25 +75,26 @@ class TrainConfig:
     # LAM / 动作离散参数
     # =========================
     action_token_begin_id: int = 151679
-    # VJEPA_LAM 模型架构参数
-    vision_model_id: str = "/mnt/public_zgc/home/jlchen/weights/vjepa2-vitl-fpc64-256"
+    # vision_model_id: str = home_path + "/weights/dinov3-vitl16-pretrain-lvd1689m"
     codebook_size: int = 16  #此处修改无效，仅作为标记
     # =========================
     # 训练设置
     # =========================
     # 训练超参
     epochs: Optional[int] = 10
-    max_steps: Optional[int] = 200000  #以max_steps为准，若为空则按epochs * 10000近似
+    max_steps: Optional[int] = 100000  #以max_steps为准，若为空则按epochs * 10000近似
     per_device_batch_size: int = 16
-    gradient_accumulation_steps: int = 8
-    learning_rate: float = 2e-6
-    warmup_steps: int = 1000
+    gradient_accumulation_steps: int = 2
+    learning_rate: float = 1e-6
+    warmup_steps: int = 100
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     lr_scheduler_type: str = "constant_with_warmup"   #constant_with_warmup
+    optim: str = "adamw_torch"
     # 训练加速
     enable_mixed_precision_training: bool = True
     seed: int = 42                                                  # Random seed (for reproducibility)
+    logging_steps: int = 1
 
     # =========================
     # 评估与保存
@@ -97,7 +103,7 @@ class TrainConfig:
     save_total_limit: int = -1
     eval_interval: int = 1000
     eval_accumulation_steps: int = 1
-    per_device_eval_batch_size: int = 24
+    per_device_eval_batch_size: int = 64
     save_interval: int = 1000                                    # Interval for saving checkpoints (in steps
 
     # =========================
@@ -110,11 +116,11 @@ class TrainConfig:
     # 运行与日志
     # =========================
     # Run Arguments
-    run_id: Optional[str] =  None                                  # Run ID for logging, Weights & Biases
-    run_id_note: Optional[str] = "run_01"                               # Extra note for logging, Weights & Biases
+    run_id: Optional[str] =  "test"     # Run ID for logging, Weights & Biases
+    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
     # Tracking Parameters
     wandb_project: str = "vla_pretraining"                   # Name of W&B project to log to (use default!)
-    # wandb_entity: str = "opendrivelab"                              # Name of entity to log under
+    wandb_entity: Optional[str] = None                              # Name of entity to log under
 
     # =========================
     # 恢复 / 断点（仅用于日志标记，不再用于模型权重加载）
@@ -131,8 +137,15 @@ class TrainConfig:
 
     # fmt: on
 
-
+@draccus.wrap()
 def train(cfg: TrainConfig) -> None:
+    """训练入口（draccus 驱动 CLI）。
+
+    用法示例：
+    - 通过配置文件启动（draccus 将根据扩展名自动解析：.yaml/.yml/.json/.toml）：
+      python -m vla_scripts.train --config /path/to/config.yaml
+    - 也可直接传入单个参数覆盖配置文件对应字段（命令行实参优先生效）。
+    """
     overwatch.info("OpenVLA Training :: Warming Up")
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
@@ -143,19 +156,17 @@ def train(cfg: TrainConfig) -> None:
     vla_tag = f"{cfg.model_id.split('/')[-1]}+{cfg.data_mix}"
     world_size = overwatch.world_size() if dist.is_initialized() else max(torch.cuda.device_count(), 1)
     overwatch.info(f"Detected world_size = {world_size}")
-    cfg.run_id = (
+
+    cfg.run_id += (
         f"{vla_tag}+n{world_size}+b{cfg.per_device_batch_size}+x{cfg.seed}"
         if cfg.run_id is None
         else cfg.run_id
     )
-    if cfg.run_id_note is not None:
-        cfg.run_id += f"--{cfg.run_id_note}"
-    if cfg.image_aug:
-        cfg.run_id += "--image_aug"
+
 
     # cfg.run_id += '-Latent-Action-Pretraining'
     # Start =>> Build Directories and Set Randomness
-    overwatch.info('"Do or do not; there is no try."', ctx_level=1)
+    # overwatch.info('"Do or do not; there is no try."', ctx_level=1)
     # hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
     hf_token = str(cfg.hf_token) if isinstance(cfg.hf_token, Path) else cfg.hf_token
     worker_init_fn = set_global_seed(cfg.seed, get_worker_init_fn=True)
@@ -213,9 +224,9 @@ def train(cfg: TrainConfig) -> None:
  
     # 直接通过 HF ID/Path 加载 InternVL 模型与处理器
     overwatch.info(f"🔄 加载基础 InternVL `{cfg.model_id}`（HF from_pretrained）")
-    vlm, tokenizer = load_InternVL(cfg.model_id, cfg.hf_cache_dir, dtype=torch.bfloat16) 
+    vlm, processor = load_InternVL(cfg.model_id, cfg.hf_cache_dir, dtype=torch.bfloat16) 
+    tokenizer = processor.tokenizer
     vlm.generation_config.max_new_tokens = int(getattr(cfg, "max_new_tokens", 4))
-    vlm.generation_config.pad_token_id=int(tokenizer.eos_token_id)
     vlm.config.loss_type = str(getattr(cfg, "loss_type", "ForCausalLMLoss"))
     vlm.config.use_cache = False
 
@@ -229,7 +240,6 @@ def train(cfg: TrainConfig) -> None:
         overwatch.info(f"num_added_toks={num_added_toks}")
     except Exception:
         num_added_toks = 0
-   
     # Print number of total/trainable model parameters
     num_params = sum(p.numel() for p in vlm.parameters())
     num_trainable_params = sum(p.numel() for p in vlm.parameters() if p.requires_grad)
@@ -240,27 +250,24 @@ def train(cfg: TrainConfig) -> None:
     # Get VLA Dataset & Collator
 
     overwatch.info(
-        f"🔄 加载 V-JEPA2 动作编码器与码本（ckpt=`{cfg.lam_path}`，"
+        f"🔄 加载 V-JEPA2 动作编码器与码本（yaml=`{cfg.lam_yaml_path}`，"
         f"K={cfg.codebook_size}）"
     )
-    latent_action_model = load_latent_action_model(cfg.lam_path, vision_model_id=cfg.vision_model_id)  # default freeze all parameters
+    latent_action_model = load_latent_action_model(cfg.lam_ckpt_path, cfg.lam_yaml_path)  # default freeze all parameters
     latent_action_model = latent_action_model.to(device_id).eval()
     overwatch.info(
         f"🔄 构建 RLDS 数据集与 Collator（mixture=`{cfg.data_mix}`，image_res={cfg.image_resolution}）"
     )
     # 类型提示规避：latent_action_tokenizer 需要 VQ 编码器，这里用 cast 静态规避
-    train_dataset, val_dataset, tokenizer, collator = get_latent_vla_dataset_and_collator(
+    train_dataset, val_dataset, collator = get_latent_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.data_mix,
         latent_action_model,
-        tokenizer=tokenizer,
+        processor=processor,
         default_image_resolution=cfg.image_resolution,
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
-
-
-
 
     act_tokens = [f"<ACT_{i}>" for i in range(cfg.codebook_size)]
     act_ids = tokenizer.convert_tokens_to_ids(act_tokens)
@@ -281,14 +288,14 @@ def train(cfg: TrainConfig) -> None:
 
     # 使用 Accelerate + FSDP 的新训练器（直接传入 dataclass -> dict）
     overwatch.info("🚀 启动 VLA 训练循环（Accelerate+FSDP）；首次 step 可能较慢（初始化 FSDP/AMP）")
-
+    dist.barrier()
     run_latent_action_training(
         cfg=cfg,
         vlm=vlm,
         vla_dataset=cast(RLDSDataset, train_dataset),
         eval_dataset=cast(RLDSDataset, val_dataset),
         collator=collator,
-        tokenizer=tokenizer,
+        processor=processor,
         run_dir=run_dir,
         overwatch=overwatch,
     )
@@ -303,5 +310,5 @@ def train(cfg: TrainConfig) -> None:
 
 
 if __name__ == "__main__":
-    # 简化入口（原 draccus CLI 装饰器已移除）
-    train(TrainConfig())
+    # 入口：由 draccus.wrap 提供 CLI（支持 --config 指定 YAML/JSON/TOML 配置）
+    train()

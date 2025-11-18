@@ -43,6 +43,9 @@ tf.config.set_visible_devices([], "GPU")
 #bridge_dataset: 5HZ
 #libero: 10HZ
 #droid: 15HZ
+#kuka: 10HZ
+#fractal20220817_data : 3HZ
+#taco_play: 15HZ
 # From 3Hz to 5Hz control frequency
 datasets_with_lower_frequency = ['fractal20220817_data', 'toto', 'berkeley_autolab_ur5',#'bridge_oxe' 
 'nyu_franka_play_dataset_converted_externally_to_rlds', 
@@ -54,7 +57,7 @@ datasets_with_higher_frequency = ['utaustin_mutex',
 'iamlab_cmu_pickup_insert_converted_externally_to_rlds', 
 'austin_sailor_dataset_converted_externally_to_rlds', 
 'austin_sailor_dataset_converted_externally_to_rlds', 
-'toto', 'viola', 'droid','droid_100']
+'toto', 'viola', 'droid','droid_100', "taco_play"]
 
 # ruff: noqa: B006
 def make_dataset_from_rlds(
@@ -424,23 +427,25 @@ def apply_trajectory_transforms(
         window_size = 2
 
     if name in datasets_with_lower_frequency:
-        window_size = random.randint(3,5) if training_phase == 'lam' else 5
-    
+        window_size = random.randint(5,7) if training_phase == 'lam' else 5
+        # window_size = 5
     if name in datasets_with_higher_frequency:
         window_size = random.randint(15,20) if training_phase == 'lam' else 15
-
-        
     # 选择chunking策略
-    if training_phase == 'post-training':
-        transform = traj_transforms.chunk_act_obs_libero        # 完整窗口，最大重叠
-    # elif training_phase == 'lam':
-    #     transform = traj_transforms.chunk_act_obs_half_stride    # 半步长，平衡重叠
-    #     # transform = traj_transforms.chunk_act_obs               # 标准版本，无重叠
-    elif train==False:
-        transform = traj_transforms.chunk_act_obs_half_stride    # 半步长，平衡重叠
-    else:       
-        transform = traj_transforms.chunk_act_obs               # 标准版本，无重叠
-
+    # if training_phase == 'post-training':
+    #     transform = traj_transforms.chunk_act_obs_libero    # load all obs. within a window
+    # else:       
+    #     transform = traj_transforms.chunk_act_obs           # only load the first and last obs. within a window
+    if training_phase == 'lam':
+        transform = traj_transforms.chunk_act_obs_uniform_resample    # 等距重采样到固定长度的窗口
+        # transform = traj_transforms.chunk_act_obs           # 仅加载窗口内的第一帧和最后一帧
+    elif training_phase == 'post-training':
+        transform = traj_transforms.chunk_act_obs_libero    # 等距重采样到固定长度的窗口
+    elif training_phase == 'pre-training':
+        transform = traj_transforms.chunk_act_obs_uniform_resample    # 等距重采样到固定长度的窗口
+    else:
+        assert False, f"Invalid training phase: {training_phase}"
+    
     dataset = dataset.traj_map(
         partial(
             transform,
@@ -632,6 +637,8 @@ def make_interleaved_dataset(
     # Effective Dataset Length = Number of samples until each dataset has completed at least one epoch
     #   =>> Note :: Only counting the "primary" datasets (i.e., datasets with sample_weight == 1.0)
     dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices].max())
+    if train==False:
+        dataset_len = min(dataset_len, shuffle_buffer_size)
 
     # Allocate Threads based on Weights
     threads_per_dataset = allocate_threads(traj_transform_threads, sample_weights)

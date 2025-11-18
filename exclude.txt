@@ -1,0 +1,18 @@
+# 训练日志目录（匹配任意层级的同名目录）
+logs/
+log/
+lightning_logs/
+tb_logs/
+tensorboard/
+runs/
+run/
+wandb/
+mlruns/
+ray_results/
+__pycache__/
+
+# 项目特有
+vla_log/
+world_vla_log/
+rollouts/
+

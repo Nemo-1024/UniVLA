@@ -64,9 +64,8 @@ def load_InternVL(model_id, cache_dir=None, dtype=torch.bfloat16):
         cache_dir=str(cache_dir) if cache_dir is not None else None,
         trust_remote_code=True,
     )
-    tokenizer = processor.tokenizer 
 
-    return vlm, tokenizer
+    return vlm, processor
 
 def freeze_internvl(vlm, freeze_vision_backbone, freeze_projector, freeze_llm_backbone, freeze_last_llm_layer):
     if freeze_vision_backbone and hasattr(vlm, "vision_tower"):

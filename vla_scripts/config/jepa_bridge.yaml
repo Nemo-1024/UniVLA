@@ -1,0 +1,13 @@
+
+
+# Hugging Face 模型（本地路径或 HF Hub ID）
+model_id: /mnt/mnt/public/jlchen/weights/InternVL3_5-1B-Instruct-HF
+lam_ckpt_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/jepa_bridge_noar_noposnos_vq/version_0/checkpoints/epoch=19.ckpt
+lam_yaml_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/jepa_bridge_noar_noposnos_vq/version_0/jepa_bridge.yaml
+
+# 数据与预处理
+data_mix: bridge_dataset
+
+
+
+

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Tuple, Type
 
 from torch.utils.data import Dataset
-from transformers import PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase, AutoProcessor
 import torch.nn as nn
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
@@ -71,39 +71,41 @@ def get_latent_vla_dataset_and_collator(
     data_root_dir: Path,
     data_mix: str,
     latent_action_model: LatentLAMModel,
-    tokenizer: PreTrainedTokenizerBase,
+    processor: AutoProcessor,
     default_image_resolution: int,
     padding_side: str = "right",
     predict_stop_token: bool = False,
     shuffle_buffer_size: int = 100_000,
     episodic: bool = False,
     image_aug: bool = False,
+    training_phase: str = 'pre-training',
     data_transform_fn = RLDSBatchTransformLatentAction,
     collator_fn = PaddedCollatorForActionPrediction,
 
 ) -> Tuple[Dataset, PreTrainedTokenizerBase, PaddedCollatorForActionPrediction]:
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
     # action_tokenizer = ActionTokenizer(tokenizer)
+    tokenizer = processor.tokenizer
+    # image_transform = transforms.Compose([transforms.ToTensor(),
+    #     transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
 
-    image_transform = transforms.Compose([transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
-
-    image_transform_lam =transforms.Compose([transforms.Resize((256,256)),
+    image_transform_lam =transforms.Compose([
+        transforms.Resize((256,256)),
+        # transforms.Resize((224,224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
 
 
     data_transform = data_transform_fn(
-        image_transform=image_transform,
         image_transform_lam=image_transform_lam,
     )
-    #151667 原为"<think>"，但用不到，所以用int(151667)
+    #tokenizer.pad_token_id: <|endoftext|> 151643
     collator = collator_fn(
         tokenizer.model_max_length,
-        int(151667),
+        tokenizer.pad_token_id,
         padding_side=padding_side,
         action_tokenizer=latent_action_model,
-        base_tokenizer=tokenizer,
+        processor=processor,
         predict_stop_token=False
     )
 
@@ -118,7 +120,7 @@ def get_latent_vla_dataset_and_collator(
         shuffle_buffer_size=shuffle_buffer_size,
         train=True,
         image_aug=image_aug,
-        training_phase='pre-training',
+        training_phase=training_phase,
     )
     val_dataset = cls(
         data_root_dir,
@@ -128,7 +130,7 @@ def get_latent_vla_dataset_and_collator(
         shuffle_buffer_size=shuffle_buffer_size,
         train=False,
         image_aug=False,
-        training_phase='pre-training',
+        training_phase=training_phase,
     )
 
-    return train_dataset, val_dataset, tokenizer, collator
+    return train_dataset, val_dataset, collator

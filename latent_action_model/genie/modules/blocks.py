@@ -68,15 +68,15 @@ class SelfAttention(nn.Module):
         attn_bias = torch.zeros(L, S, dtype=query.dtype).to(query)
         if is_causal:
             temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(attn_bias)
-            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias = attn_bias.masked_fill(temp_mask.logical_not(), float("-inf"))
 
         if attn_mask is not None:
             attn_bias = attn_bias.unsqueeze(0).repeat(query.shape[0], 1, 1)
-            attn_bias.masked_fill_((attn_mask>0).logical_not().unsqueeze(1), float("-inf"))
+            attn_bias = attn_bias.masked_fill((attn_mask>0).logical_not().unsqueeze(1), float("-inf"))
             attn_bias = attn_bias.unsqueeze(1)
             
         attn_weight = query @ key.transpose(-2, -1) * self.scale
-        attn_weight += attn_bias
+        attn_weight = attn_weight + attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
         return attn_weight @ value
 

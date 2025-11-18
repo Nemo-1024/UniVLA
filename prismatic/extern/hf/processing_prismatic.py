@@ -5,7 +5,7 @@ HuggingFace-style preprocessor definitions for Prismatic VLMs, inheriting from `
 specifies `siglip-224px+7b`.
 """
 
-from typing import Any, ClassVar, List, Optional, Tuple, Union
+from typing import Any, ClassVar, List, Optional, Tuple, Union, Dict
 
 import timm.data
 import torch
@@ -250,3 +250,185 @@ class PrismaticProcessor(ProcessorMixin):
         image_processor_input_names = self.image_processor.model_input_names
 
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
+
+
+# === LatentVLAProcessor: wraps InternVL processor and adds JEPA/proprio for LWVLA ===
+import os
+import json
+import numpy as np
+import torchvision.transforms as T
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+
+
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+
+
+def _bounds_q99_denorm(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
+    return (x + 1.0) * 0.5 * (high - low) + low
+
+
+def _bounds_q99_norm(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    eps = 1e-8
+    x_norm = 2.0 * (x - low) / (high - low + eps) - 1.0
+    x_norm = torch.clamp(x_norm, -1.0, 1.0)
+    # zeros_mask = (high - low).abs() <= eps
+    # x_norm = torch.where(zeros_mask, torch.zeros_like(x_norm), x_norm)
+    if mask is not None:
+        x_norm = torch.where(mask.bool(), x_norm, x)
+    return x_norm
+
+class LatentVLAProcessor(ProcessorMixin):
+    attributes: ClassVar[List[str]] = ["image_processor", "tokenizer"]
+    image_processor_class: str = "AutoImageProcessor"
+    tokenizer_class: str = "AutoTokenizer"
+
+    def __init__(
+        self,
+        image_processor: Optional[ImageProcessingMixin] = None,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        *,
+        jepa_image_resolution: int = 256,
+        dataset_statistics_path: Optional[Union[str, os.PathLike]] = None,
+        norm_stats: Optional[Dict[str, Any]] = None,
+        base_processor: Optional[Any] = None,
+    ) -> None:
+        super().__init__(image_processor, tokenizer)
+        self.jepa_image_resolution = int(jepa_image_resolution)
+        self.norm_stats = norm_stats
+        # 保存 InternVL 的完整 Processor，用于 apply_chat_template 以正确处理图像与文本
+        self.base_processor = base_processor
+        self.jepa_transform = T.Compose(
+            [
+                T.Resize((self.jepa_image_resolution, self.jepa_image_resolution)),
+                T.ToTensor(),
+                T.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+            ]
+        )
+
+    @classmethod
+    def from_internvl_processor(
+        cls,
+        base_processor: Any,
+        dataset_statistics_path: Union[str, os.PathLike] = None,
+    ) -> "LatentVLAProcessor":
+        if os.path.isfile(dataset_statistics_path):
+            with open(dataset_statistics_path, "r") as f:
+                norm_stats = json.load(f)
+        else:
+            raise ValueError(f"Dataset statistics file {dataset_statistics_path} load failed.")
+        return cls(
+            image_processor=base_processor.image_processor,
+            tokenizer=base_processor.tokenizer,
+            base_processor=base_processor,
+            norm_stats=norm_stats,
+        )
+
+    def _extract_first_image(self, messages: Any) -> Optional[Image.Image]:
+        try:
+            for turn in messages:
+                if turn.get("role") == "user" and isinstance(turn.get("content"), list):
+                    for c in turn["content"]:
+                        if isinstance(c, dict) and c.get("type") == "image":
+                            img = c.get("image")
+                            return img.convert("RGB") if isinstance(img, Image.Image) else None
+        except Exception:
+            return None
+        return None
+
+    def build_vla_features(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        proprio: Union[np.ndarray, torch.Tensor],
+        unnorm_key: Optional[str],
+        return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
+    ) -> BatchFeature:
+        if self.base_processor is None or self.norm_stats is None:
+            raise ValueError("LatentVLAProcessor.base_processor or norm_stats is not set. ")
+
+        inputs = self.base_processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors=return_tensors,
+            return_dict=True,
+        )
+
+        pixel_values = inputs["pixel_values"]
+        input_ids = inputs["input_ids"]
+
+        img = self._extract_first_image(messages)
+        if img is None:
+            raise ValueError("messages must include at least one image in the user content.")
+        image_4_jepa = self.jepa_transform(img).unsqueeze(0)
+
+        prop_t = torch.as_tensor(proprio)
+        if prop_t.dim() == 2:
+            prop_t = prop_t[-1]
+
+        if self.norm_stats is not None and unnorm_key is not None and unnorm_key in self.norm_stats:
+            pstats = self.norm_stats[unnorm_key].get("proprio", None)
+            if pstats is not None:
+                low = torch.as_tensor(pstats.get("q01", pstats.get("min")))
+                high = torch.as_tensor(pstats.get("q99", pstats.get("max")))
+                mask_np = pstats.get("mask", np.ones_like(pstats.get("min", []))) if "min" in pstats else None
+                mask = torch.as_tensor(mask_np) if mask_np is not None else None
+                prop_t = _bounds_q99_norm(prop_t, low, high, mask)
+
+        # Ensure batch dimension alignment with tokenizer outputs
+        # Determine batch size from input_ids (HF returns Tensor of shape [B, L])
+
+        # Make sure proprio has shape [B, D]
+        if prop_t.dim() == 1:
+            prop_t = prop_t.unsqueeze(0)
+
+        # Make sure image_4_jepa has shape [B, C, H, W]
+        if image_4_jepa.dim() == 3:
+            image_4_jepa = image_4_jepa.unsqueeze(0)
+
+
+        data = {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "image_4_jepa": image_4_jepa,
+            "proprio": prop_t,
+        }
+        return BatchFeature(data=data, tensor_type=return_tensors)
+
+    def postprocess_actions(self, actions_norm: torch.Tensor, *, unnorm_key: str, clip_to_min_max: bool = False) -> torch.Tensor:
+        if self.norm_stats is None or unnorm_key not in self.norm_stats:
+            raise ValueError(f"self.norm_stats is None or unnorm_key not in self.norm_stats")
+        astats = self.norm_stats[unnorm_key].get("action", None)
+        if astats is None:
+            raise ValueError(f"astats is None, unnorm_key: {unnorm_key}")
+        low = torch.as_tensor(astats.get("q01", astats.get("min")), dtype=actions_norm.dtype, device=actions_norm.device)
+        high = torch.as_tensor(astats.get("q99", astats.get("max")), dtype=actions_norm.dtype, device=actions_norm.device)
+        while low.dim() < actions_norm.dim():
+            low = low.unsqueeze(0)
+            high = high.unsqueeze(0)
+        denormed = _bounds_q99_denorm(actions_norm, low, high)
+        if clip_to_min_max:
+            mn = torch.as_tensor(astats.get("min", low), dtype=actions_norm.dtype, device=actions_norm.device)
+            mx = torch.as_tensor(astats.get("max", high), dtype=actions_norm.dtype, device=actions_norm.device)
+            while mn.dim() < actions_norm.dim():
+                mn = mn.unsqueeze(0)
+                mx = mx.unsqueeze(0)
+            denormed = torch.clamp(denormed, min=mn, max=mx)
+
+        # Apply mask: only denormalize dimensions where mask==True
+        mask_np = astats.get("mask", None)
+        if mask_np is not None:
+            mask = torch.as_tensor(mask_np, dtype=torch.bool, device=actions_norm.device)
+            while mask.dim() < actions_norm.dim():
+                mask = mask.unsqueeze(0)
+            actions = torch.where(mask, denormed, actions_norm)
+        else:
+            actions = denormed
+        return actions
+
+
+# Register with AutoProcessor for OpenVLAConfig
+from transformers import AutoProcessor as _AutoProcessor
+
+_AutoProcessor.register(OpenVLAConfig, LatentVLAProcessor)

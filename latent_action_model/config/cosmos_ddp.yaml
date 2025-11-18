@@ -11,30 +11,32 @@
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
+  # vision_model_id: "/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m"    #必须修改resolution，dino是224，vjepa是256
+  # vision_model_id: "/mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256"
+  vision_model_id: "/mnt/mnt/public/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
   dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
-  enc_layers: 9                # LAM 编码器层数
-  codebook_size: 16            # 码本大小
-  code_dim: 256                # 码本维度
-  dec_layers: 9                # 解码器层数
-  dec_self_heads: 8            # 解码器自注意力头数
-  dec_cross_heads: 8           # 解码器交叉注意力头数
+  encoder: LAMEncoder
+  decoder: LAMDecoder_v2
+  enc_layers: 16                # LAM 编码器层数 16head
+  codebook_size: 32           # 码本大小
+  code_dim: 64                # 码本维度
+  dec_layers: 16                # 解码器层数
   dropout: 0.1                 # Dropout 率
-  num_queries: 4               # 查询向量数量
-  
-  # 物理接地状态差解码器参数
-  enable_state_delta_prediction: true  # 是否启用物理接地功能
-  lambda_aux: 3.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
-  lambda_dir: 1.0                        # (保持)
-  lambda_mag_reg: 0.1                 # (↓↓) 极度降低：几乎只把它当作一个微弱的正则项，防止幅度跑得太偏。
-  motion_threshold_beta: 0.01            # (保持)
-  motion_scale_alpha: 100.0              # (保持)
 
-  project: UniVLA-latent_action_model
-  task_name: lam_large
-  wandb_offline: false
+  # 学习率线性预热（按 step）
+  warmup_steps: 2000           # 预热步数；0 表示关闭预热
+  
+  lambda_aux: 1.0                         # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
+
+
+  lambda_diversity: 0.1
+
+  project: lam
+  task_name: cosmos_ddp
+  wandb_offline: true
   
   # 训练参数
-  optimizer:
+  optimizer: 
     class_path: torch.optim.AdamW
     init_args:
       lr: 1e-4
@@ -46,30 +48,29 @@ model:
 
 # 数据参数
 data:
-  data_root: /mnt/public_zgc/home/jlchen/datasets
-  data_mix: lam    # Manip. + Navi. + Human
-  batch_size: 160
-  resolution: 256
-  num_frames: 16               # 视频帧数
+  data_root: /mnt/mnt/public/jlchen/datasets
+  data_mix: lam_plus    # Manip. + Navi. + Human
+  batch_size: 32
+  resolution: 256            #dino是224
+  num_frames: 16             
   episodic: false
-  shuffle_buffer_size: 10240   # 根据内存大小调整
+  shuffle_buffer_size: 102400   # 根据内存大小调整
   image_aug: true
 
 # 训练器参数
 trainer:
-  max_epochs: 50
+  max_epochs: 20
   accelerator: gpu
-  num_nodes: 1
   devices: auto
   # strategy: ddp_find_unused_parameters_true
   strategy: ddp_find_unused_parameters_false
-  precision: 16-mixed
+  precision: bf16-mixed
   log_every_n_steps: 1000
   gradient_clip_val: 1
   # enable_progress_bar: false  # 禁用重复的进度条
-  # val_check_interval: 100
+  val_check_interval: 2000
   num_sanity_val_steps: 0
-  limit_val_batches: 0
+  limit_val_batches: 100
 
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
@@ -80,13 +81,20 @@ trainer:
         save_top_k: -1
         # save_on_train_epoch_end: true    # 每个epoch结束时也保存
         every_n_epochs: 1
-        filename: "{epoch}_{step}"
+        # every_n_train_steps: 10000
+        filename: "{epoch}"
+        
+    - class_path: latent_action_model.core.lam_lightinng.CodebookMaintenanceCallback
+      init_args:
+        interval_steps: 1000
+
+    - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
 
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
-        save_dir: ./logs
-        name: test
+        save_dir: latent_action_model/logs
+        name: cosmos_ddp    
 
     # - class_path: lightning.pytorch.loggers.WandbLogger
     #   init_args:

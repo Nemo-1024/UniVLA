@@ -79,7 +79,7 @@ def chunk_act_obs_libero(traj: Dict, window_size: int, future_action_window_size
     chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [traj_len, window_size]) + tf.broadcast_to(
         tf.range(traj_len)[:, None], [traj_len, window_size]
     )
-    print('chunk_indices', chunk_indices)
+    # print('chunk_indices', chunk_indices)
     action_chunk_indices = tf.broadcast_to(
         tf.range(-window_size + 1, 1 + future_action_window_size),
         [traj_len, window_size + future_action_window_size],
@@ -122,6 +122,121 @@ def chunk_act_obs_libero(traj: Dict, window_size: int, future_action_window_size
 
     return traj
 
+
+def chunk_act_obs_uniform_resample(
+    traj: Dict,
+    window_size: int,
+    future_action_window_size: int = 0,  # 保持签名兼容，实际不使用
+    *,
+    fixed_obs_len: int = 5,
+) -> Dict:
+    """
+    基于等距重采样的简化版本：
+    - 在物理时间跨度 [-window_size+1, 0] 内，等距采样 fixed_obs_len 帧作为 observation。
+    - 动作与观测使用相同的时间索引（不使用 future_action_window_size）。
+    - 输出时间维固定为 fixed_obs_len，便于跨数据集对齐。
+    """
+    traj_len = tf.shape(traj["action"])[0]
+    action_dim = traj["action"].shape[-1]
+
+    # 等距偏移：[-window_size+1, 0] -> fixed_obs_len 个点
+    obs_offsets = tf.cast(
+        tf.round(
+            tf.linspace(
+                tf.cast(-window_size + 1, tf.float32),
+                tf.cast(0, tf.float32),
+                fixed_obs_len,
+            )
+        ),
+        tf.int32,
+    )  # [fixed_obs_len]
+
+    # 观测与动作使用相同的时间索引（按时间 t 构造 chunk）
+    all_t = tf.range(traj_len, dtype=tf.int32)
+    chunk_indices = tf.broadcast_to(obs_offsets, [traj_len, fixed_obs_len]) + tf.broadcast_to(
+        all_t[:, None], [traj_len, fixed_obs_len]
+    )
+    floored_chunk_indices = tf.maximum(chunk_indices, 0)
+
+    # goal timestep 处理
+    if "timestep" in traj["task"]:
+        goal_timestep = traj["task"]["timestep"]
+    else:
+        goal_timestep = tf.fill([traj_len], traj_len - 1)
+
+    floored_action_chunk_indices = tf.minimum(tf.maximum(chunk_indices, 0), goal_timestep[:, None])
+
+    # === 仅保留从 t >= window_size-1 开始，按 stride 采样的窗口；并强制包含最后一个窗口，减少尾部重复 ===
+    stride = tf.maximum(window_size // 2, 1)
+    start_t = tf.maximum(window_size - 1, 0)
+    last_t = tf.maximum(traj_len - 1, 0)
+
+    # 安全 range：若轨迹过短，令 limit = max(traj_len, start_t)，避免 start > limit 报错
+    limit_for_range = tf.maximum(traj_len, start_t)
+    base_indices = tf.range(start_t, limit_for_range, delta=stride, dtype=tf.int32)
+    # 若最后一个索引未命中，强制补上最后一个窗口（空序列时不访问 base_indices[-1]）
+    need_append_last = tf.cond(
+        tf.size(base_indices) > 0,
+        lambda: tf.not_equal(base_indices[-1], last_t),
+        lambda: tf.constant(False),
+    )
+    keep_indices = tf.cond(
+        need_append_last,
+        lambda: tf.concat([base_indices, tf.reshape(last_t, [1])], axis=0),
+        lambda: base_indices,
+    )
+    # 过滤掉包含越界索引（负索引，被 0 填充导致重复）的窗口
+    # 不改变窗口内等间隔取样（允许窗口内索引重复），仅移除发生越界填充的整段窗口
+    window_all_in_range = tf.reduce_all(chunk_indices >= 0, axis=1)  # [traj_len]
+    keep_indices = tf.boolean_mask(keep_indices, tf.gather(window_all_in_range, keep_indices))
+    # 若无任何合法窗口，兜底保留最后一个窗口（允许使用 padding）
+    keep_indices = tf.cond(
+        tf.size(keep_indices) > 0,
+        lambda: keep_indices,
+        lambda: tf.reshape(last_t, [1]),
+    )
+
+    # 先构造 chunk 结果，再按 keep_indices（已兜底非空）构建输出
+    chunked_obs = tf.nest.map_structure(lambda x: tf.gather(x, floored_chunk_indices), traj["observation"])  # [T,fixed_obs_len,...]
+    chunked_act = tf.gather(traj["action"], floored_action_chunk_indices)  # [T,fixed_obs_len,act]
+    chunked_pad = chunk_indices >= 0  # [T,fixed_obs_len]
+
+    new_traj = {}
+    new_traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, keep_indices), chunked_obs)
+    new_traj["observation"]["pad_mask"] = tf.gather(chunked_pad, keep_indices)
+    new_traj["action"] = tf.gather(chunked_act, keep_indices)
+    if "task" in traj:
+        new_traj["task"] = tf.nest.map_structure(
+            lambda x: tf.gather(x, keep_indices) if hasattr(x, 'shape') and len(x.shape) > 0 and tf.shape(x)[0] == traj_len else x,
+            traj["task"],
+        )
+    for key in traj:
+        if key not in ["observation", "action", "task"]:
+            if hasattr(traj[key], 'shape') and len(traj[key].shape) > 0 and tf.shape(traj[key])[0] == traj_len:
+                new_traj[key] = tf.gather(traj[key], keep_indices)
+            else:
+                new_traj[key] = traj[key]
+
+    # 绝对/相对动作的中性处理（保持与原逻辑一致）
+    if "absolute_action_mask" not in traj and future_action_window_size > 0:
+        logging.warning(
+            "future_action_window_size > 0 but no absolute_action_mask was provided. "
+            "Assuming all actions are relative for the purpose of making neutral actions."
+        )
+    absolute_action_mask = traj.get("absolute_action_mask", tf.zeros([traj_len, action_dim], dtype=tf.bool))
+    sampled_mask = tf.gather(absolute_action_mask, keep_indices)
+    neutral_actions = tf.where(
+        sampled_mask[:, None, :],
+        new_traj["action"],
+        tf.zeros_like(new_traj["action"]),
+    )
+
+    reduced_chunk_indices = tf.gather(chunk_indices, keep_indices)
+    reduced_goal = tf.gather(goal_timestep, keep_indices)
+    action_past_goal = reduced_chunk_indices > reduced_goal[:, None]
+    new_traj["action"] = tf.where(action_past_goal[:, :, None], neutral_actions, new_traj["action"])
+
+    return new_traj
 
 def chunk_act_obs_half_stride(traj: Dict, window_size: int, future_action_window_size: int = 0) -> Dict:
     """

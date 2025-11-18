@@ -1,0 +1,59 @@
+
+
+# Hugging Face 模型（本地路径或 HF Hub ID）
+model_id: /mnt/mnt/public/jlchen/weights/InternVL3_5-1B-Instruct-HF
+lam_ckpt_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_bridge_bi_cls/version_1/checkpoints/epoch=19.ckpt
+lam_yaml_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_bridge_bi_cls/version_1/dino_bridge.yaml
+
+# 数据与预处理
+data_mix: bridge_dataset
+shuffle_buffer_size: 10240
+image_resolution: 448
+image_aug: true
+
+
+# 冻结策略
+freeze_vision_backbone: false
+freeze_llm_backbone: false
+freeze_last_llm_layer: false
+freeze_projector: false
+
+# LAM / 动作离散
+vision_model_id: /mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256
+codebook_size: 16
+
+# 训练超参
+epochs: 10
+max_steps: 100000
+per_device_batch_size: 32
+gradient_accumulation_steps: 1
+learning_rate: 1e-5
+warmup_steps: 1000
+weight_decay: 0.0
+max_grad_norm: 1.0
+lr_scheduler_type: constant_with_warmup
+optim: adamw_torch
+enable_mixed_precision_training: true
+seed: 42
+logging_steps: 1
+
+# 评估与保存
+eval_strategy: steps
+save_total_limit: -1
+eval_interval: 1000
+eval_accumulation_steps: 1
+per_device_eval_batch_size: 64
+save_interval: 1000
+
+# 分布式 / FSDP
+fsdp: full_shard
+fsdp_config: null
+
+# 运行与日志
+run_id: dino_bridge
+run_id_note: null
+wandb_project: vla_pretraining
+wandb_entity: null
+
+
+

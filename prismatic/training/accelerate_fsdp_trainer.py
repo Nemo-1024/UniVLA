@@ -30,43 +30,39 @@ from prismatic.models.vlms import PrismaticVLM
 
 
 class SaveProcessorCallback(TrainerCallback):
-    """在保存 checkpoint 与训练结束时，额外保存 processor/tokenizer。"""
-
-    def __init__(self, *, processor: Optional[Any], tokenizer: Optional[Any]):
+    """
+    一个专门用于在保存模型检查点时一同保存 Processor 的回调。
+    
+    Hugging Face Trainer 默认不会保存 Processor 对象，此回调弥补了这一点，
+    确保了 image_processor 和 tokenizer 的配置与模型权重一同被保存。
+    """
+    def __init__(self, processor: Any):
+        # 构造函数只接收一个 processor 对象，意图非常明确
         self.processor = processor
-        self.tokenizer = tokenizer
 
-    def on_save(self, args: TrainingArguments, state, control, **kwargs):  # type: ignore[override]
-        # 仅 rank0 保存，避免每个进程都写入
-        try:
-            from prismatic.overwatch import initialize_overwatch
-
-            ow = initialize_overwatch(__name__)
-            if not ow.is_rank_zero():
-                return
-            ckpt_dir = os.path.join(cast(str, args.output_dir), f"checkpoint-{state.global_step}")
+    def on_save(self, args: TrainingArguments, state, control, **kwargs):
+        """在每次 `trainer.save_model()` 或达到 checkpoint 时触发。"""
+        # 确保只在主进程执行保存操作
+        if args.should_save and state.is_world_process_zero:
+            # checkpoint 的目录是 output_dir + "checkpoint-XXXX"
+            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+            
+            # 创建目录以防万一（虽然 Trainer 通常会创建）
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
             if self.processor is not None and hasattr(self.processor, "save_pretrained"):
-                self.processor.save_pretrained(ckpt_dir)
-            elif self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
-                self.tokenizer.save_pretrained(ckpt_dir)
-        except Exception:
-            pass
+                self.processor.save_pretrained(checkpoint_dir)
 
-    def on_train_end(self, args: TrainingArguments, state, control, **kwargs):  # type: ignore[override]
-        # 仅 rank0 保存，避免每个进程都写入
-        try:
-            from prismatic.overwatch import initialize_overwatch
-
-            ow = initialize_overwatch(__name__)
-            if not ow.is_rank_zero():
-                return
-            out_dir = cast(str, args.output_dir)
+    # on_train_end 逻辑非常相似，但保存到最终的 output_dir
+    # Trainer 在训练结束后会自动调用 on_save，所以这个方法甚至是可选的，
+    # 但为了明确起见，可以保留。
+    def on_train_end(self, args: TrainingArguments, state, control, **kwargs):
+        """在训练完全结束时触发。"""
+        if state.is_world_process_zero:
+            final_output_dir = args.output_dir
+            os.makedirs(final_output_dir, exist_ok=True)
             if self.processor is not None and hasattr(self.processor, "save_pretrained"):
-                self.processor.save_pretrained(out_dir)
-            elif self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
-                self.tokenizer.save_pretrained(out_dir)
-        except Exception:
-            pass
+                self.processor.save_pretrained(final_output_dir)
 
 
 class BatchActionAccuracyAndBestCallback(TrainerCallback):
@@ -129,7 +125,7 @@ class BatchActionAccuracyAndBestCallback(TrainerCallback):
 
 
 
-class LoggingAndWandbCallback(TrainerCallback):
+class LoggingCallback(TrainerCallback):
     """同时写入本地日志与 wandb，并处理 train/val 前缀。"""
 
     def __init__(self, overwatch=None, log_to_local=True):
@@ -173,7 +169,7 @@ def run_latent_action_training(
     vla_dataset: TorchIterableDataset,
     eval_dataset: Optional[Any] = None,
     collator,
-    tokenizer,
+    processor,
     run_dir: Path,
     overwatch,
 ) -> None:
@@ -184,22 +180,23 @@ def run_latent_action_training(
     epochs: int = cfg.epochs
     lr: float = cfg.learning_rate
     wd: float = cfg.weight_decay
-    use_mp: bool = bool(getattr(cfg, "enable_mixed_precision_training", True))
-    max_grad_norm: float = float(getattr(cfg, "max_grad_norm", 1.0))
+    use_mp: bool = bool(cfg.enable_mixed_precision_training)
+    max_grad_norm: float = float(cfg.max_grad_norm)
 
-    save_interval: int = int(getattr(cfg, "save_interval", 2500))
-    grad_accum_steps: int = int(getattr(cfg, "gradient_accumulation_steps", 1))
-    action_begin: int = int(getattr(cfg, "action_token_begin_id", 32000))
-    logging_steps: int = int(getattr(cfg, "logging_steps", 1))
+    save_interval: int = int(cfg.save_interval)
+    grad_accum_steps: int = int(cfg.gradient_accumulation_steps)
+    action_begin: int = int(cfg.action_token_begin_id)
+    action_end: int = action_begin + int(getattr(cfg, "codebook_size", 16))
+    logging_steps: int = int(cfg.logging_steps)
     per_device_eval_bsz: int = cfg.per_device_eval_batch_size
-    dataloader_num_workers: int = int(getattr(cfg, "dataloader_num_workers", 0))
-    dataloader_pin_memory: bool = bool(getattr(cfg, "dataloader_pin_memory", True))
-    seed: int = int(getattr(cfg, "seed", 42))
+    dataloader_num_workers: int = int(cfg.dataloader_num_workers)
+    dataloader_pin_memory: bool = bool(cfg.dataloader_pin_memory)
+    seed: int = int(cfg.seed)
 
     if max_steps is None:
         max_steps = epochs * 10000
 
-    if getattr(cfg, "wandb_project", None):
+    if cfg.wandb_project:
         os.environ.setdefault("WANDB_PROJECT", str(cfg.wandb_project))
     if getattr(cfg, "wandb_entity", None):
         os.environ.setdefault("WANDB_ENTITY", str(cfg.wandb_entity))
@@ -226,30 +223,30 @@ def run_latent_action_training(
         logging_steps=logging_steps,
         save_strategy="steps",
         save_steps=save_interval,
-        save_total_limit=int(getattr(cfg, "save_total_limit", 3)),
+        save_total_limit=int(cfg.save_total_limit),
         report_to=["wandb"],
-        run_name=str(getattr(cfg, "run_id", "run")),
+        run_name=str(cfg.run_id),
         max_grad_norm=max_grad_norm,
-        optim=str(getattr(cfg, "optim", "adamw_torch")),
+        optim=str(cfg.optim),
         save_safetensors=True,
         seed=seed,
         ddp_find_unused_parameters=False,
-        fsdp=getattr(cfg, "fsdp", None),
-        fsdp_config=getattr(cfg, "fsdp_config", None),
-        eval_strategy=str(getattr(cfg, "eval_strategy", "no")),  
-        eval_steps=int(getattr(cfg, "eval_interval", save_interval)),
-        eval_accumulation_steps=int(getattr(cfg, "eval_accumulation_steps", 1)),
+        fsdp=cfg.fsdp,
+        fsdp_config=cfg.fsdp_config,
+        eval_strategy=str(cfg.eval_strategy),  
+        eval_steps=int(cfg.eval_interval),
+        eval_accumulation_steps=int(cfg.eval_accumulation_steps),
         prediction_loss_only=False,
         # prediction_loss_only = False
         # predict_with_generate=True,  # 🔑 启用 generate
-        # generation_num_beams=int(getattr(cfg, "generation_num_beams", 1)),      # 可调
+        # generation_num_beams=int(cfg.generation_num_beams),      # 可调
     )
 
     callbacks = [
-        SaveProcessorCallback(processor=getattr(vlm, "processor", None), tokenizer=tokenizer),
+        SaveProcessorCallback(processor=processor),
         BatchActionAccuracyAndBestCallback(action_token_begin_id=action_begin, run_dir=ckpt_output_dir, overwatch=overwatch),
         # 避免与 report_to=["wandb"] 重复上报，这里仅做本地日志
-        LoggingAndWandbCallback(overwatch=overwatch, log_to_local=True),
+        LoggingCallback(overwatch=overwatch, log_to_local=True),
     ]
 
 
@@ -257,78 +254,31 @@ def run_latent_action_training(
     # 评估指标：基于 token id/labels 计算 action accuracy
     # 为减少内存与通信，将 logits 在设备上转为 token id 再传入 metrics
     def preprocess_logits_for_metrics_fn(logits, labels):
-        """在设备上将 logits->argmax 的 token ids，显著降低从 GPU→CPU 的数据量。
+        if isinstance(logits, (tuple, list)):
+            logits = logits[0]
+        # 仅在 <ACT_*> 子词表内进行分类以评估动作精度
+        act_ids = torch.arange(action_begin, action_end, device=logits.device)
+        act_logits = logits.index_select(dim=-1, index=act_ids)
+        pred_rel = act_logits.argmax(dim=-1)
+        pred_ids = act_ids[pred_rel]
 
-        返回的对象会被作为 predictions 传入 compute_metrics。
-        兼容形态：
-        - logits: Tensor 或 (loss, logits) 或 (logits,) 等。
-        - labels: 可能为 None 或张量，原样返回即可。
-        """
-        try:
-            # 解包常见元组： (loss, logits) 或 (logits, ...)
-            if isinstance(logits, (tuple, list)):
-                logits = logits[0] if len(logits) > 0 else logits
-            # 形状 [B, T, V] → argmax
-            if hasattr(logits, "ndim") and logits.ndim >= 3:
-                pred_ids = logits.argmax(dim=-1)
-            else:
-                pred_ids = logits
-            # 保持在 GPU 上，等待 Accelerate 在内部进行 all_gather；仅返回 token ids
-            pred_ids = pred_ids.detach().to(torch.int64).contiguous()
+        if labels is None:
             return pred_ids
-        except Exception:
-            # 回退：不做预处理
-            return logits
 
-    def _to_numpy_safe(x):
-        # 已是 numpy 则原样；是 Tensor（可能在 GPU），则搬到 CPU 再转；其他尽力 asarray
-        try:
-            import numpy as _np
-            if isinstance(x, torch.Tensor):
-                return x.detach().to("cpu").numpy()
-            if hasattr(x, "numpy"):
-                return x.numpy()
-            return _np.asarray(x)
-        except Exception:
-            return x
+        # 仅统计 labels 位于 <ACT_*> 范围内的位置，避免把非动作 token 计入总数
+        mask = (labels != -100) & (labels >= action_begin) & (labels < action_end)
+        correct = ((pred_ids == labels) & mask).sum(dim=-1)  # [B]
+        total = mask.sum(dim=-1)                              # [B]
 
-    # 注意：compute_metrics 现在假设 predictions 已是 token id（由 preprocess_logits_for_metrics 提供）
-    def compute_metrics_fn(eval_pred: EvalPrediction) -> Dict[str, float]:
-        """从 EvalPrediction 计算动作 token 精度（predictions 已为 token ids）。
+        return torch.stack([correct, total], dim=-1)  # [B, 2]
 
-        仅在 labels 中 >= action_begin 的位置计算精度，并 mask 掉 -100。
-        """
-        predictions = eval_pred.predictions
-        labels = eval_pred.label_ids
 
-        # 取第一项（有些版本会包一层 list/tuple）
-        if isinstance(predictions, (tuple, list)):
-            predictions = predictions[0]
-        if isinstance(labels, (tuple, list)):
-            labels = labels[0]
-
-        pred_ids = _to_numpy_safe(predictions)
-        lab = _to_numpy_safe(labels)
-
-        # 对齐长度
-        try:
-            min_len = min(pred_ids.shape[-1], lab.shape[-1])
-            pred_ids = pred_ids[..., :min_len]
-            lab = lab[..., :min_len]
-        except Exception:
-            return {"action_accuracy": 0.0}
-
-        # mask: 有效标签且为动作 token 区间
-        mask = (lab != -100) & (lab >= action_begin)
-        try:
-            total = mask.sum()
-            if total == 0:
-                return {"action_accuracy": 0.0}
-            correct = (pred_ids[mask] == lab[mask]).sum()
-            acc = float(correct) / float(total)
-        except Exception:
-            return {"action_accuracy": 0.0}
-        return {"action_accuracy": acc}
+    def compute_metrics_fn(eval_pred: EvalPrediction):
+        preds = eval_pred.predictions  # numpy array, shape [N, 2]
+        correct = preds[:, 0].sum(dtype=np.int64)
+        total = preds[:, 1].sum(dtype=np.int64)
+        acc = (correct / total) if total > 0 else 0.0
+        return {"action_accuracy": float(acc)}
 
     trainer = Seq2SeqTrainer(
         model=vlm,
@@ -336,9 +286,9 @@ def run_latent_action_training(
         train_dataset=vla_dataset,
         eval_dataset=eval_dataset,
         data_collator=collator,
-        tokenizer=tokenizer,
+        tokenizer=processor.tokenizer,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics_fn,
-        compute_metrics=compute_metrics_fn if str(getattr(cfg, "eval_strategy", "no")) != "no" else None,
+        compute_metrics=compute_metrics_fn if str(cfg.eval_strategy) != "no" else None,
         callbacks=callbacks,
     )
 

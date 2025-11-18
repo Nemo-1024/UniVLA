@@ -63,13 +63,11 @@ def get_image_resize_size(cfg):
 
 def get_action(cfg, model, obs, task_label, processor=None):
     """Queries the model to get an action."""
-    if cfg.model_family == "openvla":
-        action = get_vla_action(
-            model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop, 
-        )
-        assert action.shape == (ACTION_DIM,)
-    else:
-        raise ValueError("Unexpected `model_family` found in config.")
+
+    action = get_vla_action(
+        model, processor, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop, guidance_scale=cfg.guidance_scale, window_size=cfg.window_size,
+    )
+
     return action
 
 

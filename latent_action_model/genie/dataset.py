@@ -179,13 +179,13 @@ class LightningOpenX(LightningDataset):
             data_mix: str,
             batch_size:int = 16,
             resolution: int = 256,
-            num_frames: int = 16,
             episodic: bool = False,
             shuffle_buffer_size: int = 100_000,
             image_aug:bool = False,
+            debug_repeat_batch: bool = False,
             **kwargs
     ) -> None:
-        super(LightningOpenX, self).__init__(**kwargs)
+        super(LightningOpenX, self).__init__(batch_size=batch_size, **kwargs)
 
         self.data_root_dir = data_root
         self.data_mix = data_mix
@@ -196,13 +196,11 @@ class LightningOpenX(LightningDataset):
         self.episodic = episodic
         self.shuffle_buffer_size = shuffle_buffer_size
         self.image_aug = image_aug
-
+        self.debug_repeat_batch = debug_repeat_batch
         self.num_workers = 0    # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
         self.worker_init_fn = set_global_seed(42, get_worker_init_fn=True)
 
-        self.batch_transform = RLDSBatchTransformVideo(
-            image_transform= transforms.Compose([transforms.ToTensor(),transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])  # center crop现在在RLDS阶段处理
-        )
+        self.batch_transform = RLDSBatchTransformVideo() # center crop现在在RLDS阶段处理 # totensor已经在此函数内部实现，无需重复
         # self.batch_transform = RLDSBatchTransformVideo(
         #     image_transform= transforms.Compose([transforms.ToTensor(),])  # center crop现在在RLDS阶段处理
         # )
@@ -222,6 +220,10 @@ class LightningOpenX(LightningDataset):
                 train=True,
                 image_aug=self.image_aug,
                 training_phase='lam',
+                async_transform=True,
+                async_prefetch=True,
+                async_prefetch_size=128,
+                debug_repeat_batch=self.debug_repeat_batch,
             )
             self.val_dataset = cls(
                 self.data_root_dir,
@@ -232,6 +234,9 @@ class LightningOpenX(LightningDataset):
                 train=False,
                 image_aug=False,
                 training_phase='lam',
+                async_transform=True,
+                async_prefetch=True,
+                async_prefetch_size=128,
             )
         elif stage == "test":
             self.test_dataset = cls(
@@ -243,6 +248,9 @@ class LightningOpenX(LightningDataset):
                 train=True,
                 image_aug=False,
                 training_phase='lam',
+                async_transform=True,
+                async_prefetch=True,
+                async_prefetch_size=128,
             )
         else:
             raise ValueError(f"Invalid stage: {stage}")

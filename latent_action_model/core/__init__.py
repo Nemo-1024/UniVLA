@@ -4,15 +4,14 @@ V-JEPA2 核心模块 - LAM专用版
 专为LAM模型的潜空间训练优化
 """
 
-from .vjepa_encoder import VJEPAEncoder
+
 from .lam_lightinng import VJEPA_LAM
 from .lam_model import LatentLAMModel,load_latent_action_model
 
-from .vq import NSVQ
+from .vq import VQ
 
 __all__ = [
-    # V-JEPA2 特征编码器（无tokenization概念）
-    "VJEPAEncoder",
+
     
     # Lightning 版本的 LAM 模型
     "VJEPA_LAM",
@@ -22,5 +21,5 @@ __all__ = [
     
     
     # VQ 模块
-    "NSVQ",
+    "VQ",
 ] 
