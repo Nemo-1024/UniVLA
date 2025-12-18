@@ -65,6 +65,7 @@ def make_dataset_from_rlds(
     data_dir: str,
     *,
     train: bool,
+    dataset_id: Optional[int] = None,
     standardize_fn: Optional[Callable[[dict], dict]] = None,
     shuffle: bool = True,
     image_obs_keys: Dict[str, Optional[str]] = {},
@@ -210,6 +211,9 @@ def make_dataset_from_rlds(
             "action": tf.cast(traj["action"], tf.float32),
             "dataset_name": tf.repeat(name, traj_len),
         }
+        if dataset_id is not None:
+            # Stable numeric id for downstream consumption
+            traj["dataset_id"] = tf.repeat(dataset_id, traj_len)
 
         if absolute_action_mask is not None:
             # if len(absolute_action_mask) != traj["action"].shape[-1]:
@@ -258,7 +262,7 @@ def make_dataset_from_rlds(
     # construct the dataset
     if "val" not in builder.info.splits:
         split = "train[:95%]" if train else "train[95%:]"
-        print("cannot find val split, use train[:95%]")
+        # print("cannot find val split, use train[:95%]")
     else:
         split = "train" if train else "val"
     
@@ -341,6 +345,7 @@ def apply_trajectory_transforms(
     *,
     name: str, 
     train: bool,
+    episode_shuffle_size: int = 1024,
     goal_relabeling_strategy: Optional[str] = None,
     goal_relabeling_kwargs: dict = {},
     window_size: int = 1,
@@ -385,6 +390,11 @@ def apply_trajectory_transforms(
             function.
         num_parallel_calls (int, optional): number of parallel calls for map operations. Default to AUTOTUNE.
     """
+    # === Episode-level shuffle (shuffle full trajectories before any per-traj transforms) ===
+    # NOTE: This operates on the trajectory-level dataset, before chunking/flattening.
+    # For validation (train=False) or when episode_shuffle_size <= 0, this is a no-op.
+    if train and episode_shuffle_size and episode_shuffle_size > 0:
+        dataset = dataset.shuffle(episode_shuffle_size)
     if skip_unlabeled:
         if "language_instruction" not in dataset.element_spec["task"]:
             raise ValueError("skip_unlabeled=True but dataset does not have language labels.")
@@ -427,10 +437,10 @@ def apply_trajectory_transforms(
         window_size = 2
 
     if name in datasets_with_lower_frequency:
-        window_size = random.randint(5,7) if training_phase == 'lam' else 5
-        # window_size = 5
+        # window_size = random.randint(5,7) if training_phase == 'lam' else 5
+        window_size = 5
     if name in datasets_with_higher_frequency:
-        window_size = random.randint(15,20) if training_phase == 'lam' else 15
+        window_size = random.randint(20,25) if training_phase == 'lam' else 15
     # 选择chunking策略
     # if training_phase == 'post-training':
     #     transform = traj_transforms.chunk_act_obs_libero    # load all obs. within a window
@@ -439,6 +449,8 @@ def apply_trajectory_transforms(
     if training_phase == 'lam':
         transform = traj_transforms.chunk_act_obs_uniform_resample    # 等距重采样到固定长度的窗口
         # transform = traj_transforms.chunk_act_obs           # 仅加载窗口内的第一帧和最后一帧
+    elif training_phase == 'lam_2f':
+        transform = traj_transforms.chunk_act_obs
     elif training_phase == 'post-training':
         transform = traj_transforms.chunk_act_obs_libero    # 等距重采样到固定长度的窗口
     elif training_phase == 'pre-training':

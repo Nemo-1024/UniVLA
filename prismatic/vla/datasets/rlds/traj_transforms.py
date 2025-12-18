@@ -10,57 +10,150 @@ from typing import Dict
 
 import tensorflow as tf
 
-def chunk_act_obs(traj, window_size, future_action_window_size):
+
+def chunk_act_obs(
+    traj,
+    window_size,
+    future_action_window_size,
+    proprio_threshold_min: float = 0.05,
+    proprio_threshold_max: float = 0.8,
+):
+    """
+    仅取窗口首尾两帧的轻量版 chunk：
+    - 每个 chunk 由 [t, t+window_size-1] 两个时刻组成（第二个索引会截断到轨迹末尾）。
+    - 根据 proprio 首尾差值/夹爪变化过滤静止片段，逻辑参考 `chunk_act_obs_uniform_resample`。
+    """
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
 
     # Create indices for the first and last elements within the window size
-    first_indices = tf.range(traj_len)[:, None]  # First index is the current timestep
-    last_indices = tf.maximum(first_indices + (window_size - 1), 0)  # Last index is the end of the window
-    
-    # Combine first and last indices into a single tensor
-    chunk_indices = tf.concat([first_indices, last_indices], axis=1)  # Shape: [traj_len, 2]
+    # 只保留完整窗口：起点范围为 [0, traj_len - window_size]
+    max_start = tf.maximum(traj_len - window_size, 0)
+    first_indices = tf.range(max_start + 1, dtype=tf.int32)[:, None]  # First index is the current timestep
+    last_indices = first_indices + (window_size - 1)
 
-    # Create action_chunk_indices for the first and last elements
+    # Observation chunks: add a historical frame (~30% window back) plus first/last
+    hist_offset = tf.cast(tf.cast(window_size, tf.float32) * 0.5, tf.int32)
+    obs_hist_indices = first_indices - hist_offset
+    obs_chunk_indices = tf.concat([obs_hist_indices, first_indices, last_indices], axis=1)  # [num_chunks, 3]
+
+    # Action chunks: only first/last (no history)
     action_first_indices = first_indices
-    action_last_indices = tf.minimum(first_indices + (window_size + future_action_window_size - 1), traj_len - 1)
-    action_chunk_indices = tf.concat([action_first_indices, action_last_indices], axis=1)  # Shape: [traj_len, 2]
+    action_last_indices = last_indices
+    action_chunk_indices = tf.concat([action_first_indices, action_last_indices], axis=1)  # [num_chunks, 2]
 
-    # Ensure indices are bounded
-    floored_chunk_indices = tf.maximum(tf.minimum(chunk_indices, traj_len - 1), 0)
+    # Ensure indices are bounded (for observations)
+    floored_obs_chunk_indices = tf.maximum(tf.minimum(obs_chunk_indices, tf.maximum(traj_len - 1, 0)), 0)
 
+    # goal timestep 处理
     if "timestep" in traj["task"]:
         goal_timestep = traj["task"]["timestep"]
     else:
-        goal_timestep = tf.fill([traj_len], traj_len - 1)
+        goal_timestep = tf.fill([traj_len], tf.maximum(traj_len - 1, 0))
 
+    chunk_goal = tf.gather(goal_timestep, tf.squeeze(first_indices, axis=1))
+    floored_action_chunk_indices = tf.minimum(tf.maximum(action_chunk_indices, 0), chunk_goal[:, None])
 
-    floored_action_chunk_indices = tf.minimum(tf.maximum(action_chunk_indices, 0), goal_timestep[:, None])
+    # === 根据 proprio 差值过滤静止片段 ===
+    # 这里直接在原始时间索引上计算首尾位移，与 `chunk_act_obs_uniform_resample` 一致
+    num_chunks = tf.shape(obs_chunk_indices)[0]
+    keep_indices = tf.range(num_chunks, dtype=tf.int32)
+    last_t = tf.maximum(num_chunks - 1, 0)
 
-    traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, floored_chunk_indices), traj["observation"])
-    traj["action"] = tf.gather(traj["action"], floored_action_chunk_indices)
+    if proprio_threshold_min > 0 and proprio_threshold_max > 0 and "proprio" in traj["observation"]:
+        # keep_indices: [N_kept]，此处初始为 [0..T-1]
+        kept_chunk_indices = tf.gather(obs_chunk_indices, keep_indices)  # [N_kept, 3]
+        floored_kept_indices = tf.maximum(
+            tf.minimum(kept_chunk_indices, tf.maximum(traj_len - 1, 0)),
+            0,
+        )
 
-    # indicates whether an entire observation is padding
-    traj["observation"]["pad_mask"] = chunk_indices >= 0
+        # [N_kept, 3, proprio_dim]
+        kept_proprio = tf.gather(traj["observation"]["proprio"], floored_kept_indices)
 
-    # If no absolute_action_mask was provided, assume all actions are relative
+        # 计算窗口首尾的位移 (L2 norm)
+        delta = kept_proprio[:, -1, :3] - kept_proprio[:, 0, :3]
+        displacement = tf.norm(delta, axis=-1)  # [N_kept]
+
+        # 检查夹爪状态变化 (假设最后一维是夹爪状态)
+        gripper_delta = tf.abs(kept_proprio[:, -1, -1] - kept_proprio[:, 0, -1])
+        gripper_changed = gripper_delta > 0.5
+
+        # 位移必须小于最大值，即使有夹爪动作也要满足这个条件
+        is_moving = ((displacement > proprio_threshold_min) | gripper_changed) & (
+            displacement < proprio_threshold_max
+        )
+
+        # 如果存在移动的片段，则仅保留移动的；否则（全静止）只保留最后一个窗口
+        has_moving = tf.reduce_any(is_moving)
+        keep_indices = tf.cond(
+            has_moving,
+            lambda: tf.boolean_mask(keep_indices, is_moving),
+            lambda: keep_indices[-1:] if tf.size(keep_indices) > 0 else keep_indices,
+        )
+
+    # 若无任何合法窗口，兜底保留最后一个窗口
+    keep_indices = tf.cond(
+        tf.size(keep_indices) > 0,
+        lambda: keep_indices,
+        lambda: tf.cond(
+            num_chunks > 0,
+            lambda: tf.reshape(last_t, [1]),
+            lambda: tf.zeros([0], dtype=tf.int32),
+        ),
+    )
+
+    # 先构造 chunk 结果，再按 keep_indices 构建输出
+    chunked_obs = tf.nest.map_structure(
+        lambda x: tf.gather(x, floored_obs_chunk_indices), traj["observation"]
+    )  # [T, 3, ...]
+    chunked_act = tf.gather(traj["action"], floored_action_chunk_indices)  # [T, 2, act_dim]
+    chunked_pad = obs_chunk_indices >= 0  # [T, 3]
+
+    new_traj = {}
+    new_traj["observation"] = tf.nest.map_structure(
+        lambda x: tf.gather(x, keep_indices), chunked_obs
+    )  # [N_kept, 3, ...]
+    new_traj["observation"]["pad_mask"] = tf.gather(chunked_pad, keep_indices)
+    new_traj["action"] = tf.gather(chunked_act, keep_indices)
+
+    # 处理 task 字段（若存在）
+    if "task" in traj:
+        new_traj["task"] = tf.nest.map_structure(
+            lambda x: tf.gather(x, keep_indices)
+            if hasattr(x, "shape") and len(x.shape) > 0 and tf.shape(x)[0] == traj_len
+            else x,
+            traj["task"],
+        )
+
+    # 处理其他按时间维对齐的字段
+    for key in traj:
+        if key not in ["observation", "action", "task"]:
+            if hasattr(traj[key], "shape") and len(traj[key].shape) > 0 and tf.shape(traj[key])[0] == traj_len:
+                new_traj[key] = tf.gather(traj[key], keep_indices)
+            else:
+                new_traj[key] = traj[key]
+
+    # 绝对/相对动作的中性处理（保持与原逻辑一致）
     if "absolute_action_mask" not in traj and future_action_window_size > 0:
         logging.warning(
             "future_action_window_size > 0 but no absolute_action_mask was provided. "
             "Assuming all actions are relative for the purpose of making neutral actions."
         )
     absolute_action_mask = traj.get("absolute_action_mask", tf.zeros([traj_len, action_dim], dtype=tf.bool))
+    sampled_mask = tf.gather(absolute_action_mask, keep_indices)
     neutral_actions = tf.where(
-        absolute_action_mask[:, None, :],
-        traj["action"],  # absolute actions are repeated (already done during chunking)
-        tf.zeros_like(traj["action"]),  # relative actions are zeroed
+        sampled_mask[:, None, :],
+        new_traj["action"],
+        tf.zeros_like(new_traj["action"]),
     )
 
-    # Actions past the goal timestep become neutral
-    action_past_goal = action_chunk_indices > goal_timestep[:, None]
-    traj["action"] = tf.where(action_past_goal[:, :, None], neutral_actions, traj["action"])
+    reduced_action_chunk_indices = tf.gather(action_chunk_indices, keep_indices)
+    reduced_goal = tf.gather(chunk_goal, keep_indices)
+    action_past_goal = reduced_action_chunk_indices > reduced_goal[:, None]
+    new_traj["action"] = tf.where(action_past_goal[:, :, None], neutral_actions, new_traj["action"])
 
-    return traj
+    return new_traj
 
 
 def chunk_act_obs_libero(traj: Dict, window_size: int, future_action_window_size: int = 0) -> Dict:
@@ -129,12 +222,15 @@ def chunk_act_obs_uniform_resample(
     future_action_window_size: int = 0,  # 保持签名兼容，实际不使用
     *,
     fixed_obs_len: int = 5,
+    proprio_threshold_min: float = 0.1,
+    proprio_threshold_max: float = 0.8,
 ) -> Dict:
     """
     基于等距重采样的简化版本：
     - 在物理时间跨度 [-window_size+1, 0] 内，等距采样 fixed_obs_len 帧作为 observation。
     - 动作与观测使用相同的时间索引（不使用 future_action_window_size）。
     - 输出时间维固定为 fixed_obs_len，便于跨数据集对齐。
+    - proprio_threshold_min 和 proprio_threshold_max: 若 > 0，则计算窗口首尾 proprio 的欧氏距离，若小于该阈值则丢弃该 chunk（静止片段）。
     """
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
@@ -189,6 +285,60 @@ def chunk_act_obs_uniform_resample(
     # 不改变窗口内等间隔取样（允许窗口内索引重复），仅移除发生越界填充的整段窗口
     window_all_in_range = tf.reduce_all(chunk_indices >= 0, axis=1)  # [traj_len]
     keep_indices = tf.boolean_mask(keep_indices, tf.gather(window_all_in_range, keep_indices))
+    
+    # === 根据 proprio 差值过滤静止片段 ===
+    # 对于 ego4d、agibot 等无有效状态的数据集，跳过该过滤逻辑，直接使用基于 stride 的窗口采样结果。
+    if proprio_threshold_min > 0 and proprio_threshold_max > 0 and "proprio" in traj["observation"]:
+        # 判断当前轨迹是否来自 ego4d 或 agibot（dataset_name 在 make_dataset_from_rlds 中被写入）
+        if "dataset_name" in traj:
+            ds_name0 = traj["dataset_name"][0]
+            is_ego4d = tf.strings.regex_full_match(ds_name0, ".*ego4d.*")
+            is_agibot = tf.strings.regex_full_match(ds_name0, ".*agibot.*")
+            is_ego4d = tf.logical_or(is_ego4d, is_agibot)
+        else:
+            is_ego4d = tf.constant(False)
+
+        def apply_motion_filter():
+            nonlocal keep_indices
+            # 获取候选窗口的 proprio 数据
+            # keep_indices: [N_kept]
+            # chunk_indices: [traj_len, fixed_obs_len]
+            kept_chunk_indices = tf.gather(chunk_indices, keep_indices)  # [N_kept, fixed_obs_len]
+            floored_kept_indices = tf.maximum(kept_chunk_indices, 0)
+            
+            # [N_kept, fixed_obs_len, proprio_dim]
+            kept_proprio = tf.gather(traj["observation"]["proprio"], floored_kept_indices)
+            
+            # 计算窗口首尾的位移 (L2 norm)
+            # kept_proprio[:, -1] 是当前时刻 t，kept_proprio[:, 0] 是 t - window_size + 1
+            delta = kept_proprio[:, -1, :3] - kept_proprio[:, 0, :3]
+            displacement = tf.norm(delta, axis=-1)  # [N_kept]
+            
+            # 检查夹爪状态变化 (假设最后一维是夹爪状态)
+            # 如果夹爪状态变化超过阈值（例如 0.1），则认为是有效动作
+            gripper_delta = tf.abs(kept_proprio[:, -1, -1] - kept_proprio[:, 0, -1])
+            gripper_changed = gripper_delta > 0.5
+
+            # 位移必须小于最大值，即使有夹爪动作也要满足这个条件
+            is_moving = ((displacement > proprio_threshold_min) | gripper_changed) & (
+                displacement < proprio_threshold_max
+            )
+            
+            # 如果存在移动的片段，则仅保留移动的；否则（全静止）只保留最后一个窗口
+            # 全静止时只保留一个窗口，避免批次间数据分布不均匀
+            has_moving = tf.reduce_any(is_moving)
+            return tf.cond(
+                has_moving,
+                lambda: tf.boolean_mask(keep_indices, is_moving),
+                lambda: keep_indices[-1:] if tf.size(keep_indices) > 0 else keep_indices,  # 全静止时只保留最后一个
+            )
+
+        def skip_motion_filter():
+            # 不基于 proprio 做任何过滤，直接返回原始 keep_indices
+            return keep_indices
+
+        keep_indices = tf.cond(is_ego4d, skip_motion_filter, apply_motion_filter)
+
     # 若无任何合法窗口，兜底保留最后一个窗口（允许使用 padding）
     keep_indices = tf.cond(
         tf.size(keep_indices) > 0,

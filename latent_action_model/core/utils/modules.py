@@ -23,29 +23,29 @@ def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
     return mask
 
 
-def build_modal_block_attention_mask(T, H, W, add_tokens=1, ar_query: bool = True):
+def build_modal_block_attention_mask(T, H, W, add_tokens=1, ar_query: bool = True, num_queries: int = 1):
     """
     基于“后置”约定构造模态掩码（统一将附加 token 放在末尾）：
     - 约定每帧 token 排布为：
-      ar_query=True:  [H*W 图像 patch, add_tokens..., query(1)]
-      ar_query=False: [H*W 图像 patch, add_tokens...]，并在序列尾部追加 1 个全局 query
+      ar_query=True:  [H*W 图像 patch, add_tokens..., query(num_queries)]
+      ar_query=False: [H*W 图像 patch, add_tokens...]，并在序列尾部追加 num_queries 个全局 query
     - 规则：
       1) image_feature 只能看到 image_feature
       2) state 只能看到 state
       3) query 能看到所有模态（包括 query/state/image）
     - 返回：allowed 掩码（True 表示允许注意），形状 [N, N]
       其中：
-        ar_query=True  -> N = T * (H*W + add_tokens + 1)
-        ar_query=False -> N = T * (H*W + add_tokens) + 1
+        ar_query=True  -> N = T * (H*W + add_tokens + num_queries)
+        ar_query=False -> N = T * (H*W + add_tokens) + num_queries
     """
     assert add_tokens >= 0, "add_tokens 表示每帧额外的非 query 帧级 token 数（如 state），可为 0 或更大"
     if ar_query:
         # 每帧排列：[image..., add_tokens..., query]
-        N_T = (H * W) + add_tokens + 1
+        N_T = (H * W) + add_tokens + num_queries
         frame_modality_ids = torch.full((N_T,), 1, dtype=torch.long)  # 默认 image=1
         if add_tokens > 0:
             frame_modality_ids[H * W : H * W + add_tokens] = 0  # state-like
-        frame_modality_ids[-1] = 2  # query
+        frame_modality_ids[-num_queries:] = 2  # query
         modality_ids = frame_modality_ids.repeat(T)  # [T*N_T]
     else:
         # 帧内排列：[image..., add_tokens...]，全局在序列尾部追加 1 个 query
@@ -54,13 +54,14 @@ def build_modal_block_attention_mask(T, H, W, add_tokens=1, ar_query: bool = Tru
         if add_tokens > 0:
             frame_modality_ids[H * W :] = 0  # state-like
         modality_ids = frame_modality_ids.repeat(T)  # [T*N_T]
-        modality_ids = torch.cat([modality_ids, torch.tensor([2], dtype=torch.long)], dim=0)  # 追加全局 query
+        modality_ids = torch.cat([modality_ids, torch.tensor([2] * num_queries, dtype=torch.long)], dim=0)  # 追加全局 query
+    N = modality_ids.numel()
     row = modality_ids.unsqueeze(1)  # [N,1]
     col = modality_ids.unsqueeze(0)  # [1,N]
     same_modality = row == col
-    row_is_query = (row == 2)
-    N = modality_ids.numel()
-    allowed = same_modality | row_is_query.expand(-1, N)
+    # query 行可见所有列
+    row_is_query = (row == 2).expand(-1, N)
+    allowed = same_modality | row_is_query
     return allowed
 
 
@@ -748,7 +749,7 @@ class QFormer_att(nn.Module):
     Q-Former 模型。
     通过堆叠多个 QFormerBlock，使用一组可学习的查询向量从给定的上下文中提取特征。
     """
-    def __init__(self, query_dim, context_dim, num_frames, grid_size, add_tokens=1, num_layers=6, num_heads=16, ffn_expansion_factor=2, dropout=0.1, ar_query: bool = False, use_mask: bool = False):
+    def __init__(self, query_dim, context_dim, num_frames, num_queries, grid_size, add_tokens=1, num_layers=6, num_heads=16, ffn_expansion_factor=2, dropout=0.1, ar_query: bool = False, use_mask: bool = False):
         """
         初始化 QFormer 模型。
         
@@ -767,16 +768,17 @@ class QFormer_att(nn.Module):
         self.query_dim = query_dim
         if self.ar_query:
             # 将查询向量直接以最终形状注册为 Parameter，确保随模块一起迁移设备
-            self.queries = nn.Parameter(torch.randn(1, num_frames, 1, query_dim))  # [1, T, 1, query_dim]
+            self.queries = nn.Parameter(torch.randn(1, num_frames, 1, context_dim))  # [1, T, 1, context_dim]
         else:
-            self.queries = nn.Parameter(torch.randn(1, 1, query_dim))  #[1, 1, query_dim]
-        self.proj_in = nn.Linear(query_dim, context_dim)
-        self.proj_out = nn.Linear(context_dim, query_dim)
+            self.queries = nn.Parameter(torch.randn(1, num_queries, context_dim))  #[1, 1, context_dim]
+        self.q_cross_attn = CrossAttentionBlock(context_dim, num_heads)
+        self.num_queries = num_queries
+
         # 堆叠多个 QFormerBlock
         self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model=context_dim, nhead=num_heads, dim_feedforward=int(context_dim*ffn_expansion_factor), dropout=dropout, batch_first=True) for _ in range(num_layers)
+            nn.TransformerEncoderLayer(d_model=context_dim, nhead=num_heads, dim_feedforward=int(context_dim*ffn_expansion_factor), dropout=dropout, batch_first=True, norm_first=True) for _ in range(num_layers)
         ])
-        self.rms_norm = nn.RMSNorm(query_dim)
+
         # 预构建“模态自注意 + query全可见”的掩码，并与（若有）因果掩码合并
         # 形状对齐规则：
         #  - 输入 context 为 [B, T, (hw+1), D]
@@ -794,7 +796,7 @@ class QFormer_att(nn.Module):
                 self.register_buffer("src_mask", combined_mask, persistent=False)
             else:
                 # 非自回归：帧内为 [image..., state]（add_tokens=1），序列末尾追加全局 query
-                modal_allowed = build_modal_block_attention_mask(num_frames, grid_size, grid_size, add_tokens=add_tokens, ar_query=False)
+                modal_allowed = build_modal_block_attention_mask(num_frames, grid_size, grid_size, add_tokens=add_tokens, ar_query=False, num_queries=num_queries)
                 modality_mask = ~modal_allowed
                 self.register_buffer("src_mask", modality_mask, persistent=False)
         else:
@@ -813,26 +815,26 @@ class QFormer_att(nn.Module):
 
         B, T, _, D = context.shape
 
-        queries = self.proj_in(self.queries)
+        # queries = self.proj_in(self.queries)
 
         # 将 queries 扩展到 batch 维度，便于与 context 拼接
         if self.ar_query:
-            queries = queries.expand(B, -1, -1, -1)  # [B, T, 1, D]
+            queries = self.queries.expand(B, -1, -1, -1)  # [B, T, 1, D]
             # 直接在每帧 [image..., state] 后追加 query，得到 [image..., state, query]
             ctx = torch.cat([context, queries], dim=-2).reshape(B, -1, D)  # [B, T*(hw+2), D]
         else:
-            queries = queries.expand(B, -1, -1)  # [B, 1, D]
+            queries = self.queries.expand(B, -1, -1)  # [B, n, D]
             # 输入已为 [image..., state]，直接展平后追加全局 query
             ctx = context.reshape(B, -1, D)
+            queries = self.q_cross_attn(queries, ctx)
             ctx = torch.cat([ctx, queries], dim=1)
         # 依次通过每个 QFormerBlock
         for layer in self.layers:
             ctx = layer(ctx, src_mask=self.src_mask)
-        ctx = self.rms_norm(self.proj_out(ctx))
         if self.ar_query:
             return ctx.reshape(B, T, -1, self.query_dim)[:,1:,-1,:] #B,T-1,D    
         else:
-            return ctx[:, -1:,:]   #B,1,D
+            return ctx[:, -self.num_queries:,:]   #B,n,D
     
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -867,3 +869,98 @@ class PatchEmbed(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.encode(images)
       
+class Attn_Crossn_Block(nn.Module):
+    """
+    LAMDecoder 的核心构建块。
+    它将“动作”信息 (z_q) 融合到“状态”特征 (f_t) 中。
+    """
+    def __init__(self, feature_dim, num_heads=8, ffn_expansion_factor=4, dropout=0.1):
+        """
+        初始化 DecoderBlock。
+        
+        参数:
+            feature_dim (int): 状态特征 f_t 的维度 (D_feat)。
+            node_dim (int): 动作特征 z_q 的维度 (d)。
+            num_heads (int): 多头注意力的头数。
+            ffn_expansion_factor (int): FFN 中间层的扩展因子。
+            dropout (float): Dropout 比率。
+        """
+        super().__init__()
+
+        # 1. 自注意力 (在状态 f_t 上)
+        self.norm_sa = nn.LayerNorm(feature_dim)
+
+        self.attn_sa = nn.MultiheadAttention(
+            embed_dim=feature_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 2. 交叉注意力 (从动作 z_q 到状态 f_t)
+        self.norm_ca_q = nn.LayerNorm(feature_dim)
+        self.norm_ca_kv = nn.LayerNorm(feature_dim)
+
+        self.attn_ca = nn.MultiheadAttention(
+            embed_dim=feature_dim,   # Query (和输出) 的维度
+            kdim=feature_dim,       # Key 的维度 (投影后的维度)
+            vdim=feature_dim,       # Value 的维度 (投影后的维度)
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # 3. 前馈网络
+        self.norm_ffn = nn.LayerNorm(feature_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(feature_dim, int(feature_dim * ffn_expansion_factor)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(feature_dim * ffn_expansion_factor), feature_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, sa_features, ca_features):
+        """
+        前向传播。
+        
+        参数:
+            sa_features (torch.Tensor): f_t，形状为 [B, K, D_feat]。
+            ca_features (torch.Tensor): z_q，形状为 [B, 4, d]。
+        返回:
+            torch.Tensor: 更新后的自注意力特征和交叉注意力特征，形状为 [B, K, D_feat]。
+        """
+        # print("state_features shape:", state_features.shape)
+        # print("LAM_features shape:", LAM_features.shape)
+        # 自注意力 + 残差连接 (在 state_features 上)
+        sa_output, _ = self.attn_sa(self.norm_sa(sa_features), self.norm_sa(sa_features), self.norm_sa(sa_features))
+        sa_features = sa_features + sa_output
+        
+        # 交叉注意力 + 残差连接
+        # Query 来自 state，Key 和 Value 来自 LAM
+        ca_output, _ = self.attn_ca(query=self.norm_ca_q(sa_features), key=self.norm_ca_kv(ca_features), value=self.norm_ca_kv(ca_features)) 
+        sa_features = sa_features + ca_output
+
+        # 前馈网络 + 残差连接
+        ffn_output = self.ffn(self.norm_ffn(sa_features))
+        sa_features = sa_features + ffn_output
+
+        return sa_features
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, dim, heads=16):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.ff = nn.Sequential(nn.Linear(dim, dim),
+                                nn.GELU(),
+                                nn.Linear(dim, dim))
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, q, kv):
+        kv = self.norm1(kv)
+        attn_out, _ = self.attn(q, kv, kv)
+        q = q + attn_out
+        q = self.norm2(q)
+        q = q + self.ff(q)
+        return q

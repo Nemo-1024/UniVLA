@@ -14,10 +14,11 @@ from prismatic.overwatch import initialize_overwatch
 from prismatic.util import set_global_seed
 from prismatic.vla import get_latent_vla_dataset_and_collator
 from prismatic.vla.datasets.datasets import RLDSDataset
-from prismatic.models import load_InternVL,freeze_internvl
+from prismatic.models import load_vlm_auto, freeze_vlm_generic
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from typing import cast
 from prismatic.training.accelerate_fsdp_trainer import run_latent_action_training
+from prismatic.vla.latent_vla_model import LatentVLAModel
 from transformers import AutoProcessor
 
 # Sane Defaults
@@ -55,9 +56,10 @@ class TrainConfig:
     # =========================
     # 数据混合与缓冲
     data_mix: str = "bridge_dataset"
+    training_phase: str = "pre-training"
     shuffle_buffer_size: int = 10240
-    image_resolution: int = 448
-    image_aug: bool = True                                          # Whether to enable image augmentations
+    image_resolution: int = 256
+    image_aug: bool = False                                          # Whether to enable image augmentations
     # DataLoader
     dataloader_num_workers: int = 0
     dataloader_pin_memory: bool = True
@@ -74,28 +76,36 @@ class TrainConfig:
     # =========================
     # LAM / 动作离散参数
     # =========================
-    action_token_begin_id: int = 151679
+    latent_action_placeholder_token: str = "<ACT_PH>"
+    enable_lam_encoder_distill: bool = False
+    enable_lam_decoder_perceptual: bool = False
+    enable_lam_kl_loss: bool = False
+    lam_encoder_distill_weight: float = 1.0
+    lam_decoder_perceptual_weight: float = 0.0
+    new_token_lr_scale: float = 1.0  # 对新增 special tokens 的 embedding 梯度放大倍数（>1 放大，=1 不变）
+    use_latent_vla_model: bool = True
     # vision_model_id: str = home_path + "/weights/dinov3-vitl16-pretrain-lvd1689m"
-    codebook_size: int = 16  #此处修改无效，仅作为标记
     # =========================
     # 训练设置
     # =========================
     # 训练超参
+    # debug_repeat_batch 支持 bool 或 int：传入正整数 k 时，会缓存前 k 个样本并循环返回
+    debug_repeat_batch: Union[bool, int] = False
     epochs: Optional[int] = 10
     max_steps: Optional[int] = 100000  #以max_steps为准，若为空则按epochs * 10000近似
     per_device_batch_size: int = 16
     gradient_accumulation_steps: int = 2
     learning_rate: float = 1e-6
-    warmup_steps: int = 100
+    warmup_steps: int = 0
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     lr_scheduler_type: str = "constant_with_warmup"   #constant_with_warmup
     optim: str = "adamw_torch"
     # 训练加速
-    enable_mixed_precision_training: bool = True
+    enable_mixed_precision_training: bool = False
     seed: int = 42                                                  # Random seed (for reproducibility)
     logging_steps: int = 1
-
+    use_history_frame: bool = False
     # =========================
     # 评估与保存
     # =========================
@@ -104,12 +114,12 @@ class TrainConfig:
     eval_interval: int = 1000
     eval_accumulation_steps: int = 1
     per_device_eval_batch_size: int = 64
-    save_interval: int = 1000                                    # Interval for saving checkpoints (in steps
+    save_interval: int = 5000                                    # Interval for saving checkpoints (in steps
 
     # =========================
     # 分布式 / FSDP
     # =========================
-    fsdp: Optional[str] = "full_shard"                     # 示例："full_shard auto_wrap" 或 None 关闭
+    fsdp: Optional[str] = None                     # 示例："full_shard auto_wrap" 或 None 关闭
     fsdp_config: Optional[Dict[str, Any]] = None   # 示例：{"fsdp_min_num_params": 1e7, "xla": False}
 
     # =========================
@@ -151,17 +161,17 @@ def train(cfg: TrainConfig) -> None:
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
     torch.cuda.set_device(device_id := overwatch.local_rank())
     torch.cuda.empty_cache()
+    # 尽量保持确定性，减少 LAM/VQ 输出的随机波动
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # Configure Unique Run Name & Save Directory
     vla_tag = f"{cfg.model_id.split('/')[-1]}+{cfg.data_mix}"
     world_size = overwatch.world_size() if dist.is_initialized() else max(torch.cuda.device_count(), 1)
     overwatch.info(f"Detected world_size = {world_size}")
 
-    cfg.run_id += (
-        f"{vla_tag}+n{world_size}+b{cfg.per_device_batch_size}+x{cfg.seed}"
-        if cfg.run_id is None
-        else cfg.run_id
-    )
+    if cfg.run_id is None:
+        cfg.run_id = f"{vla_tag}+n{world_size}+b{cfg.per_device_batch_size}+x{cfg.seed}"
 
 
     # cfg.run_id += '-Latent-Action-Pretraining'
@@ -222,39 +232,26 @@ def train(cfg: TrainConfig) -> None:
 
 
  
-    # 直接通过 HF ID/Path 加载 InternVL 模型与处理器
-    overwatch.info(f"🔄 加载基础 InternVL `{cfg.model_id}`（HF from_pretrained）")
-    vlm, processor = load_InternVL(cfg.model_id, cfg.hf_cache_dir, dtype=torch.bfloat16) 
-    tokenizer = processor.tokenizer
-    vlm.generation_config.max_new_tokens = int(getattr(cfg, "max_new_tokens", 4))
-    vlm.config.loss_type = str(getattr(cfg, "loss_type", "ForCausalLMLoss"))
-    vlm.config.use_cache = False
+    # 直接在 LatentVLAModel 内部加载 VLM 与 LAM；当启用 debug_repeat_batch 时同步开启 debug_mode
+    debug_mode = bool(cfg.debug_repeat_batch)
+    latent_vla_model, processor = LatentVLAModel.from_config(cfg, overwatch=overwatch, debug_mode=debug_mode)
 
-    # 直接按配置冻结模块（若可用）；HF-only InternVL 组件名：vision_tower / language_model / multi_modal_projector / lm_head
-    freeze_internvl(vlm, cfg.freeze_vision_backbone, cfg.freeze_projector, cfg.freeze_llm_backbone, cfg.freeze_last_llm_layer)
 
-    overwatch.info("🔧 扩充 LLM 词表以注入动作离散 token")
-    special_tokens_dict = {'additional_special_tokens': [f'<ACT_{i}>' for i in range(cfg.codebook_size)]}
-    try:
-        num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)  # type: ignore[attr-defined]
-        overwatch.info(f"num_added_toks={num_added_toks}")
-    except Exception:
-        num_added_toks = 0
-    # Print number of total/trainable model parameters
-    num_params = sum(p.numel() for p in vlm.parameters())
-    num_trainable_params = sum(p.numel() for p in vlm.parameters() if p.requires_grad)
+    # 按配置冻结 VLM（内部已注册 tokenizer），保持显存与训练策略
+    freeze_vlm_generic(
+        latent_vla_model.vlm,
+        cfg.freeze_vision_backbone,
+        cfg.freeze_projector,
+        cfg.freeze_llm_backbone,
+        cfg.freeze_last_llm_layer,
+    )
+
+    num_params = sum(p.numel() for p in latent_vla_model.parameters())
+    num_trainable_params = sum(p.numel() for p in latent_vla_model.parameters() if p.requires_grad)
     overwatch.info(
         f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
     )
-    
-    # Get VLA Dataset & Collator
 
-    overwatch.info(
-        f"🔄 加载 V-JEPA2 动作编码器与码本（yaml=`{cfg.lam_yaml_path}`，"
-        f"K={cfg.codebook_size}）"
-    )
-    latent_action_model = load_latent_action_model(cfg.lam_ckpt_path, cfg.lam_yaml_path)  # default freeze all parameters
-    latent_action_model = latent_action_model.to(device_id).eval()
     overwatch.info(
         f"🔄 构建 RLDS 数据集与 Collator（mixture=`{cfg.data_mix}`，image_res={cfg.image_resolution}）"
     )
@@ -262,23 +259,14 @@ def train(cfg: TrainConfig) -> None:
     train_dataset, val_dataset, collator = get_latent_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.data_mix,
-        latent_action_model,
         processor=processor,
-        default_image_resolution=cfg.image_resolution,
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
-    )
-
-    act_tokens = [f"<ACT_{i}>" for i in range(cfg.codebook_size)]
-    act_ids = tokenizer.convert_tokens_to_ids(act_tokens)
-
-    expected_begin_id = min(act_ids)
-    expected_end_id = max(act_ids)
-
-    assert cfg.action_token_begin_id == expected_begin_id, (
-        f"cfg.action_token_begin_id={cfg.action_token_begin_id} "
-        f"but tokenizer gives {expected_begin_id} "
-        f"(range: {expected_begin_id}-{expected_end_id})"
+        training_phase=cfg.training_phase,
+        latent_action_num_queries=latent_vla_model.lam.num_queries,
+        debug_repeat_batch=cfg.debug_repeat_batch,
+        target_seq_len=350 if "InternVL" in cfg.model_id else 250,
+        use_history_frame=cfg.use_history_frame,
     )
 
 
@@ -286,12 +274,13 @@ def train(cfg: TrainConfig) -> None:
     if overwatch.is_rank_zero():
         save_dataset_statistics(cast(RLDSDataset, train_dataset).dataset_statistics, run_dir)
 
+    # 组装组合模型（VLM + LAM）
     # 使用 Accelerate + FSDP 的新训练器（直接传入 dataclass -> dict）
     overwatch.info("🚀 启动 VLA 训练循环（Accelerate+FSDP）；首次 step 可能较慢（初始化 FSDP/AMP）")
     dist.barrier()
     run_latent_action_training(
         cfg=cfg,
-        vlm=vlm,
+        model=latent_vla_model,
         vla_dataset=cast(RLDSDataset, train_dataset),
         eval_dataset=cast(RLDSDataset, val_dataset),
         collator=collator,

@@ -16,7 +16,7 @@ import logging
 logging.basicConfig(format='%(message)s', level=logging.INFO)
 import os
 import shutil
-from .utils.utils import eef_reconstruction_loss
+from .utils.utils import eef_reconstruction_loss, charbonnier_loss
 import importlib
 
 
@@ -38,6 +38,7 @@ class VJEPA_LAM(LightningModule):
         codebook_size: int = 16,
         code_dim: int = 128,
         num_frames: int = 5,
+        num_queries: int = 1,
         ar_prediction: bool = False,
         vq_kwargs: Optional[Dict[str, Any]] = None,
         dec_layers: int = 4,
@@ -59,8 +60,13 @@ class VJEPA_LAM(LightningModule):
         warmup_steps: int = 0,
         lambda_diversity: float = 0.1,
         norm_latents: bool = False,
+        norm_latents_type: str="l2",        
         disable_vq: bool = False,
         vq_type: str = "nsvq",
+        enc_add_state: bool = False,
+        enc_modal_mask: bool = False,
+        latent_layer_to_use: Any = 23,
+        multi_input: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -79,15 +85,23 @@ class VJEPA_LAM(LightningModule):
             codebook_size=codebook_size,
             code_dim=code_dim,
             num_frames=num_frames,
+            num_queries=num_queries,
             ar_prediction=ar_prediction,
             dec_layers=dec_layers,
             dropout=dropout,
             vision_model_id=vision_model_id,
             vq_kwargs=vq_kwargs,
             norm_latents=norm_latents,
+            norm_latents_type=norm_latents_type,
             disable_vq=disable_vq,
-            vq_type=vq_type
+            vq_type=vq_type,
+            enc_add_state=enc_add_state,
+            enc_modal_mask=enc_modal_mask,
+            latent_layer_to_use=latent_layer_to_use,
+            multi_input=multi_input,
         )
+
+
         
         # 训练参数
         self.optimizer = optimizer
@@ -149,24 +163,35 @@ class VJEPA_LAM(LightningModule):
         videos = batch["videos"]
         states = batch["proprio"]
         dec_videos = batch["dec_videos"]
+        dataset_ids = batch.get("dataset_ids", None)
         # print("videos shape:", videos.shape)
         # VQ 路径区分在模型内部（视觉编码也已迁移到 LAM 内部）
         if vq_training:
-            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam(videos, states, dec_videos)
+            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam(videos, states, dec_videos, dataset_ids=dataset_ids)
         else:
-            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam.inference(videos, states, dec_videos)
+            recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam.inference(videos, states, dec_videos, dataset_ids=dataset_ids)
 
         target = tgt
         # recon_loss = F.mse_loss(recon, target)
+        # 余弦相似度指标（不参与梯度计算）
+        with torch.no_grad():
+            cos_sim_metric = F.cosine_similarity(recon, target, dim=-1).mean()
+            l1_loss_metric = F.l1_loss(recon, target)
         if self.loss_type == "l1":
-            recon_loss = F.l1_loss(recon, target)
+            recon_loss = F.smooth_l1_loss(recon, target, beta=0.25)
             loss = recon_loss
-        elif self.loss_type == "cosine":
+        elif self.loss_type == "cos":
             cos_sim = F.cosine_similarity(recon, target, dim=-1).mean()
-            recon_loss = F.l1_loss(recon, target)
+            recon_loss = F.smooth_l1_loss(recon, target, beta=0.1)
             loss = recon_loss + (1 - cos_sim)
+        elif self.loss_type == "charbonnier":
+            recon_loss = charbonnier_loss(recon, target, eps=1e-3)
+            loss = recon_loss
         elif self.loss_type == "delta":
-            recon_loss = F.l1_loss(recon, target-dec_in)
+            recon_loss = F.smooth_l1_loss(recon, target-dec_in, beta=0.1)
+            loss = recon_loss
+        elif self.loss_type == "l2":
+            recon_loss = F.mse_loss(recon, target)
             loss = recon_loss
         else:
             recon_loss = F.mse_loss(recon, target)
@@ -193,12 +218,43 @@ class VJEPA_LAM(LightningModule):
                 "recon_loss": recon_loss,
                 "vq_loss": vq_loss,
                 "perplexity": perplexity,
+                "cos_sim_metric": cos_sim_metric,
+                "l1_loss_metric": l1_loss_metric,
+                # "dec_in": dec_in.mean(),
+                # "dec_in_std": dec_in.std(),
+                # "tgt": tgt.mean(),
+                # "tgt_std": tgt.std(),
+                # "recon": recon.mean(),
+                # "recon_std": recon.std(),
                 **aux_loss_logs,
             }
-            if self.loss_type == "cosine":
-                logs["cos_sim"] = cos_sim
+            # 追加 VQ 内部的熵相关分量，便于在 WandB / TensorBoard 中观察
+            vq_module = self.lam.vq
+            if hasattr(vq_module, "last_sample_entropy"):
+                logs["sample_entropy"] = vq_module.last_sample_entropy
+            if hasattr(vq_module, "last_codebook_entropy"):
+                logs["codebook_entropy"] = vq_module.last_codebook_entropy
+            if hasattr(vq_module, "nodes_norm"):
+                logs["nodes_norm"] = vq_module.nodes_norm
+            if hasattr(vq_module, "last_commitment_loss"):
+                logs["commitment_loss"] = vq_module.last_commitment_loss
+            if hasattr(vq_module, "last_orthogonal_loss") and vq_module.last_orthogonal_loss is not None:
+                logs["orthogonal_loss"] = vq_module.last_orthogonal_loss
+            # 记录每个样本在当前 batch 中使用到的唯一 code 数的平均值
+            if hasattr(vq_module, "last_avg_unique_codes"):
+                logs["avg_unique_codes"] = vq_module.last_avg_unique_codes
+                # logs["cos_sim_ori"] = cos_sim_ori
             if self.lambda_diversity >0:
                 logs["entropy_loss"] = entropy_loss
+            # 记录 VQ 中 slot 相关重复率指标（基于离散码索引）
+            if hasattr(vq_module, "last_slot_inter_redundancy") and vq_module.last_slot_inter_redundancy is not None:
+                logs["slot_inter_redundancy"] = vq_module.last_slot_inter_redundancy
+            if hasattr(vq_module, "last_slot_inner_redundancy") and vq_module.last_slot_inner_redundancy is not None:
+                logs["slot_inner_redundancy"] = vq_module.last_slot_inner_redundancy
+            if hasattr(vq_module, "last_min_inter_code_dist"):
+                logs["min_inter_code_dist"] = vq_module.last_min_inter_code_dist
+            if hasattr(vq_module, "last_avg_inter_code_dist"):
+                logs["avg_inter_code_dist"] = vq_module.last_avg_inter_code_dist
         return total_loss, logs
 
     def training_step(self, batch: Dict, batch_idx: int) -> Tensor:
@@ -209,9 +265,9 @@ class VJEPA_LAM(LightningModule):
         self.log_dict(
             {**{"train_loss": loss}, **{f"train/{k}": v for k, v in aux_losses.items()}},
             prog_bar=True,
-            logger=True,
+            logger=False,
             on_step=True,
-            on_epoch=True,
+            on_epoch=False,
             sync_dist=True
         )
         if self.distributed_state.is_main_process:
@@ -392,32 +448,27 @@ class CodebookMaintenanceCallback(pl.Callback):
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
     # def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if trainer.global_step% self.interval_steps != 0:
-            return
+        # if trainer.global_step% self.interval_steps != 0 or trainer.global_step < 100:
+        #     return
+        if (trainer.global_step % self.interval_steps == 0 and trainer.global_step <= 10000 and trainer.global_step > 100):
 
-        # 额外检查：确保 kmeans 初始化已完成
-        # replace_unused_codebooks 内部也会检查，但这里提前检查可以避免不必要的同步
-        if hasattr(pl_module.lam.vq, 'initialized'):
-            if not bool(pl_module.lam.vq.initialized.item()):
-                return
+            is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
 
-        is_distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+            # 使用 torch.distributed.barrier() 确保跨节点同步（支持多节点训练）
+            if is_distributed:
+                torch.distributed.barrier()
 
-        # 使用 torch.distributed.barrier() 确保跨节点同步（支持多节点训练）
-        if is_distributed:
-            torch.distributed.barrier()
+            # 重要：所有 rank 都需要调用，以便内部 all_reduce 能够正确聚合
+            with torch.no_grad():
+                if hasattr(pl_module.lam.vq, 'replace_unused_codebooks'):
+                    _num_replaced, _replaced_indices = pl_module.lam.vq.replace_unused_codebooks()
+                # 计数器在各 rank 本地清零，避免后续累计偏差
+                if hasattr(pl_module.lam.vq, 'reset_node_count'):
+                    pl_module.lam.vq.reset_node_count()
 
-        # 重要：所有 rank 都需要调用，以便内部 all_reduce 能够正确聚合
-        with torch.no_grad():
-            if hasattr(pl_module.lam.vq, 'replace_unused_codebooks'):
-                pl_module.lam.vq.replace_unused_codebooks()
-            # 计数器在各 rank 本地清零，避免后续累计偏差
-            if hasattr(pl_module.lam.vq, 'reset_node_count'):
-                pl_module.lam.vq.reset_node_count()
-
-        # 使用 torch.distributed.barrier() 确保跨节点同步（支持多节点训练）
-        if is_distributed:
-            torch.distributed.barrier()
+            # 使用 torch.distributed.barrier() 确保跨节点同步（支持多节点训练）
+            if is_distributed:
+                torch.distributed.barrier()
 
 
 class SaveConfigToCheckpointCallback(pl.Callback):

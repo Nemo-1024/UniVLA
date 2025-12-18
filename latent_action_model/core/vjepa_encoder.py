@@ -113,12 +113,18 @@ class DINOv3Encoder(nn.Module):
     def __init__(
         self,
         model_id: str = "facebook/dinov3-vitl16-pretrain-lvd1689m",
+        num_latent_layers: int = 1,
+        norm_layer_type: str = "l2",
+        enable_norm: bool = False,
     ):
         super().__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model_id = model_id
+        self.num_latent_layers = max(int(num_latent_layers), 1)
+        self.norm_layer_type = norm_layer_type
+        self.enable_norm = enable_norm
         # 加载 DINOv3 模型
-        model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True)
+        model = AutoModel.from_pretrained(self.model_id, trust_remote_code=True, dtype=torch.float32)
         model.eval()
         self.model = model.to(self.device)
         for param in self.model.parameters():
@@ -127,9 +133,19 @@ class DINOv3Encoder(nn.Module):
         # 记录特征维度
         hidden_size = getattr(self.model.config, 'hidden_size', None)
         self.feature_dim = int(hidden_size) if hidden_size is not None else 1024
+        # 根据 norm 类型只初始化需要的归一化层，避免出现未使用的模块
+        if self.norm_layer_type in ("bn", "ln"):
+            # 关闭 affine，避免产生可训练参数从而触发“未使用参数”告警
+            if self.norm_layer_type == "bn":
+                norm_builder = lambda: nn.SyncBatchNorm(self.feature_dim, affine=False).to(self.device)
+            else:
+                norm_builder = lambda: nn.LayerNorm(self.feature_dim, elementwise_affine=False).to(self.device)
+            self.latent_norms = nn.ModuleList([norm_builder() for _ in range(self.num_latent_layers)])
+        else:
+            self.latent_norms = None
 
     @torch.no_grad()
-    def encode(self, images: torch.Tensor, norm_latents: bool = False, remove_cls: bool = True, n: Union[int, Sequence] = [4, 11, 17, -1] ) -> torch.Tensor:
+    def encode(self, images: torch.Tensor, remove_cls: bool = True, n: Union[int, Sequence] = [4, 11, 17, -1] ) -> torch.Tensor:
         """
         输入：[B, T, C, H, W]
         输出：[B, T, K, D]
@@ -146,12 +162,26 @@ class DINOv3Encoder(nn.Module):
         if not need_all_layers:
             last = outputs.last_hidden_state  # [B*T, 5+K, D]（含若干特殊token）
             if remove_cls:
-                tokens = last[:, 5:, :]
+                tokens = last[:, 5:, :]  # [B*T, K, D]
             else:
-                tokens = last
+                tokens = last            # [B*T, 5+K, D]
+
+            # 先在 token 维度上展平做归一化，然后再一次性 reshape 到 [B, T, K, D]
+            if self.enable_norm:
+                if self.norm_layer_type == "bn":
+                    if self.latent_norms is None:
+                        raise ValueError("当前 DINOv3Encoder 未初始化 BN 层，请将 norm_layer_type 设置为 'bn'。")
+                    tokens_2d = tokens.reshape(-1, self.feature_dim)  # [B*T*K, D]
+                    tokens_2d = self.latent_norms[0](tokens_2d)
+                    tokens = tokens_2d.view(tokens.shape[0], tokens.shape[1], self.feature_dim)
+                elif self.norm_layer_type == "ln":
+                    if self.latent_norms is None:
+                        raise ValueError("当前 DINOv3Encoder 未初始化 LN 层，请将 norm_layer_type 设置为 'ln'。")
+                    tokens = self.latent_norms[0](tokens)
+                elif self.norm_layer_type == "l2":
+                    tokens = F.normalize(tokens, p=2, dim=-1)
+
             features = tokens.reshape(B, T, -1, self.feature_dim)
-            if norm_latents:
-                features = F.normalize(features, dim=-1)
             return features.detach()
         else:
             hidden_states = outputs.hidden_states
@@ -159,13 +189,34 @@ class DINOv3Encoder(nn.Module):
                 list_n = [n]
             else:
                 list_n = n
-            if remove_cls:
-                features = [hidden_states[i][:, 5:, :].reshape(B, T, -1, self.feature_dim) for i in list_n]
-            else:
-                features = [hidden_states[i].reshape(B, T, -1, self.feature_dim) for i in list_n]
-            if norm_latents:
-                features = [F.normalize(i, dim=-1) for i in features]
-            return features[0].detach() if isinstance(n, int) else [i.detach() for i in features]
+            # 确保为每个待用层分配到对应的 BN
+            assert len(list_n) <= self.num_latent_layers, (
+                f"DINOv3Encoder 期望的 BN 层数为 {self.num_latent_layers}，"
+                f"但传入的特征层数为 {len(list_n)}；请保证两者一致（通常为 len(latent_layer_to_use)）。"
+            )
+            features = []
+            for idx, i in enumerate(list_n):
+                layer_tokens = hidden_states[i]  # [B*T, 5+K, D]
+                if remove_cls:
+                    layer_tokens = layer_tokens[:, 5:, :]  # [B*T, K, D]
+
+                if self.enable_norm:
+                    if self.norm_layer_type == "bn":
+                        if self.latent_norms is None:
+                            raise ValueError("当前 DINOv3Encoder 未初始化 BN 层，请将 norm_layer_type 设置为 'bn'。")
+                        lt_2d = layer_tokens.reshape(-1, self.feature_dim)  # [B*T*K, D]
+                        lt_2d = self.latent_norms[idx](lt_2d)
+                        layer_tokens = lt_2d.view(layer_tokens.shape[0], layer_tokens.shape[1], self.feature_dim)
+                    elif self.norm_layer_type == "ln":
+                        if self.latent_norms is None:
+                            raise ValueError("当前 DINOv3Encoder 未初始化 LN 层，请将 norm_layer_type 设置为 'ln'。")
+                        layer_tokens = self.latent_norms[idx](layer_tokens)
+                    elif self.norm_layer_type == "l2":
+                        layer_tokens = F.normalize(layer_tokens, p=2, dim=-1)
+
+                features.append(layer_tokens.reshape(B, T, -1, self.feature_dim))
+
+            return features[0].detach() if isinstance(n, int) else [f.detach() for f in features]
 
 class CosmosAutoencoder(nn.Module):
     """
@@ -288,7 +339,7 @@ class CosmosAutoencoder(nn.Module):
 
  
 
-def build_vision_encoder(model_id: str) -> nn.Module:
+def build_vision_encoder(model_id: str, num_latent_layers: int = 1, norm_layer_type: str = "l2", enable_norm: bool = False) -> nn.Module:
     """
     根据 model_id 中的关键词选择并构建视觉编码器实例。
 
@@ -300,8 +351,20 @@ def build_vision_encoder(model_id: str) -> nn.Module:
     """
 
     key = model_id.lower()
-    if "dino" in key:
-        return DINOv3Encoder(model_id="/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" ), 1024
+    if "dinov3-vitl16" in key:
+        return DINOv3Encoder(
+            model_id="/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m",
+            num_latent_layers=num_latent_layers,
+            norm_layer_type=norm_layer_type,
+            enable_norm=enable_norm,
+        ), 1024
+    elif "dinov3-vitb16" in key:
+        return DINOv3Encoder(
+            model_id="/mnt/mnt/public/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m",
+            num_latent_layers=num_latent_layers,
+            norm_layer_type=norm_layer_type,
+            enable_norm=enable_norm,
+        ), 768
     elif "vjepa" in key or "jepa" in key:
         return VJEPAEncoder(model_id="/mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256"), 1024
     elif "cosmos" in key:

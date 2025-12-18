@@ -86,7 +86,8 @@ def bridge_orig_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     # print(trajectory.keys(), trajectory['observation'].keys())
     trajectory = relabel_bridge_actions(trajectory)
     trajectory["observation"]["EEF_state"] = trajectory["observation"]["state"][:, :6]
-    trajectory["observation"]["gripper_state"] = trajectory["observation"]["state"][:, -1:]
+    trajectory["observation"]["gripper_state"] = -1.0 * trajectory["observation"]["state"][:, -1:]
+    #bridge 夹爪合上是-1，张开是1
     return trajectory
 
 
@@ -828,6 +829,7 @@ def roboset_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
         ),
         axis=-1,
     )
+    
     return trajectory
 
 
@@ -875,7 +877,9 @@ def libero_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
         axis=1,
     )
     trajectory["observation"]["EEF_state"] = trajectory["observation"]["state"][:, :6]
-    trajectory["observation"]["gripper_state"] = trajectory["observation"]["state"][:, -2:]  # 2D gripper state
+
+    # 原始标量：>0 表示越夹紧，<0 表示越张开
+    trajectory["observation"]["gripper_state"] = trajectory["observation"]["state"][:, -1:]
     return trajectory
 
 
@@ -895,6 +899,39 @@ def human_dataset_transform(sample: Dict[str, Any]) -> Dict[str, Any]:
     # Infer trajectory length from available observation keys
     if "image" in observation:
         traj_len = tf.shape(observation["image"])[0]
+    elif "wrist_image" in observation:
+        traj_len = tf.shape(observation["wrist_image"])[0]
+    elif "state" in observation:
+        traj_len = tf.shape(observation["state"])[0]
+    else:
+        # Fallback: cannot infer length reliably
+        raise ValueError("human_dataset_transform: cannot infer trajectory length from observation.")
+
+    # Populate proprio placeholders matching trajectory length
+    observation["EEF_state"] = tf.zeros((traj_len, 6), dtype=tf.float32)
+    observation["gripper_state"] = tf.zeros((traj_len, 1), dtype=tf.float32)
+
+    # Create a dummy action tensor with all zeros
+    # Assuming the action space is 7D (6D for EEF + 1D for gripper)
+    sample["action"] = tf.zeros((traj_len, 7), dtype=tf.float32)
+
+    return sample
+def agibot_transform(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transforms human data into the expected format by adding dummy actions.
+    
+    Args:
+        sample (Dict[str, Any]): A dictionary containing human data observations.
+        
+    Returns:
+        Dict[str, Any]: Transformed sample with dummy actions added.
+    """
+    # Extract the observation from the sample
+    observation = sample["observation"]
+
+    # Infer trajectory length from available observation keys
+    if "head" in observation:
+        traj_len = tf.shape(observation["head"])[0]
     elif "wrist_image" in observation:
         traj_len = tf.shape(observation["wrist_image"])[0]
     elif "state" in observation:
@@ -977,7 +1014,7 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "droid_100": droid_baseact_transform,
     "fmb": fmb_dataset_transform,
     "dobbe": dobbe_dataset_transform,
-    "roboset": roboset_dataset_transform,
+    "roboset": human_dataset_transform,
     "rh20t": rh20t_dataset_transform,
     ### T-DROID datasets
     "tdroid_carrot_in_bowl": tdroid_dataset_transform,
@@ -1003,5 +1040,6 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "libero_90_rlds": libero_dataset_transform,
     ### Human Dataset
     "ego4d": human_dataset_transform,
+    "agibot": agibot_transform,
 
 }

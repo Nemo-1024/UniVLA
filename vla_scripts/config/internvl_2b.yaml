@@ -1,0 +1,26 @@
+
+
+# Hugging Face 模型（本地路径或 HF Hub ID）
+model_id: /mnt/mnt/public/jlchen/weights/InternVL3_5-2B-Instruct-HF
+lam_ckpt_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_ddp_diveq/version_1/checkpoints/last.ckpt
+lam_yaml_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_ddp_diveq/version_1/dino_ddp.yaml
+
+# 数据与预处理
+data_mix: lam_plus
+
+
+# 训练超参
+
+per_device_batch_size: 16
+gradient_accumulation_steps: 1
+learning_rate: 2e-5
+warmup_steps: 0
+
+
+# 运行与日志
+run_id: dino_ddp_2B
+run_id_note: null
+
+
+
+

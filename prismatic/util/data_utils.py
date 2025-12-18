@@ -45,6 +45,7 @@ class PaddedCollatorForLanguageModeling:
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids_list, labels_list = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
+        dataset_ids = [instance["dataset_id"] for instance in instances] if "dataset_id" in instances[0] else None
 
         # For now, we only support Tokenizers with `padding_side = "right"` during Training (but plan to extend!)
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -94,13 +95,16 @@ class PaddedCollatorForLanguageModeling:
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
-        return dict(
+        output = dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
             multimodal_indices=multimodal_indices,
         )
+        if dataset_ids is not None:
+            output["dataset_ids"] = dataset_ids
+        return output
 
 
 @dataclass
@@ -108,75 +112,92 @@ class PaddedCollatorForActionPrediction:
     model_max_length: int
     pad_token_id: int
     padding_side: str = "right"
-    # 在 collate 阶段批处理 VQ 编码与文本模板（必需）
-    action_tokenizer: Any = None
     processor: Any = None
     predict_stop_token: bool = False
+    latent_action_num_queries: int = 4
+    target_seq_len: int = 330
+    use_history_frame: bool = True
 
     def __post_init__(self):
-        # 预先缓存 mean/std 张量（避免每次调用都创建）
+        assert self.processor is not None, "processor 不能为空"
+        # 从 processor.tokenizer 中获取占位符 token id，避免外部传参不一致
+        tok = self.processor.tokenizer
+        placeholder_token_id = tok.convert_tokens_to_ids("<ACT_PH>")
+        assert placeholder_token_id != tok.unk_token_id, "未找到 <ACT_PH> 占位符，请确保已注册"
+        self.placeholder_token_id = int(placeholder_token_id)
+        # 预先缓存 mean/std 张量（用于 LAM 输入归一化）
         mean = torch.tensor([0.485, 0.456, 0.406])
         std = torch.tensor([0.229, 0.224, 0.225])
         self.mean_5d = mean.view(1, 1, 3, 1, 1)
         self.std_5d = std.view(1, 1, 3, 1, 1)
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        # 批量 VQ 编码 + 文本模板生成（仅支持新路径，不保留向后兼容）
-        assert self.action_tokenizer is not None and self.processor is not None, (
-            "action_tokenizer 和 processor 需要在 Collator 初始化时提供，用于批量 VQ 编码与模板生成"
-        )
-        device = self.action_tokenizer.device
- 
         # 收集批次数据（来自轻量 Transform，collate 阶段统一处理）
         lang_instructions_list: List[Any] = [instance["language_instruction"] for instance in instances]
-        img_list = [instance["img"] for instance in instances]
+        # VLM 只需要历史观测帧 + 当前 chunk 帧（不按视频处理）
+        if self.use_history_frame:
+            img_pairs = [
+                (
+                    instance["video"][0],  # history frame
+                    instance["video"][1],  # chunk frame
+                )
+                for instance in instances
+            ]
+        else:
+            img_pairs = [
+                (
+                    instance["video"][1],  # chunk frame
+                )
+                for instance in instances
+            ]
         dataset_names = [instance["dataset_name"] for instance in instances] if "dataset_name" in instances[0] else None
-        proprio = torch.as_tensor([instance["proprio"] for instance in instances], dtype=torch.float32, device=device)
+        dataset_ids = [instance["dataset_id"] for instance in instances] if "dataset_id" in instances[0] else None
 
-        # 批量 VQ 编码
-        video_batch = torch.stack([torch.from_numpy(instance["video"]) for instance in instances], dim=0).to(device=device, dtype=torch.float32)
-        video_batch = video_batch.permute(0, 1, 4, 2, 3).div_(255.0)
-        if self.mean_5d.device != device:
-            self.mean_5d = self.mean_5d.to(device=device, dtype=video_batch.dtype)
-            self.std_5d = self.std_5d.to(device=device, dtype=video_batch.dtype)
+        # LAM 输入：视频与状态（保持原 shape，后续在模型侧归一化）
+        lam_videos = torch.stack(
+            [torch.as_tensor(instance["video"][1:]).permute(0, 3, 1, 2).float().div_(255.0) for instance in instances],
+            dim=0,
+        )  # [B, T, 3, H, W]
+        # 归一化到与 LAM 训练一致
+        lam_videos = (lam_videos - self.mean_5d) / self.std_5d
+        lam_states = torch.stack(
+            [torch.as_tensor(instance["proprio"][1:]).float() for instance in instances],
+            dim=0,
+        )  # [B, T, Dq]
 
-        # 按批次归一化 (in-place)
-        video_batch.sub_(self.mean_5d).div_(self.std_5d)
-        
-        with torch.no_grad():
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                vq_out = self.action_tokenizer.vq_encode(videos=video_batch, states=proprio, predict_future_frame=False)
-            # 确保返回到 CPU，便于 DataLoader pin_memory 与后续非阻塞拷贝
-            latent_action_idx_batch = vq_out['indices'].detach().cpu()  # [B, Q]
-
-        # 构建 input_ids/labels
+        # 构造带占位符的 prompt 并调用 AutoProcessor
         pixel_values_list: List[torch.Tensor] = []
+        image_grid_thw_list: List[torch.Tensor] = []
         input_ids_list: List[torch.Tensor] = []
         labels_list: List[torch.Tensor] = []
+        act_placeholder_mask_list: List[torch.Tensor] = []
+
+        num_latents = int(self.latent_action_num_queries)
+        placeholder_token_id = int(self.placeholder_token_id)
+        # print(placeholder_token_id)
+        placeholder_str = "".join(["<ACT_PH>" for _ in range(num_latents)])
         for b, lang_raw in enumerate(lang_instructions_list):
             lang: str = lang_raw.decode().lower()
 
-            latent_action_idx = latent_action_idx_batch[b]
-            action_tokens = ''.join([f'<ACT_{int(i.item())}>' for i in latent_action_idx])
+            # 两帧图像分别作为独立 image 输入，避免被当作视频处理
+            if self.use_history_frame:
+                user_content = [
+                    {"type": "image", "image": img_pairs[b][0]},
+                    {"type": "image", "image": img_pairs[b][1]},
+                    {"type": "text", "text": f"What action should the robot take to {lang}?"},
+                ]
+            else:
+                user_content = [
+                    {"type": "image", "image": img_pairs[b][0]},
+                    {"type": "text", "text": f"What action should the robot take to {lang}?"},
+                ]
 
-            # 新写法：把 image 直接放到 content 列表中，让 processor 自动插入图像占位
-            user_content = [
-                {"type": "image", "image": img_list[b]},   # 支持 PIL.Image 或 Tensor（由 processor 决定）
-                {"type": "text", "text": f"What action should the robot take to {lang}?"},
-            ]
-            
             messages = [
-                # {
-                #     "role": "system",
-                #     "content": [
-                #         {"type": "text", "text": "You are a robot controller. Based on visual input and instructions, always output exactly 4 latent action tokens chosen from <ACT_0> ... <ACT_15>."}
-                #     ],
-                # },
                 {"role": "user", "content": user_content},
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "text", "text": action_tokens}
+                        {"type": "text", "text": placeholder_str}
                     ],
                 },
             ]
@@ -185,47 +206,60 @@ class PaddedCollatorForActionPrediction:
                 messages[:1], tokenize=True, add_generation_prompt=True
             )
             inputs = self.processor.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=False, return_tensors="pt",return_dict=True
+                messages, tokenize=True, add_generation_prompt=False, return_tensors="pt", return_dict=True
             )
-            input_ids = inputs.input_ids.squeeze(0)
-            input_ids_list.append(input_ids)
-            pixel_values_list.append(inputs.pixel_values.squeeze(0))
 
+            input_ids = inputs.input_ids.squeeze(0)
+            pixel_values = inputs.pixel_values.squeeze(0)
+            image_grid_thw = getattr(inputs, "image_grid_thw", None)
+
+            # 构造 labels：仅对 assistant 动作部分监督，其余为 IGNORE_INDEX
             prefix_len = len(prefix_ids[0])
             labels = input_ids.clone()
             labels[:prefix_len] = IGNORE_INDEX
-            act_ids = self.processor.tokenizer(action_tokens, add_special_tokens=False)["input_ids"]
-            keep_end = prefix_len + len(act_ids)
+            # assistant 内容长度 = num_latents 个占位符 token
+            keep_end = prefix_len + num_latents
             labels[keep_end:] = IGNORE_INDEX
-            labels_list.append(labels)
 
+            # 占位符 mask（后续模型中用来替换为真实 <ACT_i>）
+            act_placeholder_mask = (input_ids == placeholder_token_id)
+
+            input_ids_list.append(input_ids)
+            labels_list.append(labels)
+            pixel_values_list.append(pixel_values)
+            act_placeholder_mask_list.append(act_placeholder_mask)
+            if image_grid_thw is not None:
+                image_grid_thw_list.append(image_grid_thw) # (N_img, 3)
         # padding_side check
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
 
-        # 目标长度
-        target_len = 300
+        target_len = int(self.target_seq_len)
         seq_lengths = [min(t.size(-1), target_len) for t in input_ids_list]
-
-        # Pad input_ids
-        # input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)[:, :self.model_max_length]
 
         input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
         input_ids = input_ids[:, :target_len]
         if input_ids.size(1) < target_len:
             pad_amt = target_len - input_ids.size(1)
             input_ids = F.pad(input_ids, (0, pad_amt), value=self.pad_token_id)
-        # labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)[:, :self.model_max_length]
+
         labels = pad_sequence(labels_list, batch_first=True, padding_value=IGNORE_INDEX)
         labels = labels[:, :target_len]
         if labels.size(1) < target_len:
             pad_amt = target_len - labels.size(1)
             labels = F.pad(labels, (0, pad_amt), value=IGNORE_INDEX)
 
-        # Attention mask
+        act_placeholder_mask = pad_sequence(
+            act_placeholder_mask_list, batch_first=True, padding_value=0
+        )
+        act_placeholder_mask = act_placeholder_mask[:, :target_len]
+        if act_placeholder_mask.size(1) < target_len:
+            pad_amt = target_len - act_placeholder_mask.size(1)
+            act_placeholder_mask = F.pad(act_placeholder_mask, (0, pad_amt), value=0)
+        act_placeholder_mask = act_placeholder_mask.bool()
+
         lengths_tensor = torch.tensor(seq_lengths, dtype=torch.long)
         attention_mask = (torch.arange(target_len, dtype=torch.long).unsqueeze(0) < lengths_tensor.unsqueeze(1))
 
-        # Stack pixel_values
         if isinstance(pixel_values_list[0], torch.Tensor):
             pixel_values = torch.stack(pixel_values_list)
         elif isinstance(pixel_values_list[0], dict):
@@ -235,16 +269,29 @@ class PaddedCollatorForActionPrediction:
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values_list[0])}")
 
-        # 输出
+        # 保持 batch 维度：列表元素 shape 通常为 [num_imgs, 3]
+        if image_grid_thw_list:
+            image_grid_thw = torch.stack(image_grid_thw_list)  # [B, num_imgs, 3]
+            image_grid_thw = image_grid_thw.view(-1, 3)  # 展平为 [B*num_imgs, 3] 供 Qwen fast_pos_embed_interpolate
+        else:
+            image_grid_thw = None
+
+        # 仅在可用时返回 image_grid_thw，避免 Accelerate 拼接 None 值报错
         output = dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
+            labels=labels,
+            act_placeholder_mask=act_placeholder_mask,
+            lam_videos=lam_videos,
+            lam_states=lam_states,
         )
-        if labels is not None:
-            output["labels"] = labels
+        if image_grid_thw is not None:
+            output["image_grid_thw"] = image_grid_thw
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if dataset_ids is not None:
+            output["dataset_ids"] = dataset_ids
 
         return output
 
@@ -356,7 +403,7 @@ class PaddedCollatorForActionPrediction_LIBERO:
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
 
         # 目标长度与长度统计
-        target_len = 350
+        target_len = 320
         seq_lengths = [min(t.size(-1), target_len) for t in input_ids_list]
 
         # Pad input_ids
@@ -403,6 +450,8 @@ class PaddedCollatorForActionPrediction_LIBERO:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if dataset_ids is not None:
+            output["dataset_ids"] = dataset_ids
 
         return output
 
@@ -436,6 +485,10 @@ class PaddedCollatorForActionPrediction_R2R:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
             dataset_names = None
+        if "dataset_id" in instances[0]:
+            dataset_ids = [instance["dataset_id"] for instance in instances]
+        else:
+            dataset_ids = None
 
         # For low-level policy training
         actions = [instance["actions"] for instance in instances]
@@ -472,6 +525,8 @@ class PaddedCollatorForActionPrediction_R2R:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if dataset_ids is not None:
+            output["dataset_ids"] = dataset_ids
         return output
         
 @dataclass
@@ -542,6 +597,8 @@ class PaddedCollatorForActionPrediction_CALVIN:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if dataset_ids is not None:
+            output["dataset_ids"] = dataset_ids
         return output
 
 
@@ -582,8 +639,11 @@ class CollatorForLatentAction:
 
         # 若有 dataset_name
         dataset_names = None
+        dataset_ids = None
         if "dataset_name" in instances[0]:
             dataset_names = [ins["dataset_name"] for ins in instances]
+        if "dataset_id" in instances[0]:
+            dataset_ids = [ins["dataset_id"] for ins in instances]
 
         batch = {
             "videos": videos.contiguous(),
@@ -594,6 +654,8 @@ class CollatorForLatentAction:
 
         if dataset_names is not None:
             batch["dataset_names"] = dataset_names
+        if dataset_ids is not None:
+            batch["dataset_ids"] = dataset_ids
 
         return batch
 
@@ -641,5 +703,7 @@ class CollatorForMultiViewVideo:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if dataset_ids is not None:
+            output["dataset_ids"] = dataset_ids
 
         return output

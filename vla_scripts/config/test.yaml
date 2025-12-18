@@ -1,58 +1,33 @@
 
 
 # Hugging Face 模型（本地路径或 HF Hub ID）
-model_id: /mnt/mnt/public/jlchen/weights/InternVL3_5-1B-Instruct-HF
-lam_ckpt_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_bridge_noar_noposnos_nsvq_5-7/version_1/checkpoints/epoch=19.ckpt
-lam_yaml_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_bridge_noar_noposnos_nsvq_5-7/version_1/dino_bridge.yaml
-
+# model_id: "/mnt/mnt/public/jlchen/weights/InternVL3_5-1B-Instruct-HF"
+model_id: "/mnt/mnt/public/jlchen/weights/Qwen3-VL-2B-Instruct"
+# lam_ckpt_path: "/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_base_4q_32_crossattn_mask_2f_norep_bn/version_1/checkpoints/epoch=19.ckpt"
+# lam_yaml_path: "/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_base_4q_32_crossattn_mask_2f_norep_bn/version_1/dino_base_2f.yaml"
+lam_ckpt_path: "/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_base_4q_16_norep/version_16/checkpoints/epoch=4.ckpt"
+lam_yaml_path: "/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_base_4q_16_norep/version_16/dino_base.yaml"
 # 数据与预处理
-data_mix: droid_100
-shuffle_buffer_size: 1024
-image_resolution: 448
-image_aug: true
+data_mix: bridge_dataset
 
 
-# 冻结策略
+# 训练超参
+training_phase: lam_2f
+per_device_batch_size: 16
+gradient_accumulation_steps: 1
+learning_rate: 1e-4
+new_token_lr_scale: 10
+warmup_steps: 0
+debug_repeat_batch: false #此数量应为per_device_batch_size，或者直接设置为 true
+enable_lam_kl_loss: true
+
+# 运行与日志
+run_id: test
+
+
 freeze_vision_backbone: false
 freeze_llm_backbone: false
 freeze_last_llm_layer: false
 freeze_projector: false
-
-
-codebook_size: 16
-
-# 训练超参
-epochs: 10
-max_steps: 100000
-per_device_batch_size: 16
-gradient_accumulation_steps: 1
-learning_rate: 1e-6
-warmup_steps: 0
-weight_decay: 0.0
-max_grad_norm: 1.0
-lr_scheduler_type: constant_with_warmup
-optim: adamw_torch
-enable_mixed_precision_training: true
-seed: 42
-logging_steps: 1
-
-# 评估与保存
-eval_strategy: steps
-save_total_limit: -1
-eval_interval: 1000
-eval_accumulation_steps: 1
-per_device_eval_batch_size: 64
-save_interval: 1000
-
-# 分布式 / FSDP
-fsdp: full_shard
-fsdp_config: null
-
-# 运行与日志
-run_id: nsvq_bridge
-run_id_note: null
-wandb_project: vla_pretraining
-wandb_entity: null
-
 
 

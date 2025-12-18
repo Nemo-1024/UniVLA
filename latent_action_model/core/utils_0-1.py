@@ -716,32 +716,32 @@ class Attn_Crossn_Block(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, state_features, LAM_features):
+    def forward(self, sa_features, ca_features):
         """
         前向传播。
         
         参数:
-            state_features (torch.Tensor): f_t，形状为 [B, K, D_feat]。
-            LAM_features (torch.Tensor): z_q，形状为 [B, 4, d]。
+            sa_features (torch.Tensor): f_t，形状为 [B, K, D_feat]。
+            ca_features (torch.Tensor): z_q，形状为 [B, 4, d]。
         返回:
-            torch.Tensor: 更新后的状态特征，形状为 [B, K, D_feat]。
+            torch.Tensor: 更新后的自注意力特征和交叉注意力特征，形状为 [B, K, D_feat]。
         """
         # print("state_features shape:", state_features.shape)
         # print("LAM_features shape:", LAM_features.shape)
         # 自注意力 + 残差连接 (在 state_features 上)
-        sa_output, _ = self.attn_sa(self.norm_sa(state_features), self.norm_sa(state_features), self.norm_sa(state_features))
-        state_features = state_features + sa_output
+        sa_output, _ = self.attn_sa(self.norm_sa(sa_features), self.norm_sa(sa_features), self.norm_sa(sa_features))
+        sa_features = sa_features + sa_output
         
         # 交叉注意力 + 残差连接
         # Query 来自 state，Key 和 Value 来自 LAM
-        ca_output, _ = self.attn_ca(query=self.norm_ca_q(state_features), key=self.norm_ca_kv(LAM_features), value=self.norm_ca_kv(LAM_features)) 
-        state_features = state_features + ca_output
+        ca_output, _ = self.attn_ca(query=self.norm_ca_q(sa_features), key=self.norm_ca_kv(ca_features), value=self.norm_ca_kv(ca_features)) 
+        sa_features = sa_features + ca_output
 
         # 前馈网络 + 残差连接
-        ffn_output = self.ffn(self.norm_ffn(state_features))
-        state_features = state_features + ffn_output
+        ffn_output = self.ffn(self.norm_ffn(sa_features))
+        sa_features = sa_features + ffn_output
 
-        return state_features
+        return sa_features
 
 class CrossAttentionBlock(nn.Module):
     def __init__(self, d_model, num_heads=16, ffn_ratio=4, dropout=0.1):

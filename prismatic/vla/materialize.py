@@ -70,43 +70,48 @@ def get_vla_dataset_and_collator(
 def get_latent_vla_dataset_and_collator(
     data_root_dir: Path,
     data_mix: str,
-    latent_action_model: LatentLAMModel,
     processor: AutoProcessor,
-    default_image_resolution: int,
     padding_side: str = "right",
     predict_stop_token: bool = False,
-    shuffle_buffer_size: int = 100_000,
+    shuffle_buffer_size: int = 10000,
     episodic: bool = False,
     image_aug: bool = False,
     training_phase: str = 'pre-training',
     data_transform_fn = RLDSBatchTransformLatentAction,
     collator_fn = PaddedCollatorForActionPrediction,
+    latent_action_num_queries: int = None,
+    debug_repeat_batch: bool = True,
+    target_seq_len: int = 330,
+    use_history_frame: bool = False,
 
 ) -> Tuple[Dataset, PreTrainedTokenizerBase, PaddedCollatorForActionPrediction]:
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
     # action_tokenizer = ActionTokenizer(tokenizer)
     tokenizer = processor.tokenizer
+
     # image_transform = transforms.Compose([transforms.ToTensor(),
     #     transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
 
-    image_transform_lam =transforms.Compose([
-        transforms.Resize((256,256)),
-        # transforms.Resize((224,224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
+    # image_transform_lam =transforms.Compose([
+    #     transforms.Resize((256,256)),
+    #     # transforms.Resize((224,224)),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)])
 
 
-    data_transform = data_transform_fn(
-        image_transform_lam=image_transform_lam,
-    )
+    data_transform = data_transform_fn()
     #tokenizer.pad_token_id: <|endoftext|> 151643
+    assert latent_action_num_queries is not None, "latent_action_num_queries 不能为空（通常等于 LAM num_queries）"
+
     collator = collator_fn(
         tokenizer.model_max_length,
         tokenizer.pad_token_id,
         padding_side=padding_side,
-        action_tokenizer=latent_action_model,
         processor=processor,
-        predict_stop_token=False
+        predict_stop_token=False,
+        latent_action_num_queries=int(latent_action_num_queries),
+        target_seq_len=target_seq_len,
+        use_history_frame=use_history_frame,
     )
 
 
@@ -116,17 +121,18 @@ def get_latent_vla_dataset_and_collator(
         data_root_dir,
         data_mix,
         data_transform,
-        resize_resolution=(default_image_resolution, default_image_resolution),
+        resize_resolution=(256, 256),
         shuffle_buffer_size=shuffle_buffer_size,
         train=True,
         image_aug=image_aug,
         training_phase=training_phase,
+        debug_repeat_batch=debug_repeat_batch,
     )
     val_dataset = cls(
         data_root_dir,
         data_mix,
         data_transform,
-        resize_resolution=(default_image_resolution, default_image_resolution),
+        resize_resolution=(256,256),
         shuffle_buffer_size=shuffle_buffer_size,
         train=False,
         image_aug=False,

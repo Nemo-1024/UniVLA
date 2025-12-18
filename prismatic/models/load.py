@@ -17,7 +17,14 @@ from prismatic.models.registry import GLOBAL_REGISTRY, MODEL_REGISTRY
 from prismatic.models.vlas import OpenVLA
 
 from prismatic.overwatch import initialize_overwatch
-from transformers import AutoProcessor, InternVLForConditionalGeneration
+from transformers import (
+    AutoProcessor,
+    AutoModelForVision2Seq,
+    AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
+    InternVLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
+)
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -67,6 +74,59 @@ def load_InternVL(model_id, cache_dir=None, dtype=torch.bfloat16):
 
     return vlm, processor
 
+
+def load_vlm_auto(model_id, cache_dir=None, dtype=torch.bfloat16):
+    """
+    通用加载接口：优先按 Vision2Seq，其次 Seq2Seq/CAUSAL LM，均允许 trust_remote_code。
+    返回 (vlm, processor)。
+    """
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+        trust_remote_code=True,
+    )
+
+    last_err = None
+    for loader in (Qwen3VLForConditionalGeneration, InternVLForConditionalGeneration, AutoModelForVision2Seq, AutoModelForSeq2SeqLM, AutoModelForCausalLM):
+        try:
+            vlm = loader.from_pretrained(
+                model_id,
+                cache_dir=str(cache_dir) if cache_dir is not None else None,
+                trust_remote_code=True,
+                device_map="cpu",
+                torch_dtype=dtype,
+            )
+            return vlm, processor
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Failed to load VLM `{model_id}` via generic loaders") from last_err
+
+def load_Qwen3VL(model_id, cache_dir=None, dtype=torch.bfloat16):
+    """加载预训练 VLM。"""
+
+    vlm = Qwen3VLForConditionalGeneration.from_pretrained(
+        model_id,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+        trust_remote_code=True,
+        device_map="cpu",  # 避免多进程默认加载到 cuda:0；后续由 Accelerate 迁移到各自 GPU
+        torch_dtype=dtype,
+    )
+    processor = AutoProcessor.from_pretrained(
+        model_id,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+        trust_remote_code=True,
+    )
+
+    return vlm, processor    
+def freeze_qwen3vl(vlm, freeze_vision_backbone, freeze_projector, freeze_llm_backbone, freeze_last_llm_layer):
+    if freeze_vision_backbone:
+        vlm.visual.requires_grad_(False)
+    if freeze_llm_backbone:
+        vlm.language_model.requires_grad_(False)
+    if freeze_last_llm_layer:
+        vlm.lm_head.requires_grad_(False)
+
 def freeze_internvl(vlm, freeze_vision_backbone, freeze_projector, freeze_llm_backbone, freeze_last_llm_layer):
     if freeze_vision_backbone and hasattr(vlm, "vision_tower"):
         vlm.vision_tower.requires_grad_(False)
@@ -76,6 +136,33 @@ def freeze_internvl(vlm, freeze_vision_backbone, freeze_projector, freeze_llm_ba
         vlm.language_model.requires_grad_(False)
     if freeze_last_llm_layer and hasattr(vlm, "lm_head"):
         vlm.lm_head.requires_grad_(False)
+
+
+def freeze_vlm_generic(vlm, freeze_vision_backbone, freeze_projector, freeze_llm_backbone, freeze_last_llm_layer):
+    """
+    针对通用 HF VLM 的冻结逻辑：按常见子模块名称尝试冻结，未找到则跳过。
+    """
+    if freeze_vision_backbone:
+        for name in ["vision_tower", "visual", "vision_model", "vision_encoder", "vision_modules"]:
+            if hasattr(vlm, name):
+                getattr(vlm, name).requires_grad_(False)
+        if hasattr(vlm, "model") and hasattr(getattr(vlm, "model"), "vision_tower"):
+            vlm.model.vision_tower.requires_grad_(False)
+
+    if freeze_projector:
+        for name in ["multi_modal_projector", "vision_proj", "projector"]:
+            if hasattr(vlm, name):
+                getattr(vlm, name).requires_grad_(False)
+
+    if freeze_llm_backbone:
+        for name in ["language_model", "lm", "model", "text_model", "transformer", "decoder"]:
+            if hasattr(vlm, name):
+                getattr(vlm, name).requires_grad_(False)
+
+    if freeze_last_llm_layer:
+        for name in ["lm_head", "generator", "cls"]:
+            if hasattr(vlm, name):
+                getattr(vlm, name).requires_grad_(False)
 
 
 

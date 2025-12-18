@@ -1,0 +1,27 @@
+
+
+# Hugging Face 模型（本地路径或 HF Hub ID）
+model_id: "/mnt/mnt/public/jlchen/weights/InternVL3_5-1B-Instruct-HF"
+lam_ckpt_path: "/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_4q_32_layer_23_vq_maxrep2_l2_crossattn_modalmask_state/version_0/checkpoints/epoch=19.ckpt"
+lam_yaml_path: "/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_4q_32_layer_23_vq_maxrep2_l2_crossattn_modalmask_state/version_0/dino_bridge_state.yaml"
+
+
+# 数据与预处理
+data_mix: bridge_dataset
+
+
+# 训练超参
+
+per_device_batch_size: 16
+gradient_accumulation_steps: 2
+learning_rate: 1e-5
+warmup_steps: 0
+
+
+# 运行与日志
+run_id: bridge_lr1e-5
+
+
+
+
+

@@ -7,7 +7,7 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type, Optional
+from typing import Any, Dict, Tuple, Type, Optional, Union
 from IPython.display import Video
 from torchvision import transforms
 import torchvision.transforms.v2.functional as F
@@ -21,7 +21,7 @@ from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
 import threading
 from queue import Queue, Full
-
+import tensorflow as tf
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
@@ -84,7 +84,10 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)
+        out = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name)
+        if "dataset_id" in rlds_batch:
+            out["dataset_id"] = rlds_batch["dataset_id"]
+        return out
 
 
 @dataclass
@@ -162,13 +165,23 @@ class RLDSBatchTransformLIBERO_withHis:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, actions=rlds_batch["action"][randomized_overlap: self.window_size + randomized_overlap], latent_action_idx=latent_action_idx, dataset_name=dataset_name)
+        out = dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            labels=labels,
+            actions=rlds_batch["action"][randomized_overlap: self.window_size + randomized_overlap],
+            latent_action_idx=latent_action_idx,
+            dataset_name=dataset_name,
+        )
+        if "dataset_id" in rlds_batch:
+            out["dataset_id"] = rlds_batch["dataset_id"]
+        return out
 
 
 @dataclass
 class RLDSBatchTransformLIBERO:
     image_transform_lam: Optional[Any] = None
-
+    vlm_resolution: int = 448
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
         轻量化 Transform：仅提取必要的数据供 Collator 批量 VQ 编码。
@@ -184,6 +197,7 @@ class RLDSBatchTransformLIBERO:
         video = np.array(rlds_batch["observation"]["image_primary"])  # [T, H, W, C]（固定长度）
         # 当前帧
         img = Image.fromarray(video[0])
+        img = img.resize((self.vlm_resolution, self.vlm_resolution), Image.BILINEAR)
         total_frames = len(video)
         assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
@@ -200,9 +214,11 @@ class RLDSBatchTransformLIBERO:
             "actions": np.array(rlds_batch["action"])
         }
 
-        # # 透传数据集名称（若存在）
-        # if "dataset_name" in rlds_batch:
-        #     out["dataset_name"] = rlds_batch["dataset_name"]
+        # 透传数据集标识（若存在）
+        if "dataset_name" in rlds_batch:
+            out["dataset_name"] = rlds_batch["dataset_name"]
+        if "dataset_id" in rlds_batch:
+            out["dataset_id"] = rlds_batch["dataset_id"]
 
         return out
 
@@ -210,7 +226,6 @@ class RLDSBatchTransformLIBERO:
 @dataclass
 class RLDSBatchTransformLatentAction:
     image_transform_lam: Optional[Any] = None
-
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
         轻量化 Transform：仅提取必要的数据供 Collator 批量 VQ 编码。
@@ -228,17 +243,17 @@ class RLDSBatchTransformLatentAction:
         total_frames = len(video)
         assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
-        img = Image.fromarray(video[0])
         out: Dict[str, Any] = {
             "language_instruction": language_instruction,
             "video": video,
-            "img": img,
             "proprio": np.array(rlds_batch["observation"]["proprio"]),
         }
 
-        # # 透传数据集名称（若存在）
-        # if "dataset_name" in rlds_batch:
-        #     out["dataset_name"] = rlds_batch["dataset_name"]
+        # 透传数据集标识（若存在）
+        if "dataset_name" in rlds_batch:
+            out["dataset_name"] = rlds_batch["dataset_name"]
+        if "dataset_id" in rlds_batch:
+            out["dataset_id"] = rlds_batch["dataset_id"]
 
         return out
 
@@ -249,7 +264,7 @@ class RLDSBatchTransformVideo:
     random_resized_crop: bool = True
     scale: tuple = (0.8, 1.0)
     # ratio: tuple = (0.5625, 1.0)
-    ratio: tuple = (0.9, 1.1)
+    ratio: tuple = (0.8, 1.0)    #不要低于1.0，否则会得到细长的图
 
 
 
@@ -259,7 +274,7 @@ class RLDSBatchTransformVideo:
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
         # ---- 获取视频帧 ----
-        video_frames = np.array(rlds_batch["observation"]["image_primary"])  # [T, H, W, C]
+        video_frames = np.array(rlds_batch["observation"]["image_primary"][1:])  # [T, H, W, C]  第0帧是历史帧
         total_frames = len(video_frames)
         assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
@@ -286,7 +301,7 @@ class RLDSBatchTransformVideo:
             )
             dec_video = F.resized_crop(dec_video, i, j, h, w, size=(image_size, image_size))
         
-        proprio = np.array(rlds_batch["observation"]["proprio"])
+        proprio = np.array(rlds_batch["observation"]["proprio"][1:])
 
         # 📦 输出
         result = {
@@ -296,6 +311,10 @@ class RLDSBatchTransformVideo:
             "action": action,
             "proprio": proprio,
         }
+        if "dataset_name" in rlds_batch:
+            result["dataset_name"] = rlds_batch["dataset_name"]
+        if "dataset_id" in rlds_batch:
+            result["dataset_id"] = rlds_batch["dataset_id"]
         return result
 
 
@@ -312,16 +331,16 @@ class RLDSDataset(IterableDataset):
         image_aug: bool = False,
         training_phase: str = 'lam',
         async_prefetch: bool = False,
-        async_prefetch_size: int = 64,
+        async_prefetch_size: int = 128,
         async_transform: bool = False,
-        debug_repeat_batch: bool = False,
+        debug_repeat_batch: Union[bool, int] = False,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
         self.async_prefetch: bool = async_prefetch
         self.async_prefetch_size: int = int(async_prefetch_size)
         self.async_transform: bool = async_transform
-        self.debug_repeat_batch: bool = debug_repeat_batch
+        self.debug_repeat_batch: Union[bool, int] = debug_repeat_batch
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
             mixture_spec = OXE_NAMED_MIXTURES[self.data_mix]
@@ -345,16 +364,19 @@ class RLDSDataset(IterableDataset):
                 future_action_window_size=0,                        # For action chunking
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
+                # Episode-level shuffle: shuffle full trajectories before chunking.
+                # Only effective when train=True inside apply_trajectory_transforms.
+                episode_shuffle_size=2048 if train else 0,
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,
-                num_parallel_calls=8,                          # For CPU-intensive ops (decoding, resizing, etc.)
+                num_parallel_calls=tf.data.AUTOTUNE,                          # For CPU-intensive ops (decoding, resizing, etc.)
             ),
             dataset_kwargs_list=per_dataset_kwargs,
             shuffle_buffer_size=shuffle_buffer_size,
             sample_weights=weights,
             balance_weights=True,
-            traj_transform_threads=len(mixture_spec),
+            traj_transform_threads=32,
             traj_read_threads=len(mixture_spec),
             train=train,
             training_phase=training_phase,
@@ -391,13 +413,17 @@ class RLDSDataset(IterableDataset):
 
     def __iter__(self) -> Dict[str, Any]:
         iterator = self.dataset.as_numpy_iterator()
-        # === 🧠 调试模式：重复返回同一个 batch ===
+        # === 🧠 调试模式：重复返回固定的 k 个样本（k 可配置，默认 1 个样本）===
         if self.debug_repeat_batch:
-            first_batch = next(iterator)
-            first_batch = self.batch_transform(first_batch)
-            print("[RLDSDataset] Debug mode: Repeating the same batch indefinitely.")
+            repeat_k = int(self.debug_repeat_batch) if isinstance(self.debug_repeat_batch, int) else 1
+            repeat_k = max(1, repeat_k)
+            cached_samples = []
+            for _ in range(repeat_k):
+                cached_samples.append(self.batch_transform(next(iterator)))
+            print(f"[RLDSDataset] Debug mode: Repeating {repeat_k} cached sample(s) indefinitely.")
             while True:
-                yield first_batch
+                for sample in cached_samples:
+                    yield sample
             return
         # === 正常模式 ===
         if not self.async_prefetch:
@@ -468,6 +494,8 @@ class RLDSDataset(IterableDataset):
         """返回预计算的数据集长度，考虑分布式训练时的数据分割"""
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             world_size = torch.distributed.get_world_size()
+            # print(world_size)
+            # print(self.dataset_length)
             return int(self.dataset_length // world_size)
         return int(self.dataset_length)
     # === Explicitly Unused ===

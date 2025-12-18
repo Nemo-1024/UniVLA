@@ -80,7 +80,63 @@ class Fixed3DPositionalEncoding(nn.Module):
             x = x.view(x.shape[0], self.T, self.H, self.W, self.embed_dim)
 
         x = x + self.pos_embed.to(x.device)
-        return x
+        return x.reshape(x.shape[0], self.T, -1, self.embed_dim)
+
+
+class Fixed2DPositionalEncoding(nn.Module):
+    """
+    固定尺寸 2D 联合位置编码 (高 + 宽)
+    输入 x: [B, H, W, D] 或 [B, H*W, D]
+    输出: x + pos_embed
+    """
+
+    def __init__(self, embed_dim: int, H: int, W: int, uniform_power: bool = False):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.H, self.W = H, W
+        self.uniform_power = uniform_power
+
+        if not uniform_power:
+            h_dim = embed_dim // 2
+            w_dim = embed_dim - h_dim  # 保证总维度一致
+        else:
+            # 2 个方向 * sin/cos => 4 的倍数
+            h_dim = w_dim = int(math.ceil(embed_dim / 4) * 2)
+
+        # 生成两个方向的编码
+        self.register_buffer("pe_h", self._build_1d_pos_embed(h_dim, H))  # [H, h_dim]
+        self.register_buffer("pe_w", self._build_1d_pos_embed(w_dim, W))  # [W, w_dim]
+
+        # 拼接成最终 embedding
+        pe_h_expand = self.pe_h[:, None, :]          # [H,1,h_dim]
+        pe_w_expand = self.pe_w[None, :, :]          # [1,W,w_dim]
+
+        # pad 使两个方向维度一致
+        pe_h_expand = nn.functional.pad(pe_h_expand, (0, embed_dim - h_dim))
+        pe_w_expand = nn.functional.pad(pe_w_expand, (0, embed_dim - w_dim))
+
+        # 相加形成联合编码
+        self.register_buffer("pos_embed", pe_h_expand + pe_w_expand)  # [H,W,D]
+
+    def _build_1d_pos_embed(self, dim: int, length: int):
+        """生成 1D sin-cos 编码"""
+        position = torch.arange(length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * -(math.log(10000.0) / dim))
+        pe = torch.zeros(length, dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe  # [length, dim]
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, H, W, D] 或 [B, H*W, D]
+        """
+        if x.ndim != 4:
+            # Flattened input [B, H*W, D]
+            x = x.view(x.shape[0], self.H, self.W, self.embed_dim)
+
+        x = x + self.pos_embed.to(x.device)
+        return x.reshape(x.shape[0], -1, self.embed_dim)
 
 def get_3d_sincos_pos_embed(embed_dim, grid_size, grid_depth, cls_token=False, uniform_power=False):
     """

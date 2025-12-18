@@ -1,2 +1,11 @@
-from .load import available_model_names, available_models, get_model_description, load_InternVL, load_vla,freeze_internvl
+from .load import (
+    available_model_names,
+    available_models,
+    get_model_description,
+    load_InternVL,
+    load_vla,
+    freeze_internvl,
+    load_vlm_auto,
+    freeze_vlm_generic,
+)
 from .materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform, get_vlm

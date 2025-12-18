@@ -8,6 +8,8 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_TIMEOUT=1800   # 单位：秒
 
 
+
+
 # 训练参数
 # CONFIG_FILE="config/lam-vjepa_large.yaml"
 # 默认配置文件（当未在命令行通过 --config 指定时使用）

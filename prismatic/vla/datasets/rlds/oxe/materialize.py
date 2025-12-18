@@ -110,7 +110,7 @@ def get_oxe_dataset_kwargs_and_weights(
 
     # Assemble Dataset Config (kwargs) and Weights
     per_dataset_kwargs, sampling_weights = [], []
-    for d_name, d_weight in filtered_mixture_spec:
+    for dataset_id, (d_name, d_weight) in enumerate(filtered_mixture_spec):
         try:
             per_dataset_kwargs.append(
                 make_oxe_dataset_kwargs(
@@ -123,6 +123,8 @@ def get_oxe_dataset_kwargs_and_weights(
                     action_proprio_normalization_type,
                 )
             )
+            # Stable, deterministic id follows the declared order in mixtures.py
+            per_dataset_kwargs[-1]["dataset_id"] = dataset_id
             sampling_weights.append(d_weight)
 
         except ValueError as e:

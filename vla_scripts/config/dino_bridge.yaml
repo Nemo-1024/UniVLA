@@ -2,14 +2,14 @@
 
 # Hugging Face 模型（本地路径或 HF Hub ID）
 model_id: /mnt/mnt/public/jlchen/weights/InternVL3_5-1B-Instruct-HF
-lam_ckpt_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_bridge_bi_cls/version_1/checkpoints/epoch=19.ckpt
-lam_yaml_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_bridge_bi_cls/version_1/dino_bridge.yaml
+lam_ckpt_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_lr1e-4_div001_2q_32_layer_23_aux01_vq_maxrep2_l2_pos/version_5/checkpoints/epoch=11.ckpt
+lam_yaml_path: /mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_lr1e-4_div001_2q_32_layer_23_aux01_vq_maxrep2_l2_pos/version_5/dino_bridge.yaml
 
 # 数据与预处理
 data_mix: bridge_dataset
 shuffle_buffer_size: 10240
 image_resolution: 448
-image_aug: true
+image_aug: false
 
 
 # 冻结策略
@@ -18,9 +18,6 @@ freeze_llm_backbone: false
 freeze_last_llm_layer: false
 freeze_projector: false
 
-# LAM / 动作离散
-vision_model_id: /mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256
-codebook_size: 16
 
 # 训练超参
 epochs: 10

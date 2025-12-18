@@ -79,7 +79,7 @@ def eef_reconstruction_loss(
         gripper_pred, gripper_target, reduction='none'
     )
     # --- 聚合 ---
-    total_loss = pos_ori_loss.mean(dim=-1) + gripper_loss.squeeze(-1)
+    total_loss = pos_ori_loss.mean(dim=-1) + 0.1 * gripper_loss.squeeze(-1)
 
     if reduction == "mean":
         total_loss = total_loss.mean()
@@ -91,4 +91,9 @@ def eef_reconstruction_loss(
         raise ValueError(f"Unsupported reduction: {reduction}")
 
     return total_loss
+
+# Charbonnier loss 定义（避免外部依赖缺失）
+def charbonnier_loss(input: torch.Tensor, target: torch.Tensor, eps: float = 0.1) -> torch.Tensor:
+    diff = input - target
+    return torch.mean(torch.sqrt(diff * diff + eps * eps))
 

@@ -15,6 +15,12 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
         # ("bridge_orig", 1.0),                                   # Original Version of Bridge V2 from Project Website
     ],
 
+    "roboset": [
+        ("roboset", 1.0),
+    ],
+    "agibot": [
+        ("agibot", 1.0),
+    ],
     "droid": [
         ("droid", 1.0),
     ],
@@ -31,23 +37,25 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
         ("bridge_dataset", 1.0),
         ("ego4d", 1.0),
     ],
+
     "lam": [
-        ("libero_10_no_noops", 1.0),
-        ("libero_spatial_no_noops", 1.0),
-        ("libero_object_no_noops", 1.0),
-        ("libero_goal_no_noops", 1.0),
-        ("droid", 0.1),
+        ("libero_90_rlds", 1.0),
+        ("droid", 0.2),
         ("bridge_dataset", 1.0),
+        ("fractal20220817_data", 1.5),
+        ("taco_play", 0.5),
+        ("jaco_play", 0.5),
         ("ego4d", 1.0),
+        ("agibot", 1.0),
     ],
     "lam_plus": [
-        ("libero_90_rlds", 3.0),
-        ("droid", 0.5),
+        ("libero_90_rlds", 1.0),
+        ("droid", 0.2),
         ("bridge_dataset", 1.0),
-        ("kuka", 1.0),
-        ("fractal20220817_data", 1.0),
-        ("taco_play", 1.0),
-        ("jaco_play", 1.0),
+        ("fractal20220817_data", 1.5),
+        ("taco_play", 0.5),
+        ("jaco_play", 0.5),
+        ("ego4d", 1.0),
     ],
     # === Human-data Only ===
     "Ego4D": [ 

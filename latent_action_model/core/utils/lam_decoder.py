@@ -2,18 +2,18 @@ import torch.nn as nn
 import torch
 import math
 from .ac_predictor import VisionTransformerPredictorAC
-
+from .modules import Attn_Crossn_Block
+from .pos_embs import Fixed2DPositionalEncoding
 class LAMDecoder(nn.Module):
     """
     使用 VisionTransformerPredictorAC 作为 backbone 的自回归解码器。
     
     - 支持按时间维度自回归（frame-causal），即第 t 帧仅可看见 <= t 的信息
-    - 要求 z_q 与 f_0 在时间维度对齐：z_q.shape = [B, T, node_dim]，f_0.shape = [B, T, K, input_dim] 或 [B, 1, K, input_dim]
+    - 要求 z_q 与 f_0 在时间维度对齐：z_q.shape = [B, T, context_dim]，f_0.shape = [B, T, K, input_dim] 或 [B, 1, K, input_dim]
     """
     def __init__(
         self,
-        feature_dim,
-        node_dim,
+        context_dim,
         input_dim: int = 1024,
         num_layers: int = 6,
         num_heads: int = 16,
@@ -23,11 +23,11 @@ class LAMDecoder(nn.Module):
         ffn_expansion_factor: int = 2,
         img_size = (256, 256),
         patch_size: int = 16,
+        dataset_vocab_size: int = 16,
     ):
         """
         参数:
-            feature_dim: predictor 的中间通道（predictor_embed_dim）
-            node_dim: z_q 的通道数（动作/状态条件维度）
+            context_dim: predictor 的中间通道（predictor_embed_dim），也是动作/状态条件维度
             input_dim: patch 特征维度（embed_dim）
             num_layers: backbone 深度（Transformer blocks 数量）
             num_heads: 注意力头数
@@ -38,7 +38,7 @@ class LAMDecoder(nn.Module):
             use_rope: 是否启用旋转位置编码
         """
         super().__init__()
-        self.feature_dim = feature_dim
+        self.feature_dim = context_dim
         self.input_dim = input_dim
         self.train_in_latent = train_in_latent
         self.img_size = img_size
@@ -50,7 +50,7 @@ class LAMDecoder(nn.Module):
             patch_size=patch_size,
             num_frames=frame_to_pre,  
             embed_dim=input_dim,
-            predictor_embed_dim=feature_dim,
+            predictor_embed_dim=context_dim,
             depth=num_layers,
             num_heads=num_heads,
             mlp_ratio=4.0,
@@ -67,25 +67,24 @@ class LAMDecoder(nn.Module):
             is_frame_causal=True,
             use_activation_checkpointing=False,
             use_rope=True,
-            action_embed_dim=node_dim,
+            action_embed_dim=context_dim,
         )
 
         # 若需要从 latent 还原到像素（通常不在预训练视觉特征上使用）
         if not train_in_latent:
             self.to_pixel = nn.ConvTranspose2d(input_dim, 3, kernel_size=patch_size, stride=patch_size)
 
-        self.state_predictor = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 4),
-            nn.GELU(),
-            nn.Linear(feature_dim // 4, 8)) # 输出与状态维度对齐
-    def forward(self, features, actions, states):
+        self.state_predictor = StatePredictor(context_dim, dropout=dropout, num_datasets=dataset_vocab_size)
+
+    def forward(self, features, actions, states, dataset_id):
         """
         前向传播（自回归）。
         
         参数:
             features: [B, T, K, input_dim] 或 [B, 1, K, input_dim] 或 [B, K, input_dim]
-            actions: [B, T, node_dim]（默认与 features 在时间维度上对齐）
+            actions: [B, T, context_dim]（默认与 features 在时间维度上对齐）
             states: [B, T, 8]
+            dataset_id: [B] 或 [B, 1]，用于选择对应数据集的可学习嵌入
         返回:
             torch.Tensor:
                 - 若 train_in_latent=True: [B, T, K, input_dim]
@@ -106,7 +105,7 @@ class LAMDecoder(nn.Module):
         # 自回归预测
         y = self.backbone(x, actions=actions, states=states)  # [B, T, 2+H*W, D]
         f_pre = y[:,:,2:,:]
-        s_pre = self.state_predictor(y[:,:,0,:]) # [B, T, 8]
+        s_pre = self.state_predictor(y[:,:,0,:], states, dataset_id) # [B, T, 8]
         return f_pre, s_pre
 
         # # 如需还原到像素空间：对每帧分别映射
@@ -120,30 +119,33 @@ class LAMDecoder_v2(nn.Module):
     """
     通过堆叠多个 DecoderBlock，将动作应用到状态上，以重建下一帧的特征。
     """
-    def __init__(self, feature_dim, node_dim, input_dim: int=1024, num_layers=6, num_heads=16, dropout=0.1, train_in_latent: bool = True, ffn_expansion_factor=2):
+    def __init__(self, context_dim, input_dim: int=1024, num_queries: int=1, num_layers=6, num_heads=16, dropout=0.1, grid_size: int=16, train_in_latent: bool = True, ffn_expansion_factor=2, dataset_vocab_size: int = 16):
         """
         初始化 LAMDecoder。
         
         参数:
-            feature_dim (int): 状态特征 f_t 的维度 (D_feat)。
-            node_dim (int): 动作特征 z_q 的维度 (d)。
+            context_dim (int): 状态/动作特征维度 (D_feat)。
             input_dim (int): 输入特征的维度 (D_feat)。
             num_layers (int): DecoderBlock 的堆叠层数。
             num_heads (int): 每个注意力模块的头数。
         """
         super().__init__()
-        self.feature_dim = feature_dim
+        self.feature_dim = context_dim
         self.input_dim = input_dim
         self.train_in_latent = train_in_latent
+            
         # 解码层
         # self.dec_layers = nn.ModuleList([
         #     CrossAttentionBlock(feature_dim, num_heads=num_heads, ffn_ratio=4, dropout=dropout) 
         #     for _ in range(num_layers)
         # ])
-        self.dec_layers = nn.ModuleList([nn.TransformerEncoderLayer(feature_dim, num_heads, dim_feedforward=int(feature_dim*ffn_expansion_factor), dropout=dropout, batch_first=True, norm_first=True) for _ in range(num_layers)])
-        # 简化query投影：去除冗余的第二层
-        self.project_query = nn.Linear(node_dim, feature_dim)
-        self.state_predictor = StatePredictor(node_dim, dropout=dropout)
+        self.num_queries = num_queries
+        # if self.num_queries == 1:
+        self.dec_layers = nn.ModuleList([nn.TransformerEncoderLayer(context_dim, num_heads, dim_feedforward=int(context_dim*ffn_expansion_factor), dropout=dropout, batch_first=True, norm_first=True) for _ in range(num_layers)])
+        # else:
+            # self.dec_layers = nn.ModuleList([Attn_Crossn_Block(feature_dim, num_heads=num_heads, ffn_expansion_factor=ffn_expansion_factor, dropout=dropout) for _ in range(num_layers)])
+        self.state_predictor = StatePredictor(context_dim, dropout=dropout, num_datasets=dataset_vocab_size)
+        self.pos_embed = Fixed2DPositionalEncoding(context_dim, grid_size, grid_size)
         # # Query self-attention增强
         # self.query_attn = nn.MultiheadAttention(
         #     embed_dim=feature_dim,
@@ -153,16 +155,16 @@ class LAMDecoder_v2(nn.Module):
         # )
         
         # 简化输入输出投影，避免冗余
-        if input_dim == feature_dim:
+        if input_dim == context_dim:
             self.project_input = nn.Identity()
             self.project_output = nn.Identity()
         else:
-            self.project_input = nn.Linear(input_dim, feature_dim)
-            self.project_output = nn.Linear(feature_dim, input_dim)
+            self.project_input = nn.Linear(input_dim, context_dim)
+            self.project_output = nn.Linear(context_dim, input_dim)
         if not train_in_latent:
             self.to_pixel = nn.ConvTranspose2d(input_dim, 3, kernel_size=16, stride=16)
         
-    def forward(self, features, actions, states):
+    def forward(self, features, actions, states, dataset_id):
         """
         前向传播。
         
@@ -170,27 +172,36 @@ class LAMDecoder_v2(nn.Module):
             features (torch.Tensor): 初始帧的特征，形状 [B, 1, K, input_dim]。
             actions (torch.Tensor): VQ量化后的动作code，形状 [B, 1, node_dim]。
             states (torch.Tensor): 初始状态，形状 [B, 1, 8]。
+            dataset_id (torch.Tensor): [B] 或 [B,1]，选择数据集特定的嵌入。
             
         返回:
             torch.Tensor: 重建的最后一帧特征 f_hat_T，形状 [B, 1, K, input_dim]。
         """
         # 投影query并使用self-attention增强
-        actions_tokens = self.project_query(actions)  # [B, 1, feature_dim]
+        actions_tokens = actions  # [B, 1, feature_dim]
         
         # 投影输入特征（只调用一次，避免冗余）
         features_tokens = self.project_input(features)  # [B, 1, K, feature_dim] 或 [B, K, feature_dim]
+
         if features_tokens.dim() == 4:
             # 将单帧时间维压缩，Transformer 期望 3D: [B, S, E]
             features_tokens = features_tokens.squeeze(1)  # [B, K, feature_dim]
-        # 将动作条件加到每个空间token上，自动在K维广播
-        x = features_tokens + actions_tokens  # [B, K, feature_dim]
-        # 通过解码层堆叠
-        for layer in self.dec_layers:
-            x = layer(x)
-        
+        features_tokens = self.pos_embed(features_tokens)
+        if self.num_queries == 1:
+            # 将动作条件加到每个空间token上，自动在K维广播
+            x = features_tokens + actions_tokens  # [B, K, feature_dim]
+            # x = torch.cat([features_tokens, actions_tokens], dim=1)
+            # 通过解码层堆叠
+            for layer in self.dec_layers:
+                x = layer(x)
+        else:
+            x = torch.cat([features_tokens, actions_tokens], dim=1)
+            # x = features_tokens
+            for layer in self.dec_layers:
+                x = layer(x)
         # 输出投影
-        reconstructed_features = self.project_output(x)  # [B, K, input_dim]
-        s_pre = self.state_predictor(actions, states)
+        reconstructed_features = self.project_output(x[:, :features_tokens.shape[1]])  # [B, K, input_dim]
+        s_pre = self.state_predictor(actions, states, dataset_id)
 
         # 统一返回形状为 [B, 1, K, *]
         if not self.train_in_latent:
@@ -200,6 +211,7 @@ class LAMDecoder_v2(nn.Module):
             return rec_img.unsqueeze(1), s_pre  # [B, 1, 3, H, W], [B, 8]
         else:
             return reconstructed_features.unsqueeze(1), s_pre  # [B, 1, K, input_dim], [B, 8]
+
 
 class StatePredictor(nn.Module):
     """
@@ -215,11 +227,13 @@ class StatePredictor(nn.Module):
         s_pred: [B, 1, 8]  (与目标状态对应)
     """
 
-    def __init__(self, latent_dim: int, dropout: float = 0.1):
+    def __init__(self, latent_dim: int, dropout: float = 0.1, num_datasets: int = 16):
         super().__init__()
 
         # 归一化层
         self.norm = nn.LayerNorm(latent_dim)
+        # 数据集可学习嵌入
+        self.dataset_embed = nn.Embedding(num_datasets, latent_dim)
 
         # 注意力层
         self.attn = nn.TransformerEncoderLayer(
@@ -231,7 +245,7 @@ class StatePredictor(nn.Module):
 
         # 将 state_0 投射到相同潜空间
         self.proj_state = nn.Linear(1, latent_dim)
-
+        self.proj_code = nn.Linear(latent_dim, latent_dim)
         # 聚合潜动作特征与状态
         self.global_aggregator = nn.Sequential(
             nn.Linear(latent_dim, latent_dim // 4),
@@ -239,31 +253,38 @@ class StatePredictor(nn.Module):
             nn.Linear(latent_dim // 4, 1),  # 输出与状态维度对齐
         )
 
-    def forward(self, z_t: torch.Tensor, state_0: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_t: torch.Tensor, state_0: torch.Tensor, dataset_id: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         
         Args:
             z_t: [B, num_queries, latent_dim]
             state_0: [B, 1, 8]
+            dataset_id: [B] 或 [B,1]，用于选择对应数据集的嵌入
         Returns:
             s_pred: [B, 1, 8]
         """
+        if dataset_id is None:
+            raise ValueError("dataset_id 不能为空")
         B = state_0.size(0)
+        dataset_id = dataset_id.view(B).long()
         if state_0.dim() == 3:
             state_0 = state_0.squeeze(1)
         # 1️⃣ 将 state_0 投射并加入上下文
         state_embed = self.proj_state(state_0.unsqueeze(-1))  # [B, 8, latent_dim]
+        z_t = self.proj_code(z_t)
+        ds_token = self.dataset_embed(dataset_id).unsqueeze(1)  # [B, 1, latent_dim]
 
-        # 2️⃣ 拼接潜动作 + 状态
+        # 2️⃣ 拼接潜动作 + 状态 + 数据集嵌入
         z_cat = torch.cat([z_t, state_embed], dim=1)  # [B, num_queries + 8, latent_dim]
+        z_cat = z_cat + ds_token
         z_cat = self.norm(z_cat)
 
         # 3️⃣ 自注意力聚合潜动作
         z_cat = self.attn(z_cat)
 
-        # 4️⃣ 使用状态token的输出进行预测
-        state_token = z_cat[:, z_t.shape[1]:, :]  # [B, 8, latent_dim]
+        # 4️⃣ 使用状态 token 的输出进行预测（保留状态位，dataset token 仅作为上下文）
+        state_token = z_cat[:, -state_embed.shape[1]:, :]  # [B, 8, latent_dim]
 
         # 5️⃣ 输出预测状态
         s_pred = self.global_aggregator(state_token).squeeze(-1)  # [B, 8]

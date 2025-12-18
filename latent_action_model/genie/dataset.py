@@ -96,6 +96,7 @@ class LightningDataset(LightningDataModule):
             # shuffle=self.train_shuffle,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
+            pin_memory=True,
             worker_init_fn=worker_init_fn
         )
 
@@ -111,6 +112,7 @@ class LightningDataset(LightningDataModule):
             # shuffle=self.val_shuffle,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
+            pin_memory=True,
             worker_init_fn=worker_init_fn
         )
 
@@ -126,6 +128,7 @@ class LightningDataset(LightningDataModule):
             # shuffle=self.val_shuffle,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
+            pin_memory=True,
             worker_init_fn=worker_init_fn
         )
 
@@ -183,6 +186,7 @@ class LightningOpenX(LightningDataset):
             shuffle_buffer_size: int = 100_000,
             image_aug:bool = False,
             debug_repeat_batch: bool = False,
+            training_phase: str = 'lam',
             **kwargs
     ) -> None:
         super(LightningOpenX, self).__init__(batch_size=batch_size, **kwargs)
@@ -199,7 +203,7 @@ class LightningOpenX(LightningDataset):
         self.debug_repeat_batch = debug_repeat_batch
         self.num_workers = 0    # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
         self.worker_init_fn = set_global_seed(42, get_worker_init_fn=True)
-
+        self.training_phase = training_phase
         self.batch_transform = RLDSBatchTransformVideo() # center crop现在在RLDS阶段处理 # totensor已经在此函数内部实现，无需重复
         # self.batch_transform = RLDSBatchTransformVideo(
         #     image_transform= transforms.Compose([transforms.ToTensor(),])  # center crop现在在RLDS阶段处理
@@ -219,7 +223,7 @@ class LightningOpenX(LightningDataset):
                 shuffle_buffer_size=self.shuffle_buffer_size,
                 train=True,
                 image_aug=self.image_aug,
-                training_phase='lam',
+                training_phase=self.training_phase,
                 async_transform=True,
                 async_prefetch=True,
                 async_prefetch_size=128,
@@ -233,7 +237,7 @@ class LightningOpenX(LightningDataset):
                 shuffle_buffer_size=self.shuffle_buffer_size,
                 train=False,
                 image_aug=False,
-                training_phase='lam',
+                training_phase=self.training_phase,
                 async_transform=True,
                 async_prefetch=True,
                 async_prefetch_size=128,
@@ -247,7 +251,7 @@ class LightningOpenX(LightningDataset):
                 shuffle_buffer_size=self.shuffle_buffer_size,
                 train=True,
                 image_aug=False,
-                training_phase='lam',
+                training_phase=self.training_phase,
                 async_transform=True,
                 async_prefetch=True,
                 async_prefetch_size=128,
