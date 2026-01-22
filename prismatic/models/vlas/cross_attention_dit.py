@@ -165,11 +165,13 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
+        # diffusers.Attention 不直接接受 encoder_attention_mask；在交叉注意力时将其传入 attention_mask
+        attn_mask = encoder_attention_mask if encoder_hidden_states is not None else attention_mask
+
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
-            # encoder_attention_mask=encoder_attention_mask,
+            attention_mask=attn_mask,
         )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)
@@ -220,9 +222,9 @@ class DiT(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = False
 
         # Timestep encoder
-        self.timestep_encoder = TimestepEncoder(
-            embedding_dim=self.inner_dim, compute_dtype=self.config.compute_dtype
-        )
+        # NOTE: eval/加载旧权重时 config 里可能没有 compute_dtype，做兼容
+        compute_dtype = getattr(self.config, "compute_dtype", torch.float32)
+        self.timestep_encoder = TimestepEncoder(embedding_dim=self.inner_dim, compute_dtype=compute_dtype)
 
         all_blocks = []
         for idx in range(self.config.num_layers):
@@ -295,7 +297,7 @@ class DiT(ModelMixin, ConfigMixin):
                     hidden_states,
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=None,
+                    encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                 )
             all_hidden_states.append(hidden_states)
@@ -377,3 +379,83 @@ class SelfAttentionTransformer(ModelMixin, ConfigMixin):
             return hidden_states, all_hidden_states
         else:
             return hidden_states
+
+
+class AlternateVLDiT(DiT):
+    """
+    交替视觉-语言 DiT，在交叉注意力时分别关注视觉特征和VLM特征
+    参照 NVIDIA Isaac-GR00T 实现
+    """
+    def __init__(self, *args, attend_text_every_n_blocks: int = 2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.attend_text_every_n_blocks = attend_text_every_n_blocks
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # Shape: (B, T, D)
+        encoder_hidden_states: torch.Tensor,  # Shape: (B, S, D)
+        timestep: Optional[torch.LongTensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        return_all_hidden_states: bool = False,
+        image_mask: Optional[torch.Tensor] = None,  # 新增：标识视觉tokens
+        vlm_mask: Optional[torch.Tensor] = None,    # 新增：标识VLM tokens
+    ):
+        assert image_mask is not None and vlm_mask is not None, \
+            "AlternateVLDiT requires image_mask and vlm_mask"
+        
+        # 编码时间步
+        temb = self.timestep_encoder(timestep)
+        
+        hidden_states = hidden_states.contiguous()
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+        
+        all_hidden_states = [hidden_states]
+        
+        # 遍历 transformer blocks
+        for idx, block in enumerate(self.transformer_blocks):
+            if idx % 2 == 1 and self.config.interleave_self_attention:
+                # 自注意力块
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=None,
+                    encoder_hidden_states=None,
+                    encoder_attention_mask=None,
+                    temb=temb,
+                )
+            else:
+                # 交叉注意力块：交替关注视觉和VLM特征
+                # 需求：最底层先关注 VLM，再关注视觉
+                if idx % (2 * self.attend_text_every_n_blocks) == 0:
+                    # 关注 VLM 特征，需要结合 padding mask
+                    region_mask = vlm_mask
+                else:
+                    # 关注视觉特征（h_t + h_t1_star）
+                    region_mask = image_mask
+                
+                # 将区域选择 mask 与 padding mask 结合
+                # encoder_attention_mask: [B, seq_len]，1=有效，0=padding
+                # region_mask: [B, seq_len]，True=关注该区域
+                if encoder_attention_mask is not None:
+                    # 结合：只关注该区域内的有效（非 padding）位置
+                    curr_encoder_attention_mask = region_mask & encoder_attention_mask.bool()
+                else:
+                    curr_encoder_attention_mask = region_mask
+                
+                hidden_states = block(
+                    hidden_states,
+                    attention_mask=None,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=curr_encoder_attention_mask,
+                    temb=temb,
+                )
+            all_hidden_states.append(hidden_states)
+        
+        # 输出处理
+        conditioning = temb
+        shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
+        hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
+        
+        if return_all_hidden_states:
+            return self.proj_out_2(hidden_states), all_hidden_states
+        else:
+            return self.proj_out_2(hidden_states)

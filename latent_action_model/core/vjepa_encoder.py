@@ -144,8 +144,17 @@ class DINOv3Encoder(nn.Module):
         else:
             self.latent_norms = None
 
+    def train(self, mode: bool = True):
+        """
+        始终保持 DINO 及其内部归一化层在 eval 模式，防止 Lightning
+        在训练循环中切换回 train() 影响统计量。
+        """
+        super().train(False)
+        self.model.eval()
+        return self
+
     @torch.no_grad()
-    def encode(self, images: torch.Tensor, remove_cls: bool = True, n: Union[int, Sequence] = [4, 11, 17, -1] ) -> torch.Tensor:
+    def encode(self, images: torch.Tensor, remove_cls: bool = True, n: Union[int, Sequence] = -2 ) -> torch.Tensor:
         """
         输入：[B, T, C, H, W]
         输出：[B, T, K, D]
@@ -353,22 +362,22 @@ def build_vision_encoder(model_id: str, num_latent_layers: int = 1, norm_layer_t
     key = model_id.lower()
     if "dinov3-vitl16" in key:
         return DINOv3Encoder(
-            model_id="/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m",
+            model_id="/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m",
             num_latent_layers=num_latent_layers,
             norm_layer_type=norm_layer_type,
             enable_norm=enable_norm,
         ), 1024
     elif "dinov3-vitb16" in key:
         return DINOv3Encoder(
-            model_id="/mnt/mnt/public/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m",
+            model_id="/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m",
             num_latent_layers=num_latent_layers,
             norm_layer_type=norm_layer_type,
             enable_norm=enable_norm,
         ), 768
     elif "vjepa" in key or "jepa" in key:
-        return VJEPAEncoder(model_id="/mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256"), 1024
+        return VJEPAEncoder(model_id="/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"), 1024
     elif "cosmos" in key:
-        return CosmosAutoencoder(model_id="/mnt/mnt/public/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"), 16
+        return CosmosAutoencoder(model_id="/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"), 16
 
     else:
         print(f"未使用预训练模型，采用PatchEmbed编码器")

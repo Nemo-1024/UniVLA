@@ -144,7 +144,6 @@ class LAMDecoder_v2(nn.Module):
         self.dec_layers = nn.ModuleList([nn.TransformerEncoderLayer(context_dim, num_heads, dim_feedforward=int(context_dim*ffn_expansion_factor), dropout=dropout, batch_first=True, norm_first=True) for _ in range(num_layers)])
         # else:
             # self.dec_layers = nn.ModuleList([Attn_Crossn_Block(feature_dim, num_heads=num_heads, ffn_expansion_factor=ffn_expansion_factor, dropout=dropout) for _ in range(num_layers)])
-        self.state_predictor = StatePredictor(context_dim, dropout=dropout, num_datasets=dataset_vocab_size)
         self.pos_embed = Fixed2DPositionalEncoding(context_dim, grid_size, grid_size)
         # # Query self-attention增强
         # self.query_attn = nn.MultiheadAttention(
@@ -164,7 +163,7 @@ class LAMDecoder_v2(nn.Module):
         if not train_in_latent:
             self.to_pixel = nn.ConvTranspose2d(input_dim, 3, kernel_size=16, stride=16)
         
-    def forward(self, features, actions, states, dataset_id):
+    def forward(self, features, actions):
         """
         前向传播。
         
@@ -187,7 +186,7 @@ class LAMDecoder_v2(nn.Module):
             # 将单帧时间维压缩，Transformer 期望 3D: [B, S, E]
             features_tokens = features_tokens.squeeze(1)  # [B, K, feature_dim]
         features_tokens = self.pos_embed(features_tokens)
-        if self.num_queries == 1:
+        if actions_tokens.shape[1] == 1:
             # 将动作条件加到每个空间token上，自动在K维广播
             x = features_tokens + actions_tokens  # [B, K, feature_dim]
             # x = torch.cat([features_tokens, actions_tokens], dim=1)
@@ -201,56 +200,43 @@ class LAMDecoder_v2(nn.Module):
                 x = layer(x)
         # 输出投影
         reconstructed_features = self.project_output(x[:, :features_tokens.shape[1]])  # [B, K, input_dim]
-        s_pre = self.state_predictor(actions, states, dataset_id)
-
         # 统一返回形状为 [B, 1, K, *]
         if not self.train_in_latent:
             B, K, D = reconstructed_features.shape
             h = w = int(K ** 0.5)
             rec_img = self.to_pixel(reconstructed_features.transpose(1, 2).reshape(B, D, h, w))  # [B, 3, H, W]
-            return rec_img.unsqueeze(1), s_pre  # [B, 1, 3, H, W], [B, 8]
+            return rec_img.unsqueeze(1)  # [B, 1, 3, H, W]
         else:
-            return reconstructed_features.unsqueeze(1), s_pre  # [B, 1, K, input_dim], [B, 8]
+            return reconstructed_features.unsqueeze(1)  # [B, 1, K, input_dim]
 
 
 class StatePredictor(nn.Module):
     """
     物理接地末端执行器状态预测器 (Physical Grounding State Predictor)
-    
-    将潜动作向量 z_t 与初始状态 state_0 融合，通过注意力机制预测下一时刻的 EEF 状态。
-    输出直接对应于 eef_reconstruction_loss 所需的 s_pred（绝对状态）。
-    
+
+    对潜动作序列在 query 维度做均值池化并映射，与 state 的最后一维映射值
+    以及数据集 token 拼接后，经 MLP 预测下一时刻的 EEF 状态。
+
     输入:
         z_t: [B, num_queries, latent_dim]
-        state_0: [B, 1,8]
+        state_0: [B, 1, 8]
     输出:
-        s_pred: [B, 1, 8]  (与目标状态对应)
+        s_pred: [B, 8]  (与目标状态对应)
     """
 
-    def __init__(self, latent_dim: int, dropout: float = 0.1, num_datasets: int = 16):
+    def __init__(self, latent_dim: int, dropout: float = 0.1, num_datasets: int = 16, num_queries: int = 1, state_dim: int = 8):
         super().__init__()
-
-        # 归一化层
-        self.norm = nn.LayerNorm(latent_dim)
-        # 数据集可学习嵌入
         self.dataset_embed = nn.Embedding(num_datasets, latent_dim)
-
-        # 注意力层
-        self.attn = nn.TransformerEncoderLayer(
-            d_model=latent_dim,
-            nhead=8,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        # 将 state_0 投射到相同潜空间
-        self.proj_state = nn.Linear(1, latent_dim)
-        self.proj_code = nn.Linear(latent_dim, latent_dim)
-        # 聚合潜动作特征与状态
-        self.global_aggregator = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 4),
+        # 对 query 进行均值池化后的线性映射
+        self.z_proj = nn.Linear(latent_dim, latent_dim)
+        # 对完整 state 做线性映射
+        self.state_proj = nn.Linear(state_dim, latent_dim)
+        # MLP 预测最终状态
+        self.mlp = nn.Sequential(
+            # nn.LayerNorm(latent_dim * 2),
+            nn.Linear(latent_dim * 2, latent_dim),
             nn.GELU(),
-            nn.Linear(latent_dim // 4, 1),  # 输出与状态维度对齐
+            nn.Linear(latent_dim, 8),
         )
 
     def forward(self, z_t: torch.Tensor, state_0: torch.Tensor, dataset_id: torch.Tensor) -> torch.Tensor:
@@ -262,7 +248,7 @@ class StatePredictor(nn.Module):
             state_0: [B, 1, 8]
             dataset_id: [B] 或 [B,1]，用于选择对应数据集的嵌入
         Returns:
-            s_pred: [B, 1, 8]
+            s_pred: [B, 8]
         """
         if dataset_id is None:
             raise ValueError("dataset_id 不能为空")
@@ -270,28 +256,17 @@ class StatePredictor(nn.Module):
         dataset_id = dataset_id.view(B).long()
         if state_0.dim() == 3:
             state_0 = state_0.squeeze(1)
-        # 1️⃣ 将 state_0 投射并加入上下文
-        state_embed = self.proj_state(state_0.unsqueeze(-1))  # [B, 8, latent_dim]
-        z_t = self.proj_code(z_t)
-        ds_token = self.dataset_embed(dataset_id).unsqueeze(1)  # [B, 1, latent_dim]
-
-        # 2️⃣ 拼接潜动作 + 状态 + 数据集嵌入
-        z_cat = torch.cat([z_t, state_embed], dim=1)  # [B, num_queries + 8, latent_dim]
-        z_cat = z_cat + ds_token
-        z_cat = self.norm(z_cat)
-
-        # 3️⃣ 自注意力聚合潜动作
-        z_cat = self.attn(z_cat)
-
-        # 4️⃣ 使用状态 token 的输出进行预测（保留状态位，dataset token 仅作为上下文）
-        state_token = z_cat[:, -state_embed.shape[1]:, :]  # [B, 8, latent_dim]
-
-        # 5️⃣ 输出预测状态
-        s_pred = self.global_aggregator(state_token).squeeze(-1)  # [B, 8]
-
-        # 6️⃣ 对输出范围做约束（仅作用于前 7 个连续维度）
-        s_pred = torch.cat([torch.tanh(s_pred[..., :-1]), s_pred[..., -1:]], dim=-1)
-
-        # gripper 最后一维保持原始 logit，方便 BCEWithLogits
+        # 1️⃣ 对 query 在第二维求均值并线性映射
+        z_mean = z_t.mean(dim=1)
+        z_embed = self.z_proj(z_mean)  # [B, latent_dim]
+        # 2️⃣ 对完整 state 做线性映射
+        state_full = state_0.contiguous()
+        state_embed = self.state_proj(state_full)  # [B, latent_dim]
+        # 3️⃣ 拼接 dataset token 并送入 MLP
+        ds_token = self.dataset_embed(dataset_id)  # [B, latent_dim]
+        fused = torch.cat([z_embed+ ds_token, state_embed], dim=-1)   # [B, latent_dim*2]
+        s_pred = self.mlp(fused)  # [B, 8]
+        # 4️⃣ 对连续维度做范围约束
+        s_pred = torch.tanh(s_pred)
 
         return s_pred

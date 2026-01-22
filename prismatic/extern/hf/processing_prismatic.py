@@ -264,11 +264,11 @@ IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
-def _bounds_q99_denorm(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
+def _bounds_denorm(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
     return (x + 1.0) * 0.5 * (high - low) + low
 
 
-def _bounds_q99_norm(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+def _bounds_norm(x: torch.Tensor, low: torch.Tensor, high: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
     eps = 1e-8
     x_norm = 2.0 * (x - low) / (high - low + eps) - 1.0
     x_norm = torch.clamp(x_norm, -1.0, 1.0)
@@ -288,26 +288,26 @@ class LatentVLAProcessor(ProcessorMixin):
         image_processor: Optional[ImageProcessingMixin] = None,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         *,
-        jepa_image_resolution: int = 256,
+        lam_image_resolution: int = 256,
         dataset_statistics_path: Optional[Union[str, os.PathLike]] = None,
         norm_stats: Optional[Dict[str, Any]] = None,
         base_processor: Optional[Any] = None,
     ) -> None:
         super().__init__(image_processor, tokenizer)
-        self.jepa_image_resolution = int(jepa_image_resolution)
+        self.lam_image_resolution = int(lam_image_resolution)
         self.norm_stats = norm_stats
         # 保存 InternVL 的完整 Processor，用于 apply_chat_template 以正确处理图像与文本
         self.base_processor = base_processor
-        self.jepa_transform = T.Compose(
+        self.lam_image_transform = T.Compose(
             [
-                T.Resize((self.jepa_image_resolution, self.jepa_image_resolution)),
+                T.Resize((self.lam_image_resolution, self.lam_image_resolution)),
                 T.ToTensor(),
                 T.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
             ]
         )
 
     @classmethod
-    def from_internvl_processor(
+    def from_vlm_processor(
         cls,
         base_processor: Any,
         dataset_statistics_path: Union[str, os.PathLike] = None,
@@ -324,44 +324,80 @@ class LatentVLAProcessor(ProcessorMixin):
             norm_stats=norm_stats,
         )
 
-    def _extract_first_image(self, messages: Any) -> Optional[Image.Image]:
+    def _extract_last_image(self, messages: Any) -> Optional[Image.Image]:
+        """
+        提取 messages 中的最后一张图像（当前帧），用于 LAM 输入。
+        
+        训练时的逻辑：
+        - VLM 看到：[video[0], video[1]] = [历史帧, 当前帧]
+        - LAM 使用：video[1:] = [当前帧, ...]
+        
+        因此推理时需要提取最后一张图像（当前帧）用于 LAM。
+        """
         try:
+            last_image = None
             for turn in messages:
                 if turn.get("role") == "user" and isinstance(turn.get("content"), list):
                     for c in turn["content"]:
                         if isinstance(c, dict) and c.get("type") == "image":
                             img = c.get("image")
-                            return img.convert("RGB") if isinstance(img, Image.Image) else None
+                            if isinstance(img, Image.Image):
+                                last_image = img
+            return last_image.convert("RGB") if last_image is not None else None
         except Exception:
             return None
-        return None
 
     def build_vla_features(
         self,
         *,
         messages: List[Dict[str, Any]],
+        observation: Image.Image,
         proprio: Union[np.ndarray, torch.Tensor],
         unnorm_key: Optional[str],
         return_tensors: Optional[Union[str, TensorType]] = TensorType.PYTORCH,
     ) -> BatchFeature:
+        """
+        构建 VLA 推理所需的特征。
+        
+        Args:
+            messages: 包含图像和文本的消息列表
+                当 use_history_frame=True 时：包含 [历史帧, 当前帧] 两张图像
+                当 use_history_frame=False 时：只包含 [当前帧] 一张图像
+            proprio: 本体感受信息（关节位置、夹爪状态等）
+            unnorm_key: 数据集键，用于查找归一化/反归一化参数
+            return_tensors: 返回张量类型
+            
+        Returns:
+            BatchFeature 包含：
+                - pixel_values: VLM 的图像输入（处理所有图像）
+                - input_ids: 文本 token IDs
+                - lam_image: LAM 的图像输入（提取最后一张图像，即当前帧）
+                - proprio: 归一化后的本体感受信息
+        """
         if self.base_processor is None or self.norm_stats is None:
             raise ValueError("LatentVLAProcessor.base_processor or norm_stats is not set. ")
 
+        # 如果消息中已经包含 assistant 的回复，则不需要 add_generation_prompt
+        # 训练时：messages 包含 assistant 回复（带 <ACT_PH>），add_generation_prompt=False
+        # 推理时（旧代码）：messages 只有 user，add_generation_prompt=True
+        # 推理时（新代码）：messages 包含 assistant 回复（带 <ACT_PH>），add_generation_prompt=False
+        has_assistant_reply = any(msg.get("role") == "assistant" for msg in messages)
+        
         inputs = self.base_processor.apply_chat_template(
             messages,
             tokenize=True,
-            add_generation_prompt=True,
+            add_generation_prompt=not has_assistant_reply,
             return_tensors=return_tensors,
             return_dict=True,
         )
 
         pixel_values = inputs["pixel_values"]
         input_ids = inputs["input_ids"]
+        # 获取 image_grid_thw（Qwen3 VL 需要）
+        image_grid_thw = getattr(inputs, "image_grid_thw", None)
 
-        img = self._extract_first_image(messages)
-        if img is None:
-            raise ValueError("messages must include at least one image in the user content.")
-        image_4_jepa = self.jepa_transform(img).unsqueeze(0)
+        # LAM 的输入：当前帧经过 transform
+        lam_image = self.lam_image_transform(observation)  # [C, H, W]
 
         prop_t = torch.as_tensor(proprio)
         if prop_t.dim() == 2:
@@ -374,7 +410,7 @@ class LatentVLAProcessor(ProcessorMixin):
                 high = torch.as_tensor(pstats.get("q99", pstats.get("max")))
                 mask_np = pstats.get("mask", np.ones_like(pstats.get("min", []))) if "min" in pstats else None
                 mask = torch.as_tensor(mask_np) if mask_np is not None else None
-                prop_t = _bounds_q99_norm(prop_t, low, high, mask)
+                prop_t = _bounds_norm(prop_t, low, high, mask)
 
         # Ensure batch dimension alignment with tokenizer outputs
         # Determine batch size from input_ids (HF returns Tensor of shape [B, L])
@@ -383,31 +419,49 @@ class LatentVLAProcessor(ProcessorMixin):
         if prop_t.dim() == 1:
             prop_t = prop_t.unsqueeze(0)
 
-        # Make sure image_4_jepa has shape [B, C, H, W]
-        if image_4_jepa.dim() == 3:
-            image_4_jepa = image_4_jepa.unsqueeze(0)
+        # Make sure lam_image has shape [B, C, H, W]
+        if lam_image.dim() == 3:
+            lam_image = lam_image.unsqueeze(0)
 
 
         data = {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
-            "image_4_jepa": image_4_jepa,
+            "lam_image": lam_image,
             "proprio": prop_t,
         }
+        # 仅在可用时返回 image_grid_thw（Qwen3 VL 需要）
+        if image_grid_thw is not None:
+            data["image_grid_thw"] = image_grid_thw
         return BatchFeature(data=data, tensor_type=return_tensors)
 
-    def postprocess_actions(self, actions_norm: torch.Tensor, *, unnorm_key: str, clip_to_min_max: bool = False) -> torch.Tensor:
+    def postprocess_actions(
+        self,
+        actions_norm: torch.Tensor,
+        *,
+        unnorm_key: str,
+        clip_to_min_max: bool = True,
+        bounds_mode: str = "q99",
+    ) -> torch.Tensor:
         if self.norm_stats is None or unnorm_key not in self.norm_stats:
             raise ValueError(f"self.norm_stats is None or unnorm_key not in self.norm_stats")
         astats = self.norm_stats[unnorm_key].get("action", None)
         if astats is None:
             raise ValueError(f"astats is None, unnorm_key: {unnorm_key}")
-        low = torch.as_tensor(astats.get("q01", astats.get("min")), dtype=actions_norm.dtype, device=actions_norm.device)
-        high = torch.as_tensor(astats.get("q99", astats.get("max")), dtype=actions_norm.dtype, device=actions_norm.device)
+        if bounds_mode == "q99":
+            low_key, high_key = "q01", "q99"
+        elif bounds_mode == "min_max":
+            low_key, high_key = "min", "max"
+        else:
+            raise ValueError(f"Invalid bounds_mode: {bounds_mode}. Use 'q99' or 'min_max'.")
+        low = torch.as_tensor(astats.get(low_key, astats.get("min")), dtype=actions_norm.dtype, device=actions_norm.device)
+        high = torch.as_tensor(astats.get(high_key, astats.get("max")), dtype=actions_norm.dtype, device=actions_norm.device)
         while low.dim() < actions_norm.dim():
             low = low.unsqueeze(0)
             high = high.unsqueeze(0)
-        denormed = _bounds_q99_denorm(actions_norm, low, high)
+
+        # actions_norm = torch.clamp(actions_norm, -1.0, 1.0)
+        denormed = _bounds_denorm(actions_norm, low, high)
         if clip_to_min_max:
             mn = torch.as_tensor(astats.get("min", low), dtype=actions_norm.dtype, device=actions_norm.device)
             mx = torch.as_tensor(astats.get("max", high), dtype=actions_norm.dtype, device=actions_norm.device)
@@ -424,6 +478,7 @@ class LatentVLAProcessor(ProcessorMixin):
                 mask = mask.unsqueeze(0)
             actions = torch.where(mask, denormed, actions_norm)
         else:
+            print(f"mask_np is None !!!!!")
             actions = denormed
         return actions
 

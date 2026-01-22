@@ -11,10 +11,10 @@
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
-  vision_model_id: "/mnt/mnt/public/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256"
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
   dim: 768                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
   enc_layers: 12               # LAM 编码器层数 16head
   ffn_expansion_factor: 3
@@ -22,7 +22,7 @@ model:
   codebook_size: 32        # 码本大小
   code_dim: 64                # 码本维度
   ar_prediction: false
-  num_queries: 2
+  num_queries: 4
   num_frames: 2
   dec_layers: 12                # 解码器层数
   dropout: 0.0                 # Dropout 率              
@@ -73,7 +73,7 @@ model:
 
 # 数据参数
 data:
-  data_root: /mnt/mnt/public/jlchen/datasets
+  data_root: /mnt/project_rlinf/jlchen/datasets
   data_mix: lam_plus   # Manip. + Navi. + Human
   batch_size: 128
   resolution: 256            #dino是256

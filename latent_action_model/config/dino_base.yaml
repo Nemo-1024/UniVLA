@@ -11,18 +11,18 @@
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
-  vision_model_id: "/mnt/mnt/public/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256"
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
   dim: 768                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
   enc_layers: 12               # LAM 编码器层数 16head
   ffn_expansion_factor: 3
 
-  codebook_size: 32        # 码本大小
+  codebook_size: 16        # 码本大小
   code_dim: 64                # 码本维度
   ar_prediction: false
-  num_queries: 4
+  num_queries: 2
   num_frames: 2
   dec_layers: 12                # 解码器层数
   dropout: 0.0                 # Dropout 率              
@@ -30,11 +30,11 @@ model:
   enc_add_state: false
   enc_modal_mask: true
   lambda_aux: 0.3                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
-  loss_type: "l1"
+  loss_type: "smooth_l1"
 
   latent_layer_to_use: -2
   multi_input: false
-  norm_latents: true                 #syncbatchnorm归一化latents
+  norm_latents: true                 #归一化latents
   norm_latents_type: "ln"
   lambda_diversity: 0.01            #0.03与重建损失同一数量级
   vq_type: "vq"
@@ -50,8 +50,7 @@ model:
 
 
   project: lam
-  task_name: dino_base_4q_32_norep
-
+  task_name: dino_base_2q_16_bigwin
 
   wandb_offline: true
   
@@ -68,9 +67,9 @@ model:
 
 # 数据参数
 data:
-  data_root: /mnt/mnt/public/jlchen/datasets
+  data_root: /mnt/project_rlinf/jlchen/datasets
   data_mix: lam_plus   # Manip. + Navi. + Human
-  batch_size: 128
+  batch_size: 256
   resolution: 256            #dino是256
   episodic: false
   shuffle_buffer_size: 10240   # 根据内存大小调整
@@ -108,7 +107,7 @@ trainer:
         
     - class_path: latent_action_model.core.lam_lightinng.CodebookMaintenanceCallback
       init_args:
-        interval_steps: 100000000
+        interval_steps: 10000000000
 
     - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
 
@@ -116,7 +115,7 @@ trainer:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
         save_dir: latent_action_model/logs
-        name:  dino_base_4q_32_norep
+        name:  dino_base_2q_16_bigwin
 
 
 

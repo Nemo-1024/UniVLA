@@ -1038,6 +1038,7 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "libero_10_no_noops_quad": libero_dataset_transform,
     "libero_combined": libero_dataset_transform,
     "libero_90_rlds": libero_dataset_transform,
+    "libero_all_merged": libero_dataset_transform,
     ### Human Dataset
     "ego4d": human_dataset_transform,
     "agibot": agibot_transform,

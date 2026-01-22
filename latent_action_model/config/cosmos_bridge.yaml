@@ -11,9 +11,9 @@
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m"    #必须修改resolution，dino是224，vjepa是256
-  # vision_model_id: "/mnt/mnt/public/jlchen/weights/vjepa2-vitl-fpc64-256"
-  vision_model_id: "/mnt/mnt/public/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m"    #必须修改resolution，dino是224，vjepa是256
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
   dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
   encoder: LAMEncoder
   decoder: LAMDecoder_v2
@@ -48,7 +48,7 @@ model:
 
 # 数据参数
 data:
-  data_root: /mnt/mnt/public/jlchen/datasets
+  data_root: /mnt/project_rlinf/jlchen/datasets
   data_mix: lam_plus    # Manip. + Navi. + Human
   batch_size: 32
   resolution: 256            #dino是224

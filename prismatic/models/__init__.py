@@ -5,6 +5,7 @@ from .load import (
     load_InternVL,
     load_vla,
     freeze_internvl,
+    freeze_qwen3vl,
     load_vlm_auto,
     freeze_vlm_generic,
 )

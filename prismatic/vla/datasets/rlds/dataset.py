@@ -270,6 +270,8 @@ def make_dataset_from_rlds(
     # special case with process ego4d dataset
     if 'ego4d' in name:
         split = "train"
+    if 'libero' in name:
+        split = "train"
 
     # === Distributed sharding via manual percent slicing (train only) ===
     # Ensure each rank gets a disjoint percent range inside the current split expression.
@@ -358,6 +360,7 @@ def apply_trajectory_transforms(
     task_augment_kwargs: dict = {},
     num_parallel_calls: int = tf.data.AUTOTUNE,
     training_phase: str = None,
+    use_history_frame: bool = False,
 ) -> dl.DLataset:
     """
     Applies common transforms that happen at a trajectory level. Such transforms are usually some sort of "relabeling"
@@ -433,14 +436,16 @@ def apply_trajectory_transforms(
 
 
     # adjust frame interval based on their frame rate
+    # window_size = 20
     if 'ego4d' in name:
         window_size = 2
-
-    if name in datasets_with_lower_frequency:
-        # window_size = random.randint(5,7) if training_phase == 'lam' else 5
+    elif 'fractal' in name:
         window_size = 5
-    if name in datasets_with_higher_frequency:
-        window_size = random.randint(20,25) if training_phase == 'lam' else 15
+    elif name in datasets_with_lower_frequency:
+        # window_size = random.randint(5,7) if training_phase == 'lam' else 5
+        window_size = random.randint(8, 10) if training_phase == 'lam_2f' else 10
+    elif name in datasets_with_higher_frequency:
+        window_size = random.randint(25,30) if training_phase == 'lam_2f' else 30
     # 选择chunking策略
     # if training_phase == 'post-training':
     #     transform = traj_transforms.chunk_act_obs_libero    # load all obs. within a window
@@ -454,7 +459,7 @@ def apply_trajectory_transforms(
     elif training_phase == 'post-training':
         transform = traj_transforms.chunk_act_obs_libero    # 等距重采样到固定长度的窗口
     elif training_phase == 'pre-training':
-        transform = traj_transforms.chunk_act_obs_uniform_resample    # 等距重采样到固定长度的窗口
+        transform = traj_transforms.chunk_act_obs    # 等距重采样到固定长度的窗口
     else:
         assert False, f"Invalid training phase: {training_phase}"
     
@@ -463,6 +468,7 @@ def apply_trajectory_transforms(
             transform,
             window_size=window_size,
             future_action_window_size=future_action_window_size,
+            use_history_frame=use_history_frame,
         ),
         num_parallel_calls,
     )

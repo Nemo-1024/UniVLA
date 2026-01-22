@@ -8,7 +8,6 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-from argparse import Action
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -17,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from .cross_attention_dit import DiT
+from .cross_attention_dit import DiT, AlternateVLDiT
 
 
 
@@ -177,23 +176,32 @@ class ConditionalFlowMatchingConfig:
     action_dim: int = 7
     window_size: int = 10
     # Flow 维度与步数
-    hidden_dim: int = 512
-    num_layers: int = 8  #DiT层数
+    hidden_dim: int = 768
+    num_layers: int = 12  #DiT层数
     num_steps: int = 50
     cfg_drop_prob: float = 0.25
-    cfg_scale: float = 0.8
-    interleave_self_attention: bool = True
+    cfg_scale: float = 1.0
+    interleave_self_attention: bool = False  # 让所有层都关注 VLM 特征
     num_timestep_buckets: int = 1000
 
     # 可学习编码器（内部构造 cond）所需配置
-    vlm_dim: int = 1024
-    vision_dim: int = 1024
+    vlm_dim: int = 2048
+    vision_dim: int = 768
     num_vision_tokens: int = 256
     proprio_dim: int = 8
-    num_vision_queries: int = 64
-    qformer_layers: int = 2
-    enc_num_heads: int = 4
-    enc_hidden_dim: int = 512  # Enc(h_*) 输出维度；cond_dim = enc_hidden_dim * 4
+    # num_vision_queries: int = 64
+    # qformer_layers: int = 2
+    # enc_num_heads: int = 4
+    # enc_hidden_dim: int = 512  # Enc(h_*) 输出维度；cond_dim = enc_hidden_dim * 4
+    
+    # AlternateVLDiT 相关配置
+    use_alternate_vldit: bool = False  # 是否使用交替注意力模式
+    attend_text_every_n_blocks: int = 2  # 每多少个块关注一次VLM特征
+    
+    # 噪声采样配置（与 GR00T 对齐）
+    noise_beta_alpha: float = 1.5  # Beta 分布的 alpha 参数
+    noise_beta_beta: float = 1.0   # Beta 分布的 beta 参数
+    noise_s: float = 0.999         # 时间变换的缩放因子
 
 
 class ConditionalFlowMatchingHead(nn.Module):
@@ -209,36 +217,60 @@ class ConditionalFlowMatchingHead(nn.Module):
         #     num_queries=self.config.num_vision_queries,
         #     num_layers=self.config.qformer_layers,
         # )
-        self.enc_vlm = VectorMLP(in_dim=self.config.vlm_dim, hidden_dim=self.config.hidden_dim)
-        self.enc_a_p_to_a = VectorMLP(in_dim=2 * self.config.hidden_dim, hidden_dim=self.config.hidden_dim)
+        self.enc_vlm = VectorMLP(in_dim=self.config.vlm_dim, hidden_dim=self.config.vision_dim)
+        # self.enc_a_p_to_a = VectorMLP(in_dim=2 * self.config.hidden_dim, hidden_dim=self.config.hidden_dim)
         self.enc_prop = VectorMLP(in_dim=self.config.proprio_dim, hidden_dim=self.config.hidden_dim)
-        
         self.action_encoder = ActionEncoder(action_dim=self.config.action_dim, hidden_size=self.config.hidden_dim)
         self.position_embedding = nn.Embedding(512, self.config.hidden_dim)
         nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
-        self.DiT = DiT(
-            num_attention_heads=8,
-            attention_head_dim=int(self.config.hidden_dim//8),
-            output_dim=self.config.action_dim,
-            num_layers=self.config.num_layers,
-            interleave_self_attention=self.config.interleave_self_attention,
-            cross_attention_dim=self.config.vision_dim, # default None 修改是为了确保cond被交叉注意力关注到
-        )
+        
+        # 根据配置选择 DiT 类型
+        DiTClass = AlternateVLDiT if self.config.use_alternate_vldit else DiT
+        
+        dit_kwargs = {
+            "num_attention_heads": 16,
+            "attention_head_dim": int(self.config.hidden_dim // 16),
+            "output_dim": self.config.action_dim,
+            "num_layers": self.config.num_layers,
+            "interleave_self_attention": self.config.interleave_self_attention,
+            "cross_attention_dim": self.config.vision_dim,  # default None 修改是为了确保cond被交叉注意力关注到
+        }
+        
+        if self.config.use_alternate_vldit:
+            dit_kwargs["attend_text_every_n_blocks"] = self.config.attend_text_every_n_blocks
+        
+        self.DiT = DiTClass(**dit_kwargs)
         self.velocity_head = nn.Linear(self.config.hidden_dim, self.config.action_dim)
         self.cfg_embeddings = nn.Parameter(torch.randn(1, self.config.num_vision_tokens, self.config.vision_dim))
+        
+        # 初始化 Beta 分布（与 GR00T 一致）
+        self.beta_dist = torch.distributions.Beta(
+            concentration1=self.config.noise_beta_alpha,
+            concentration0=self.config.noise_beta_beta
+        )
+        
+        
+    def sample_noise(
+        self, shape: Tuple[int, ...], device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # 与 GR00T 对齐：直接使用 randn；同时避免部分 backend 对 torch.normal+bfloat16 的限制
+        return torch.randn(size=shape, dtype=dtype, device=device)
 
-    def sample_noise(self, shape: Tuple[int, ...], device: torch.device,dtype: torch.dtype) -> torch.Tensor:
-        return torch.normal(mean=0.0, std=1.0, size=shape, dtype=dtype, device=device)
+    def sample_time(self, bsize: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        采样时间步，遵循 GR00T 的实现
+        使用 Beta 分布并应用 (noise_s - sample) / noise_s 变换
+        
+        关键修复：原实现使用 (1 - sample) * noise_s，导致时间范围为 [0, 0.999]
+        正确实现使用 (noise_s - sample) / noise_s，时间范围为 [~0, 1.0]
+        这确保训练时能学习到 t=1 附近的速度场，这对推理至关重要
+        """
+        # Beta 采样在 float32 上更稳定；再 cast 回目标 dtype，避免 (bf16/half) 隐式升精度
+        sample = self.beta_dist.sample([bsize]).to(device=device, dtype=torch.float32)
+        sample = (self.config.noise_s - sample) / self.config.noise_s
+        return sample.to(dtype=dtype)
 
-    def sample_time(self, bsize: int, device: torch.device) -> torch.Tensor:
-        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
-        time_beta = beta_dist.sample(torch.Size([bsize])).to(device=device, dtype=torch.float32)
-        return time_beta * 0.999 + 0.001
-    def _add_state(self, x_t: torch.Tensor, cond_prop: torch.Tensor) -> torch.Tensor:
-        x_t = torch.cat([x_t, cond_prop], dim=-1)
-        x_t = self.enc_prop(x_t)
-        return x_t
-
+    
     def forward(
         self,
         h_t: torch.Tensor,
@@ -246,46 +278,101 @@ class ConditionalFlowMatchingHead(nn.Module):
         h_vlm: torch.Tensor,
         proprio: torch.Tensor, # [B, D]
         actions: torch.Tensor, # [B, T, K]
+        attention_mask: Optional[torch.Tensor] = None,  # [B, vlm_seq_len] VLM 的 attention_mask
     ) -> torch.Tensor:
         assert actions.shape[1] == self.config.window_size, "actions.shape[1] must be equal to window_size"
         device = actions.device
+        batch_size = h_t.shape[0]
+        
+        # 采样噪声和时间
         noise = self.sample_noise(actions.shape, device, actions.dtype)
-        time = self.sample_time(actions.shape[0], device)
-        time = time[:,None,None]
+        time = self.sample_time(actions.shape[0], device, actions.dtype)
+        time = time[:, None, None]
 
-        x_t = time * noise + (1 - time) * actions
-        u_t = noise - actions
-        # Convert (continuous) t -> discrete if needed
+        # 流匹配插值（与 GR00T 一致：t=0 是噪声，t=1 是数据）
+        noisy_trajectory = (1 - time) * noise + time * actions
+        velocity = actions - noise
+        # 离散化时间步，并确保在有效范围内 [0, num_timestep_buckets-1]
         t_discretized = (time[:, 0, 0] * self.config.num_timestep_buckets).long()
-        x_t = self.action_encoder(x_t, t_discretized)
-        pos_ids = torch.arange(x_t.shape[1], dtype=torch.long, device=device)
+        t_discretized = torch.clamp(t_discretized, 0, self.config.num_timestep_buckets - 1)
+        
+        # 编码动作特征
+        noisy_trajectory = self.action_encoder(noisy_trajectory, t_discretized)
+        pos_ids = torch.arange(noisy_trajectory.shape[1], dtype=torch.long, device=device)
         pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-        x_t = x_t + pos_embs
+        noisy_trajectory = noisy_trajectory + pos_embs
 
-
+        # 编码条件特征
         cond_prop = self.enc_prop(proprio)
-        # x_t = torch.cat([x_t, cond_prop], dim=-1)
-        # x_t = self.enc_a_p_to_a(x_t)
-        # 只能使用当前时刻的state，而不是整个chunk的state，否则会出现训练推理不一致的问题
+        cond_vlm = self.enc_vlm(h_vlm)  # [B, seq_len, vision_dim]
 
-        # training-time CFG drop
+        # CFG drop（仅作用于 h_t1_star）
         if self.training and self.config.cfg_drop_prob > 0.0:
             bsz = h_t.shape[0]
-            mask = (torch.rand(bsz, device=device) < self.config.cfg_drop_prob).view(bsz, 1,1)
+            mask = (torch.rand(bsz, device=device) < self.config.cfg_drop_prob).view(bsz, 1, 1)
             cond_future = torch.where(mask, self.cfg_embeddings.expand(bsz, -1, -1), h_t1_star)
         else:
             cond_future = h_t1_star
 
-        cond_vision = torch.cat((h_t, cond_future), dim=1)
-        cond_vlm = self.enc_vlm(h_vlm)  # h_vlm 已经是 bfloat16，无需再次转换
+        # 统一数据流：VLM 特征合并到 encoder_hidden_states
+        encoder_hidden_states = torch.cat((h_t, cond_future, cond_vlm), dim=1)
+        hidden_states = torch.cat((cond_prop, noisy_trajectory), dim=1)
         
-
-        action_horizon = x_t.shape[1]  # 记录动作序列长度，确保与推理时一致
-        sa_embs = torch.cat((cond_vlm, cond_prop, x_t), dim=1)
-        dit_output = self.DiT(hidden_states=sa_embs, encoder_hidden_states=cond_vision, timestep=t_discretized)
+        action_horizon = noisy_trajectory.shape[1]  # 记录动作序列长度，确保与推理时一致
+        
+        # 构造 encoder_attention_mask：视觉部分(h_t+h_t1)全关注 + VLM部分使用原始 attention_mask
+        num_vision = h_t.shape[1] + cond_future.shape[1]  # 256 + 256 = 512
+        num_vlm = cond_vlm.shape[1]
+        if attention_mask is not None:
+            # diffusers/SDPA 要求 mask dtype 为 bool 或 float（或与 query dtype 一致）
+            # 这里统一用 bool mask：True=有效/可见，False=padding/不可见
+            vlm_mask_bool = attention_mask.to(device=device, dtype=torch.bool)
+            vision_mask_bool = torch.ones(batch_size, num_vision, dtype=torch.bool, device=device)
+            encoder_attention_mask = torch.cat([vision_mask_bool, vlm_mask_bool], dim=1)  # [B, 512 + vlm_seq_len]
+        else:
+            # 无 mask 时全部关注
+            encoder_attention_mask = None
+        
+        # 根据模式选择调用方式
+        if self.config.use_alternate_vldit:
+            # 构建 attention masks
+            num_h_t = h_t.shape[1]
+            num_h_t1 = cond_future.shape[1]
+            num_vlm = cond_vlm.shape[1]
+            
+            # image_mask: 视觉部分为 True
+            image_mask = torch.cat([
+                torch.ones(batch_size, num_h_t + num_h_t1, dtype=torch.bool, device=device),
+                torch.zeros(batch_size, num_vlm, dtype=torch.bool, device=device)
+            ], dim=1)
+            
+            # vlm_mask: VLM 部分为 True
+            vlm_mask = torch.cat([
+                torch.zeros(batch_size, num_h_t + num_h_t1, dtype=torch.bool, device=device),
+                torch.ones(batch_size, num_vlm, dtype=torch.bool, device=device)
+            ], dim=1)
+            
+            dit_output = self.DiT(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=t_discretized,
+                image_mask=image_mask,
+                vlm_mask=vlm_mask,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+        else:
+            # 标准 DiT
+            dit_output = self.DiT(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=t_discretized,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+        
         v_t = dit_output[:, -action_horizon:, :]
-        
-        losses = F.mse_loss(u_t, v_t)
+        # Flow Matching loss: 预测速度场 vs 真实速度场
+        # 遵循 PyTorch 约定：loss(prediction, target)
+        losses = F.mse_loss(v_t, velocity)
         return losses
 
     @torch.inference_mode()
@@ -295,13 +382,13 @@ class ConditionalFlowMatchingHead(nn.Module):
         h_t1_star: torch.Tensor,
         h_vlm: torch.Tensor,
         proprio: torch.Tensor,
-        action_horizon: int = 14,
         cfg_scale: Optional[float] = None,
-        num_inference_steps: int = 10,
+        num_inference_steps: int = 50,
+        attention_mask: Optional[torch.Tensor] = None,  # [B, vlm_seq_len] VLM 的 attention_mask
     ) -> torch.Tensor:
         """
-        参照 forward 的流匹配定义进行推理，从 t=1 的噪声积分到 t=0 的数据；
-        通过 cfg_scale 控制是否启用 CFG：cfg_scale <= 1 视为关闭（仅条件分支），>1 启用。
+        参照 forward 的流匹配定义进行推理，从 t=0 的噪声积分到 t=1 的数据；
+        通过 cfg_scale 控制是否启用 CFG：cfg_scale = 1.0 或 None 时关闭（仅条件分支），!= 1.0 时启用。
         
         Args:
             h_t: 当前视觉特征 [B, num_vision_tokens, vision_dim]
@@ -317,82 +404,132 @@ class ConditionalFlowMatchingHead(nn.Module):
         """
         device = h_t.device
         batch_size = h_t.shape[0]
-        
-        # 初始化为 t=1 的噪声（对应 forward 中 x_t = t*noise + (1-t)*actions 的噪声端）
-        x = torch.randn(
+        action_horizon = self.config.window_size
+        # 初始化为纯噪声（t=0 的起点）
+        actions = torch.randn(
             size=(batch_size, action_horizon, self.config.action_dim),
             dtype=h_t.dtype,
             device=device,
         )
 
-        # 设置推理步数与时间步长（从 t=1 -> t=0，负向时间积分等价为 x = x - dt * v）
-        num_steps = num_inference_steps
-        dt = 1.0 / float(num_steps)
+        dt = 1.0 / float(num_inference_steps)
 
-        # 条件编码（与 forward 一致，不含训练时的随机 drop）
-        cond_vision = torch.cat((h_t, h_t1_star), dim=1)
-        cond_vlm = self.enc_vlm(h_vlm)
-        cond_prop = self.enc_prop(proprio)  # 本体感受编码（在循环中不变，提前计算）
+        # 编码条件特征（循环外，只需计算一次）
+        cond_vlm = self.enc_vlm(h_vlm)  # [B, seq_len, vision_dim]
+        cond_prop = self.enc_prop(proprio)
 
-        # 是否启用 CFG（仅当 cfg_scale > 1 才计算无条件分支以节省算力）
-        # 注意：训练时CFG drop只作用在h_t1_star上，因此推理时无条件分支只替换视觉特征
-        use_cfg = cfg_scale is not None
-        
+        # 统一数据流：构建 encoder_hidden_states
+        cond_encoder_hidden = torch.cat((h_t, h_t1_star, cond_vlm), dim=1)
+
+        # 构造 encoder_attention_mask：视觉部分(h_t+h_t1)全关注 + VLM部分使用原始 attention_mask
+        num_vision = h_t.shape[1] + h_t1_star.shape[1]  # 256 + 256 = 512
+        if attention_mask is not None:
+            vlm_mask_bool = attention_mask.to(device=device, dtype=torch.bool)
+            vision_mask_bool = torch.ones(batch_size, num_vision, dtype=torch.bool, device=device)
+            encoder_attention_mask = torch.cat([vision_mask_bool, vlm_mask_bool], dim=1)  # [B, 512 + vlm_seq_len]
+        else:
+            encoder_attention_mask = None
+
+        # 修正CFG判断：只有当 cfg_scale 存在且 != 1.0 时才启用CFG
+        # cfg_scale=1.0 时，CFG公式退化为纯条件预测，应避免计算无条件分支
+        use_cfg = cfg_scale is not None and cfg_scale != 1.0
         if use_cfg:
-            # 无条件分支：用cfg_embeddings替换h_t1_star（未来视觉特征）
-            uncond_vision = torch.cat((
-                h_t, self.cfg_embeddings.expand(batch_size, -1, -1)
+            # 无条件分支：仅替换 h_t1_star
+            uncond_encoder_hidden = torch.cat((
+                h_t,
+                self.cfg_embeddings.expand(batch_size, -1, -1),
+                cond_vlm
             ), dim=1)
-            # VLM特征在训练时未做drop，推理时保持一致（与条件分支相同）
-            uncond_vlm = cond_vlm  # 复用条件分支的VLM编码，避免重复计算
 
-        # 反向时间积分：从 t=1, ..., 1/num_steps 到 0
-        for step in range(num_steps, 0, -1):
-            t_cont = step / float(num_steps)  # (0, 1]
-            
-            # 离散化时间步，与训练时保持一致（使用.long()而非int()）
-            # 训练时：t_discretized = (time[:, 0, 0] * num_timestep_buckets).long()
-            # 这里需要确保相同的离散化逻辑
-            t_discretized = int((t_cont * self.config.num_timestep_buckets))
-            # 边界裁剪：确保 t_discretized 在 [0, num_buckets-1] 范围内
+        # 如果使用 AlternateVLDiT，预先构建 masks
+        if self.config.use_alternate_vldit:
+            num_h_t = h_t.shape[1]
+            num_h_t1 = h_t1_star.shape[1]
+            num_vlm = cond_vlm.shape[1]
+
+            image_mask = torch.cat([
+                torch.ones(batch_size, num_h_t + num_h_t1, dtype=torch.bool, device=device),
+                torch.zeros(batch_size, num_vlm, dtype=torch.bool, device=device)
+            ], dim=1)
+
+            vlm_mask = torch.cat([
+                torch.zeros(batch_size, num_h_t + num_h_t1, dtype=torch.bool, device=device),
+                torch.ones(batch_size, num_vlm, dtype=torch.bool, device=device)
+            ], dim=1)
+
+        # 降噪循环：从 t=0 正向积分到 t=1（噪声→数据）
+        for step in range(num_inference_steps):
+            t_cont = step / float(num_inference_steps)  # 从 0 到接近 1
+            # 离散化时间步，与训练时保持一致的方式
+            t_discretized = int(t_cont * self.config.num_timestep_buckets)
             t_discretized = min(self.config.num_timestep_buckets - 1, max(0, t_discretized))
 
-            # 编码当前 x_t
+            # 编码当前动作
             timesteps_tensor = torch.full(
                 size=(batch_size,), fill_value=t_discretized, device=device, dtype=torch.long
             )
-            action_features = self.action_encoder(x, timesteps_tensor)
-            
-            # 添加位置编码（与训练时保持一致）
+            action_features = self.action_encoder(actions, timesteps_tensor)
+
+            # 添加位置编码
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
 
-            # 条件路径（与训练时保持一致：直接拼接 cond_vlm, cond_prop, action_features）
-            sa_embs_cond = torch.cat((cond_vlm, cond_prop, action_features), dim=1)
-            model_output_cond = self.DiT(
-                hidden_states=sa_embs_cond,
-                encoder_hidden_states=cond_vision,
-                timestep=timesteps_tensor,
-            )
-            pred_cond = model_output_cond[:, -action_horizon:, :]
+            # 构建 hidden_states
+            hidden_states = torch.cat((cond_prop, action_features), dim=1)
 
-            if use_cfg:
-                # 无条件路径
-                sa_embs_uncond = torch.cat((uncond_vlm, cond_prop, action_features), dim=1)
-                model_output_uncond = self.DiT(
-                    hidden_states=sa_embs_uncond,
-                    encoder_hidden_states=uncond_vision,
+            # 根据模式调用 DiT
+            if self.config.use_alternate_vldit:
+                # 条件预测
+                model_output_cond = self.DiT(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=cond_encoder_hidden,
                     timestep=timesteps_tensor,
+                    image_mask=image_mask,
+                    vlm_mask=vlm_mask,
+                    encoder_attention_mask=encoder_attention_mask,
                 )
-                pred_uncond = model_output_uncond[:, -action_horizon:, :]
-                pred_velocity = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+                pred_cond = model_output_cond[:, -action_horizon:, :]
+
+                if use_cfg:
+                    # 无条件预测
+                    model_output_uncond = self.DiT(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=uncond_encoder_hidden,
+                        timestep=timesteps_tensor,
+                        image_mask=image_mask,
+                        vlm_mask=vlm_mask,
+                        encoder_attention_mask=encoder_attention_mask,
+                    )
+                    pred_uncond = model_output_uncond[:, -action_horizon:, :]
+                    pred_velocity = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+                else:
+                    pred_velocity = pred_cond
             else:
-                pred_velocity = pred_cond
+                # 标准 DiT
+                model_output_cond = self.DiT(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=cond_encoder_hidden,
+                    timestep=timesteps_tensor,
+                    encoder_attention_mask=encoder_attention_mask,
+                )
+                pred_cond = model_output_cond[:, -action_horizon:, :]
 
-            # 反向欧拉积分（从噪声端走向数据端）：x_{t-dt} = x_t - dt * v
-            x = x - dt * pred_velocity
+                if use_cfg:
+                    model_output_uncond = self.DiT(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=uncond_encoder_hidden,
+                        timestep=timesteps_tensor,
+                        encoder_attention_mask=encoder_attention_mask,
+                    )
+                    pred_uncond = model_output_uncond[:, -action_horizon:, :]
+                    pred_velocity = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+                else:
+                    pred_velocity = pred_cond
 
-        return x
+            # 正向欧拉积分（从噪声走向数据）
+            actions = actions + dt * pred_velocity
+
+        return actions
 
 

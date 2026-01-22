@@ -1,9 +1,10 @@
 import os
+import math
 import random
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Union
 
 import draccus
 import torch
@@ -20,8 +21,8 @@ from torch.utils.data import DataLoader
 from prismatic.overwatch import initialize_overwatch
 import wandb
 from prismatic.vla import get_latent_vla_dataset_and_collator
-from prismatic.models.vlas.latent_world_vla import LatentWorldVLA, LatentWorldVLAConfig
-from prismatic.util.data_utils import PaddedCollatorForActionPrediction_LIBERO
+from prismatic.models.vlas.latent_world_vla import LatentWorldVLA, LatentWorldVLAConfig, SimpleLatentWorldVLA
+from prismatic.util.data_utils import PaddedCollatorForLatentWorldVLA_LIBERO
 from prismatic.vla.datasets import RLDSBatchTransformLIBERO
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
  
@@ -30,6 +31,7 @@ from datetime import datetime
 import logging
 import sys
 import json
+import shutil
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -43,41 +45,55 @@ def _install_global_exception_logger() -> None:
         logging.getLogger().exception("未捕获异常", exc_info=(exc_type, exc_value, exc_traceback))
     sys.excepthook = _handler
 
-home_path = "/mnt/mnt/public/jlchen"
+
+class _TqdmLoggingHandler(logging.Handler):
+    """让 logging 输出不破坏 tqdm 进度条（通过 tqdm.write）。"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            tqdm.tqdm.write(msg)
+        except Exception:
+            # 不要让日志影响训练
+            pass
+
+home_path = "/mnt/project_rlinf/jlchen"
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    # Base VLM & LAM
-    # 已迁移到 LatentWorldVLAConfig：model_id, hf_cache_dir, lam_ckpt_path, lam_yaml_path
+    # 模型配置（装配由 LatentWorldVLA.from_config 内部完成）
+    model_cfg: LatentWorldVLAConfig = field(default_factory=LatentWorldVLAConfig)
     # Dataset
     data_root_dir: Path = Path(home_path + "/datasets")
     data_mix: str = "libero_object_no_noops"
-    image_resolution: int = 448
+    image_resolution: int = 256
     shuffle_buffer_size: int = 2000
     image_aug: bool = False
-
+    # debug_repeat_batch 支持 bool 或 int：传入正整数 k 时，会缓存前 k 个样本并循环返回
+    debug_repeat_batch: Union[bool, int] = False
+    use_history_frame: bool = True
     # Run & IO
     run_root_dir: Path = Path(__file__).resolve().parent / "world_vla_log"
     # adapter_tmp_dir: Path = Path("adapter-tmp")
     # save_latest_checkpoint_only: bool = True
-
+    use_simple_model: bool = False
     # Optimization
     batch_size: int = 64
     max_steps: int = 40000
     warmup_steps: int = 200
-    save_steps: int = 1000
+    save_steps: int = 5000
     eval_steps: int = 1000
     eval_batches: int = 100
+    log_every_steps: int = 50  # 每多少个 optimizer step 在命令行输出一次关键指标
     learning_rate: float = 1e-4
+    window_size: int = 10
     # 独立的 VLM 学习率与调度超参
     vlm_learning_rate: float = 1e-5
     vlm_warmup_steps: int = 200
     grad_accumulation_steps: int = 1
     gradient_clip: float = 1.0
     weight_decay: float = 1e-4
-    vlm_loss_weight: float = 1.0
-    # 冻结策略（全量微调切换）：当 freeze_vlm=True 时冻结整个 VLM；否则全参数更新 VLM
-    freeze_vlm: bool = True
+    # vlm_loss_weight: float = 1.0
 
     # Seeding & dtype
     seed: int = 42
@@ -87,6 +103,8 @@ class FinetuneConfig:
     # Tracking
     wandb_project: str = "finetune-LIBERO"
     wandb_entity: Optional[str] = None
+    # 将每次 finetune 的 wandb 文件存储在本次 run_dir 内部（run_dir/wandb）
+    wandb_dir: Optional[Path] = None
     run_id_note: Optional[str] = None
     run_time: Optional[str] = datetime.now().strftime("%m%d_%H%M%S")
 
@@ -95,7 +113,7 @@ class FinetuneConfig:
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     # 构建模型配置（包含 VLM/LAM 加载所需参数，已迁移至 LatentWorldVLAConfig）
-    model_cfg = LatentWorldVLAConfig()
+    model_cfg = cfg.model_cfg
     overwatch.info(f"Fine-tuning LatentWorldVLA on `{cfg.data_mix}` with base `{model_cfg.model_id}`")
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
@@ -119,15 +137,23 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Configure Unique Experiment ID & Log Directory
     exp_id = (
-        f"{cfg.run_time}+{model_cfg.model_id.split('/')[-1]}+{cfg.data_mix}"
+        f"{cfg.run_time}+{model_cfg.model_id.split('/')[-2]}+{cfg.data_mix}"
         f"+lr-{cfg.learning_rate}"
     )
-    if cfg.freeze_vlm:
-        exp_id += "+freeze_vlm"
+    # 添加冻结策略标记
+    freeze_tags = []
+    if model_cfg.freeze_vision_backbone:
+        freeze_tags.append("frzVis")
+    if model_cfg.freeze_llm_backbone:
+        freeze_tags.append("frzLLM")
+        if model_cfg.unfreeze_llm_last_n_layers:
+            freeze_tags.append(f"unfrzLast{model_cfg.unfreeze_llm_last_n_layers}")
+    if model_cfg.freeze_embedding:
+        freeze_tags.append("frzEmb")
+    if freeze_tags:
+        exp_id += "+" + "+".join(freeze_tags)
     if cfg.run_id_note is not None:
         exp_id += f"--{cfg.run_id_note}"
-    if cfg.image_aug:
-        exp_id += "--image_aug"
 
     # Start =>> Build Directories (hierarchical)
     run_dir = cfg.run_root_dir / exp_id
@@ -135,10 +161,43 @@ def finetune(cfg: FinetuneConfig) -> None:
     if distributed_state.is_main_process:
         os.makedirs(ckpt_root, exist_ok=True)
 
+    # 保存本次运行的配置文件到日志目录（main process only）
+    if distributed_state.is_main_process:
+        try:
+            # 1) 保存命令行参数
+            (run_dir / "argv.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
+
+            # 2) 若通过 draccus `--config` 指定了 YAML/JSON/TOML，则复制原始文件
+            src_cfg = None
+            if "--config" in sys.argv:
+                i = sys.argv.index("--config")
+                if i + 1 < len(sys.argv):
+                    src_cfg = sys.argv[i + 1]
+            # 兼容常见短参数
+            if src_cfg is None and "-c" in sys.argv:
+                i = sys.argv.index("-c")
+                if i + 1 < len(sys.argv):
+                    src_cfg = sys.argv[i + 1]
+            if src_cfg is not None:
+                src_path = Path(src_cfg).expanduser()
+                if src_path.exists() and src_path.is_file():
+                    # 使用原配置文件名保存到 run_dir
+                    shutil.copy2(str(src_path), str(run_dir / src_path.name))
+                    overwatch.info(f"📋 配置文件已保存到：{run_dir / src_path.name}")
+        except Exception as e:
+            overwatch.warning(f"保存配置文件失败（不影响训练）：{e}")
+
     # Configure logging to file (main process only; avoid duplicate handlers)
     if distributed_state.is_main_process:
-        log_file_path = run_dir / f"{cfg.run_id_note}.log"
+        # Ensure a stable log filename even when run_id_note is None
+        log_name = f"{cfg.run_id_note}.log" if cfg.run_id_note is not None else "train.log"
+        log_file_path = run_dir / log_name
         root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            fmt="% (asctime)s | % (levelname)s | % (name)s: % (message)s".replace(" ", ""),
+            datefmt="%m-%d %H:%M:%S",
+        )
         already_attached = False
         for h in list(root_logger.handlers):
             try:
@@ -153,44 +212,103 @@ def finetune(cfg: FinetuneConfig) -> None:
                     file_handler = logging.FileHandler(str(log_file_path), encoding="utf-8")
                 except TypeError:
                     file_handler = logging.FileHandler(str(log_file_path))
-                formatter = logging.Formatter(
-                    fmt="% (asctime)s | % (levelname)s | % (name)s: % (message)s".replace(" ", ""),
-                    datefmt="%m-%d %H:%M:%S",
-                )
                 file_handler.setFormatter(formatter)
                 file_handler.setLevel(logging.INFO)
                 root_logger.addHandler(file_handler)
             except Exception:
                 pass
+        # tqdm 训练时，RichHandler/普通 StreamHandler 往往会被进度条覆盖；这里统一替换为 tqdm.write handler。
+        for h in list(root_logger.handlers):
+            try:
+                if isinstance(h, logging.FileHandler):
+                    continue
+                if isinstance(h, _TqdmLoggingHandler):
+                    continue
+                root_logger.removeHandler(h)
+            except Exception:
+                continue
+        # 确保 stdout 有 handler（否则命令行可能只有 tqdm 一行）
+        has_tqdm_handler = any(isinstance(h, _TqdmLoggingHandler) for h in root_logger.handlers)
+        if not has_tqdm_handler:
+            stream_handler = _TqdmLoggingHandler()
+            stream_handler.setLevel(logging.INFO)
+            try:
+                stream_handler.setFormatter(formatter)
+            except Exception:
+                pass
+            root_logger.addHandler(stream_handler)
         overwatch.info(f"📝 日志将写入 `{log_file_path}`")
         _install_global_exception_logger()
         overwatch.info("✅ 已安装全局异常捕获（未捕获异常将写入日志）")
 
     # 构建 LatentWorldVLA（内部自洽加载 VLM/LAM，并完成 tokenizer 扩展与冻结策略）
     overwatch.info("🔄 构建 LatentWorldVLA（内部加载VLM & LAM）")
-    lwvla = LatentWorldVLA(model_cfg=model_cfg)
-
+    if cfg.use_simple_model:
+        lwvla, processor = SimpleLatentWorldVLA.from_config(cfg=model_cfg)
+    else:
+        lwvla, processor = LatentWorldVLA.from_config(cfg=model_cfg)
     num_params = sum(p.numel() for p in lwvla.parameters())
     num_trainable_params = sum(p.numel() for p in lwvla.parameters() if p.requires_grad)
     overwatch.info(
         f"# LatentWorldVLA Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
     )
 
+    # ===== 在 DDP 包装前解冻 LAM decoder（如果配置要求） =====
+    if model_cfg.unfreeze_lam_decoder:
+        try:
+            lam = lwvla.lam
+            dec = getattr(lam, "decoder", None)
+            if dec is None:
+                overwatch.warning(
+                    "[finetune_libero] unfreeze_lam_decoder=True but LAM has no decoder; "
+                    "skip decoder unfreeze."
+                )
+            else:
+                # 检查 decoder 是否已经被解冻
+                dec_params = sum(p.numel() for p in dec.parameters())
+                already_unfrozen = any(p.requires_grad for p in dec.parameters())
+                
+                if already_unfrozen:
+                    overwatch.info(
+                        f"[finetune_libero] LAM decoder ({dec_params/1e6:.3f}M params) already unfrozen; "
+                        "skipping redundant unfreeze"
+                    )
+                else:
+                    # 执行解冻
+                    for p in dec.parameters():
+                        p.requires_grad = True
+                    overwatch.info(
+                        f"[finetune_libero] Unfroze LAM decoder ({dec_params/1e6:.3f}M params) "
+                        f"before optimizer creation"
+                    )
+                
+                # 重新统计可训练参数
+                num_trainable_params_after = sum(p.numel() for p in lwvla.parameters() if p.requires_grad)
+                overwatch.info(
+                    f"[finetune_libero] Trainable params after LAM decoder unfreeze: "
+                    f"{num_trainable_params_after / 10**6:.3f}M "
+                    f"(+{(num_trainable_params_after - num_trainable_params) / 10**6:.3f}M)"
+                )
+        except Exception as e:
+            overwatch.warning(f"[finetune_libero] LAM decoder unfreeze failed: {e}")
+
     overwatch.info(
         f"🔄 构建 RLDS 数据集与 Collator(mixture=`{cfg.data_mix}`, image_res={cfg.image_resolution})"
     )
-    processor = lwvla.processor
     train_dataset, val_dataset, collator = get_latent_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.data_mix,
-        lwvla.lam,
-        processor=processor,
-        default_image_resolution=cfg.image_resolution,
+        processor,
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        window_size=cfg.window_size,
         training_phase='post-training', 
         data_transform_fn=RLDSBatchTransformLIBERO,
-        collator_fn=PaddedCollatorForActionPrediction_LIBERO,
+        collator_fn=PaddedCollatorForLatentWorldVLA_LIBERO,
+        latent_action_num_queries=lwvla.lam.num_queries,
+        debug_repeat_batch=cfg.debug_repeat_batch,
+        use_history_frame=cfg.use_history_frame,
+        target_seq_len=180 if cfg.use_history_frame else 120,
     )
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
@@ -202,49 +320,48 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Optimizer & LR scheduler
     # 按模块区分参数组（VLM 与非 VLM），以便为 VLM 设置独立 LR 与调度
+    # 冻结策略已在 LatentWorldVLA.__init__ 中应用，此处无需额外冻结
     base_params: List[torch.nn.Parameter] = []
-    vlm_params: List[torch.nn.Parameter] = []
-    # 通过模块引用来界定 VLM 参数（不要依赖参数名）
-    vlm_param_ids = {id(p) for p in wrapped_model.module.vlm.parameters()}
+    latent_vla_params: List[torch.nn.Parameter] = []
+    # 通过模块引用来界定 VLM 与 LAM 参数（不要依赖参数名）
+    # 将 VLM 和 LAM 的参数都归入 vlm_params 组，以使用相同的学习率调度
+    latent_vla_param_ids = {id(p) for p in wrapped_model.module.latent_vla.parameters()}
+    # lam_param_ids = {id(p) for p in wrapped_model.module.lam.parameters()}
     for param in wrapped_model.module.parameters():
         if not param.requires_grad:
             continue
-        if id(param) in vlm_param_ids:
-            vlm_params.append(param)
+        if id(param) in latent_vla_param_ids:
+            latent_vla_params.append(param)
         else:
             base_params.append(param)
     param_groups = [
         {"params": base_params, "lr": cfg.learning_rate, "weight_decay": cfg.weight_decay},
     ]
-    if (not cfg.freeze_vlm) and len(vlm_params) > 0:
-        param_groups.append({"params": vlm_params, "lr": cfg.vlm_learning_rate, "weight_decay": cfg.weight_decay})
+    # 如果 VLM 有可训练参数，为其添加独立的参数组
+    if len(latent_vla_params) > 0:
+        param_groups.append({"params": latent_vla_params, "lr": cfg.vlm_learning_rate, "weight_decay": cfg.weight_decay})
     optimizer = AdamW(param_groups)
     # 训练中用于裁剪的可训练参数集合
-    trainable_params = base_params + vlm_params
+    trainable_params = base_params + latent_vla_params
 
     # 调度器（为不同参数组提供独立的 lr lambda）
-    base_decay_step = int(cfg.max_steps * 0.8)     # 原来的 StepLR step（基础网络）
-    vlm_decay_step = int(cfg.max_steps * 0.8)      # VLM 的 step，可按需暴露更多配置
-
     def lr_lambda_base(current_step: int):
         if current_step < cfg.warmup_steps:
             # linear warmup
             return float(current_step) / float(max(1, cfg.warmup_steps))
-        elif current_step < base_decay_step:
-            # 保持原始学习率
-            return 1.0
         else:
-            # step decay
-            return 0.1
+            # cosine decay
+            progress = float(current_step - cfg.warmup_steps) / float(max(1, cfg.max_steps - cfg.warmup_steps))
+            return max(0.5 * (1.0 + math.cos(math.pi * progress)), 1e-6)
 
     def lr_lambda_vlm(current_step: int):
         if current_step < cfg.vlm_warmup_steps:
             # linear warmup（VLM 独立 warmup）
             return float(current_step) / float(max(1, cfg.vlm_warmup_steps))
-        elif current_step < vlm_decay_step:
-            return 1.0
         else:
-            return 0.1
+            # cosine decay
+            progress = float(current_step - cfg.vlm_warmup_steps) / float(max(1, cfg.max_steps - cfg.vlm_warmup_steps))
+            return max(0.5 * (1.0 + math.cos(math.pi * progress)), 1e-6)
 
     if len(param_groups) == 2:
         scheduler = LambdaLR(optimizer, lr_lambda=[lr_lambda_base, lr_lambda_vlm])
@@ -257,7 +374,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         batch_size=cfg.batch_size,
         sampler=None,
         collate_fn=collator,
-        num_workers=0,  # 注意：collator 含 GPU 计算（LAM.vq_encode），不可开启多进程
+        num_workers=0,  # collator 已不再调用 vq_encode，默认单进程以保持确定性
         pin_memory=True,
     )
     val_loader = DataLoader(
@@ -270,7 +387,15 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize Logging =>> W&B
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+        # Separate wandb storage for finetune runs
+        # wb_dir = run_dir / "wandb"
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+        except Exception:
+            pass
+        # ensure wandb honors directory even if it spawns processes
+        os.environ["WANDB_DIR"] = str(run_dir)
+        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}", dir=str(run_dir))
         # push full config to W&B
         try:
             wandb.config.update({k: getattr(cfg, k) for k in cfg.__dataclass_fields__.keys()}, allow_val_change=True)
@@ -279,10 +404,14 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Train!
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
-    with tqdm.tqdm(total=cfg.max_steps, desc=f"🚀 {cfg.run_id_note or 'Training'}", leave=False, disable=not distributed_state.is_main_process, ncols=80) as progress:
+    with tqdm.tqdm(
+        total=cfg.max_steps,
+        desc=f"🚀 {cfg.run_id_note or 'Training'}",
+        leave=True,
+        disable=not distributed_state.is_main_process,
+    ) as progress:
         wrapped_model.train()
-        if cfg.freeze_vlm:
-            wrapped_model.module.vlm.eval()
+        # VLM eval 模式由 LatentWorldVLA.train() 自动管理
         optimizer.zero_grad(set_to_none=True)
         global_step = 0
         for batch_idx, batch in enumerate(dataloader):
@@ -290,7 +419,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             batch = {
                 k: (v.to(device_id) if isinstance(v, torch.Tensor) else v)
                 for k, v in batch.items()
-                if k in {"pixel_values","input_ids","labels","attention_mask","actions","latent_action_idx","proprio","image_features"}
+                if k in {"pixel_values","input_ids","attention_mask","act_placeholder_mask","lam_videos","lam_states","actions","proprio","image_grid_thw"}
             }
             if "pixel_values" in batch:
                 batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
@@ -301,11 +430,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):  # 或者 dtype=torch.float16 取决于硬件
                 out = wrapped_model(**batch)
                 flow_loss = out["loss_flow"]
-                vlm_loss = out.get("loss_vlm", torch.tensor(0.0, device=device_id, dtype=flow_loss.dtype))
-                if cfg.freeze_vlm:
-                    loss = flow_loss
-                else:
-                    loss = flow_loss + cfg.vlm_loss_weight * vlm_loss
+                perceptual_loss = out.get("loss_perceptual", torch.tensor(0.0, device=device_id, dtype=flow_loss.dtype))
+                loss = out["loss_total"]
 
             normalized_loss = loss / cfg.grad_accumulation_steps
             normalized_loss.backward()
@@ -328,10 +454,18 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 # Logging per optimizer step
                 if distributed_state.is_main_process:
-                    progress.set_postfix({"loss": f"{smoothened_loss:.6f}"})
+                    postfix = {
+                        "loss": f"{smoothened_loss:.6f}",
+                        "flow": f"{float(flow_loss.item()):.6f}",
+                        "perc": f"{float(perceptual_loss.item()):.6f}",
+                    }
+                    if "vlm_action_accuracy" in out:
+                        postfix["acc"] = f"{float(out['vlm_action_accuracy'].item()):.4f}"
+                    progress.set_postfix(postfix)
                     log_payload = {
                         "train_loss": smoothened_loss,
                         "train_flow_loss": float(flow_loss.item()),
+                        "train_perceptual_loss": float(perceptual_loss.item()),
                         # 记录基础参数组与（若有）VLM 参数组的学习率
                         "lr": optimizer.param_groups[0]['lr'],
                     }
@@ -339,9 +473,20 @@ def finetune(cfg: FinetuneConfig) -> None:
                         log_payload["vlm_lr"] = optimizer.param_groups[1]['lr']
                     if "vlm_action_accuracy" in out:
                         log_payload["train_action_accuracy"] = float(out["vlm_action_accuracy"].item())
-                    if not cfg.freeze_vlm:
-                        log_payload["train_vlm_loss"] = float(vlm_loss.item())
                     wandb.log(log_payload, step=global_step)
+
+                    # Also persist key iteration stats to the run log file (tqdm UI does not go to FileHandler)
+                    if (global_step % int(max(1, cfg.log_every_steps))) == 0 or global_step == 1:
+                        try:
+                            overwatch.info(
+                                f"[step {global_step}/{cfg.max_steps}] "
+                                f"loss={smoothened_loss:.6f} "
+                                f"flow={float(flow_loss.item()):.6f} "
+                                f"perc={float(perceptual_loss.item()):.6f} "
+                                f"lr={optimizer.param_groups[0]['lr']:.3e}"
+                            )
+                        except Exception:
+                            pass
 
                 # Checkpoint on schedule (skip step 0)
                 if global_step > 0 and global_step % cfg.save_steps == 0:
@@ -350,27 +495,15 @@ def finetune(cfg: FinetuneConfig) -> None:
                         os.makedirs(step_dir, exist_ok=True)
                         overwatch.info(f"💾 保存检查点 @ step={global_step}: 目录 `{step_dir}`")
 
-                        # Save weights:
-                        # - 当冻结 VLM：仅保存 Flow；
-                        # - 当不冻结 VLM（全参数微调）：分别保存 VLM 与 Flow。
-                        if cfg.freeze_vlm:
-                            # 仅保存 Flow（使用 safetensors）
-                            torch.save(wrapped_model.module.flow.state_dict(), step_dir / "flow.pt")
-                            overwatch.info("✅ 已保存 Flow(safetensors)")
-                        else:
-                            # 保存 Flow（safetensors）
-                            torch.save(wrapped_model.module.flow.state_dict(), step_dir / "flow.pt")
-                            # 保存 VLM（HuggingFace save_pretrained 目录结构）
-                            try:
-                                vlm_out_dir = step_dir / "vlm"
-                                os.makedirs(vlm_out_dir, exist_ok=True)
-                                if hasattr(wrapped_model.module.vlm, "save_pretrained"):
-                                    wrapped_model.module.vlm.save_pretrained(vlm_out_dir)
-                                    overwatch.info("✅ 已保存 VLM(save_pretrained) 与 Flow(safetensors)")
-                                else:
-                                    overwatch.warning("VLM 缺少 save_pretrained()，已仅保存 Flow(safetensors)")
-                            except Exception:
-                                overwatch.warning("保存 VLM(save_pretrained) 失败，已仅保存 Flow(safetensors)")
+
+                        # 保存完整 LatentWorldVLA（包含 VLM+latent_vla_extra + Flow）
+                        wrapped_model.module.save_pretrained(step_dir)
+                        overwatch.info("✅ 已保存 LatentWorldVLA(checkpoint dir)（VLM+latent_vla_extra+Flow）")
+
+                        # 保存 processor（image_processor + tokenizer）
+                        if processor is not None and hasattr(processor, "save_pretrained"):
+                            processor.save_pretrained(step_dir)
+                            overwatch.info("✅ 已保存 Processor（image_processor + tokenizer）")
 
                         # 始终保存优化器/调度器状态
                         torch.save(optimizer.state_dict(), step_dir / "optim.pt")
@@ -404,39 +537,47 @@ def finetune(cfg: FinetuneConfig) -> None:
                             eval_batch = {
                                 k: (v.to(device_id) if isinstance(v, torch.Tensor) else v)
                                 for k, v in eval_batch.items()
-                                if k in {"pixel_values","input_ids","labels","attention_mask","actions","latent_action_idx","proprio","image_features"}
+                                if k in {"pixel_values","input_ids","attention_mask","act_placeholder_mask","lam_videos","lam_states","actions","proprio","image_grid_thw"}
                             }
                             if "pixel_values" in eval_batch:
                                 eval_batch["pixel_values"] = eval_batch["pixel_values"].to(torch.bfloat16)
 
-                            # 使用 predict_action 重建动作，并与 GT 动作计算 MSE
-                            window_size = int(eval_batch["actions"].shape[1])
                             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                                pred_actions = wrapped_model.module.predict_action(
+                                predicted_actions = wrapped_model.module.predict_action(
                                     pixel_values=eval_batch["pixel_values"],
                                     input_ids=eval_batch["input_ids"],
-                                    proprio=eval_batch["proprio"],
-                                    image_feat_4_lam=eval_batch["image_features"],
-                                    window_size=window_size,
-                                    guidance_scale=1.0,
+                                    attention_mask=eval_batch["attention_mask"],
+                                    act_placeholder_mask=eval_batch["act_placeholder_mask"],
+                                    lam_videos=eval_batch["lam_videos"],
+                                    lam_states=eval_batch.get("lam_states", None),
+                                    proprio=eval_batch.get("proprio", None),
+                                    image_grid_thw=eval_batch.get("image_grid_thw", None),
                                 )
-                                gt_actions = eval_batch["actions"]
-                                # 对齐 dtype 以避免精度/类型不匹配
-                                pred_actions = pred_actions.to(dtype=gt_actions.dtype)
-                                eval_mse = F.mse_loss(pred_actions, gt_actions)
+                                # 计算预测动作与真实动作的 MSE
+                                gt_actions = eval_batch["actions"]  # [B, T, Da]
+                                eval_loss = F.mse_loss(predicted_actions, gt_actions)
 
-                            eval_loss_accum += float(eval_mse.item())
+                            eval_loss_accum += float(eval_loss.item())
                             eval_count += 1
 
                     mean_eval_loss = eval_loss_accum / max(eval_count, 1)
                     if distributed_state.is_main_process:
                         wandb.log({
-                            "eval_loss": mean_eval_loss,  # 使用 MSE 作为评估损失
+                            "eval_loss": mean_eval_loss,
                             "global_step": global_step,
                         }, step=global_step)
                         overwatch.info(
                             f"📊 评估完成 @ step={global_step}: eval_loss(MSE)={mean_eval_loss:.6f}"
                         )
+                        # Also persist eval stats explicitly (mirrors train step logging)
+                        try:
+                            overwatch.info(
+                                f"[eval step {global_step}] "
+                                f"eval_loss={mean_eval_loss:.6f} "
+                                f"eval_batches={int(eval_count)}"
+                            )
+                        except Exception:
+                            pass
 
                         # Maintain best checkpoint using metrics.json only
                         try:
@@ -477,13 +618,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                                     except Exception:
                                         pass
                                 target_dir = ckpt_root / f"step-{global_step:06d}"
-                                if not target_dir.exists():
-                                    os.makedirs(target_dir, exist_ok=True)
-                                try:
-                                    best_link.symlink_to(target_dir.name)
-                                except Exception:
-                                    with open(ckpt_root / "BEST_STEP", "w") as f:
-                                        f.write(target_dir.name)
+                                # 只有在目标目录确实存在时才创建符号链接
+                                # 不再主动创建目录，只有在保存检查点时才创建
+                                if target_dir.exists():
+                                    try:
+                                        best_link.symlink_to(target_dir.name)
+                                    except Exception:
+                                        with open(ckpt_root / "BEST_STEP", "w") as f:
+                                            f.write(target_dir.name)
                                 # Log best update
                                 if prev_best is None:
                                     overwatch.info(
@@ -524,8 +666,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                             pass
 
                     wrapped_model.train()
-                    if cfg.freeze_vlm:
-                        wrapped_model.module.vlm.eval()
+                    # VLM eval 模式由 LatentWorldVLA.train() 自动管理
 
 
 

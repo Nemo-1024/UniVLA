@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 from typing import Optional, Any, cast, Dict
+import copy
 
 import torch
 import torch.distributed as dist
@@ -27,8 +28,10 @@ from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from transformers.modeling_utils import unwrap_model
 import numpy as np
 import wandb
+from peft import PeftModel
 
 from prismatic.models.vlms import PrismaticVLM
+from prismatic.models.load import _unfreeze_last_n_llm_layers, _resolve_llm_module
 
 
 class SaveProcessorCallback(TrainerCallback):
@@ -88,6 +91,14 @@ class BatchActionAccuracyAndBestCallback(TrainerCallback):
 
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        # embedding/quantized 监督模式下 action accuracy 无意义：直接跳过
+        try:
+            model = kwargs.get("model", None)
+            base = unwrap_model(model) if model is not None else None
+            if base is not None and bool(getattr(base, "supervise_quantized", False)):
+                return control
+        except Exception:
+            pass
         if metrics is None:
             return control
 
@@ -160,14 +171,37 @@ class LoggingCallback(TrainerCallback):
         if manual_token_loss_mean is not None:
             logs["train_token_loss_mean"] = manual_token_loss_mean
 
-        # 如果有待输出的 train_action_accuracy，将其合并到 logs 中
-        if self.trainer_ref is not None and hasattr(self.trainer_ref, '_pending_action_acc'):
-            if self.trainer_ref._pending_action_acc is not None:
-                logs['train_action_accuracy'] = self.trainer_ref._pending_action_acc
-                self.trainer_ref._pending_action_acc = None
-            if hasattr(self.trainer_ref, "_pending_action_top3_acc") and self.trainer_ref._pending_action_top3_acc is not None:
-                logs['train_action_top3_accuracy'] = self.trainer_ref._pending_action_top3_acc
-                self.trainer_ref._pending_action_top3_acc = None
+        # 合并 trainer 缓存的额外日志（loss 分量 / action accuracy / identity shortcut）
+        if self.trainer_ref is not None:
+            # loss 分量（来自模型输出 dict）
+            for key in ("loss_main", "loss_distill", "loss_perceptual", "loss_kl"):
+                pending_key = f"_pending_{key}"
+                if hasattr(self.trainer_ref, pending_key):
+                    val = getattr(self.trainer_ref, pending_key)
+                    if val is not None:
+                        logs[f"train_{key}"] = float(val)
+                        setattr(self.trainer_ref, pending_key, None)
+            
+            # identity shortcut 指标
+            if hasattr(self.trainer_ref, "_pending_identity_shortcut"):
+                if self.trainer_ref._pending_identity_shortcut is not None:
+                    logs["train_identity_shortcut"] = float(self.trainer_ref._pending_identity_shortcut)
+                    self.trainer_ref._pending_identity_shortcut = None
+
+            # action accuracy：embedding/quantized 模式下应跳过
+            try:
+                base = unwrap_model(getattr(self.trainer_ref, "model", None))
+                skip_acc = bool(getattr(base, "supervise_quantized", False)) if base is not None else False
+            except Exception:
+                skip_acc = False
+            if not skip_acc and hasattr(self.trainer_ref, "_pending_action_acc"):
+                if self.trainer_ref._pending_action_acc is not None:
+                    # If trainer already logged these keys via `self.log(...)`, do not override.
+                    logs.setdefault("train_action_accuracy", self.trainer_ref._pending_action_acc)
+                    self.trainer_ref._pending_action_acc = None
+                if hasattr(self.trainer_ref, "_pending_action_top3_acc") and self.trainer_ref._pending_action_top3_acc is not None:
+                    logs.setdefault("train_action_top3_accuracy", self.trainer_ref._pending_action_top3_acc)
+                    self.trainer_ref._pending_action_top3_acc = None
 
         # 本地日志
         if self.log_to_local and self.overwatch is not None:
@@ -184,6 +218,9 @@ class LoggingCallback(TrainerCallback):
                 self.overwatch.info(msg)
             except Exception:
                 pass
+
+        # 注意：不需要手动调用 wandb.log，因为 Trainer 配置了 report_to=["wandb"]
+        # Trainer 会自动将 logs 字典发送到 wandb，包括我们在 callback 中修改的内容
 
 
 
@@ -217,9 +254,113 @@ def run_latent_action_training(
     dataloader_num_workers: int = int(cfg.dataloader_num_workers)
     dataloader_pin_memory: bool = bool(cfg.dataloader_pin_memory)
     seed: int = int(cfg.seed)
+    merge_lora_before_save: bool = bool(getattr(cfg, "lora_merge_before_save", False))
+    unfreeze_llm_last_n_layers: Optional[int] = getattr(cfg, "unfreeze_llm_last_n_layers", None)
+    unfreeze_lam_decoder: bool = bool(getattr(cfg, "unfreeze_lam_decoder", False))
 
     if max_steps is None:
         max_steps = epochs * 10000
+
+    # 在 Trainer 创建前解冻 LLM 最后 n 层，确保优化器能包含这些参数
+    if unfreeze_llm_last_n_layers is not None and int(unfreeze_llm_last_n_layers) > 0:
+        try:
+            base_model = unwrap_model(model)
+            # LatentVLAModel wrapper -> VLM is at base_model.vlm
+            if hasattr(base_model, "vlm"):
+                vlm = base_model.vlm
+            elif hasattr(base_model, "model") and hasattr(base_model.model, "vlm"):
+                vlm = base_model.model.vlm
+            else:
+                vlm = base_model
+
+            llm_module = _resolve_llm_module(vlm)
+            if llm_module is None:
+                if overwatch is not None:
+                    overwatch.warning(
+                        "[run_latent_action_training] Failed to resolve LLM module; "
+                        "skip unfreeze (training may have 0 trainable params)."
+                    )
+            else:
+                ok = _unfreeze_last_n_llm_layers(llm_module, int(unfreeze_llm_last_n_layers))
+                if overwatch is not None:
+                    overwatch.info(
+                        f"[run_latent_action_training] Unfroze last {int(unfreeze_llm_last_n_layers)} LLM layers "
+                        f"before optimizer creation (ok={ok})"
+                    )
+                # Log trainable parameter count AFTER unfreeze (more reliable than the earlier log in vla_scripts/train.py)
+                try:
+                    num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                    num_total = sum(p.numel() for p in model.parameters())
+                    if overwatch is not None:
+                        overwatch.info(
+                            f"[run_latent_action_training] params: {num_total/1e6:.3f}M total, {num_trainable/1e6:.3f}M trainable (after pre-unfreeze)"
+                        )
+                except Exception:
+                    pass
+        except Exception as e:
+            if overwatch is not None:
+                overwatch.warning(f"[run_latent_action_training] LLM unfreeze failed: {e}")
+
+    # 在 Trainer 创建前解冻 LAM decoder，确保优化器能包含这些参数
+    if unfreeze_lam_decoder:
+        try:
+            base_model = unwrap_model(model)
+            # LatentVLAModel wrapper -> LAM is at base_model.lam
+            lam = None
+            if hasattr(base_model, "lam"):
+                lam = base_model.lam
+            elif hasattr(base_model, "model") and hasattr(base_model.model, "lam"):
+                lam = base_model.model.lam
+            
+            if lam is None:
+                if overwatch is not None:
+                    overwatch.warning(
+                        "[run_latent_action_training] Failed to find LAM module; "
+                        "skip decoder unfreeze."
+                    )
+            else:
+                dec = getattr(lam, "decoder", None)
+                if dec is None:
+                    if overwatch is not None:
+                        overwatch.warning(
+                            "[run_latent_action_training] LAM has no decoder; "
+                            "skip decoder unfreeze."
+                        )
+                else:
+                    # 检查 decoder 是否已经被解冻（理论上不应该，除非手动解冻）
+                    dec_params = sum(p.numel() for p in dec.parameters())
+                    already_unfrozen = any(p.requires_grad for p in dec.parameters())
+                    
+                    if already_unfrozen:
+                        if overwatch is not None:
+                            overwatch.info(
+                                f"[run_latent_action_training] LAM decoder ({dec_params/1e6:.3f}M params) already unfrozen; "
+                                "skipping redundant unfreeze"
+                            )
+                    else:
+                        # 执行解冻
+                        for p in dec.parameters():
+                            p.requires_grad = True
+                        if overwatch is not None:
+                            overwatch.info(
+                                f"[run_latent_action_training] Unfroze LAM decoder ({dec_params/1e6:.3f}M params) "
+                                f"before optimizer creation"
+                            )
+                    
+                    # Log trainable parameter count (无论是否已经解冻，都统计一次以供参考)
+                    try:
+                        num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                        num_total = sum(p.numel() for p in model.parameters())
+                        if overwatch is not None:
+                            status = "already unfrozen" if already_unfrozen else "after LAM decoder pre-unfreeze"
+                            overwatch.info(
+                                f"[run_latent_action_training] params: {num_total/1e6:.3f}M total, {num_trainable/1e6:.3f}M trainable ({status})"
+                            )
+                    except Exception:
+                        pass
+        except Exception as e:
+            if overwatch is not None:
+                overwatch.warning(f"[run_latent_action_training] LAM decoder immediate unfreeze failed: {e}")
 
     if cfg.wandb_project:
         os.environ.setdefault("WANDB_PROJECT", str(cfg.wandb_project))
@@ -280,6 +421,14 @@ def run_latent_action_training(
     # 评估指标：基于 token id/labels 计算 action accuracy
     # 为减少内存与通信，将 logits 在设备上转为 token id 再传入 metrics
     def preprocess_logits_for_metrics_fn(logits, labels):
+        # embedding/quantized 监督模式下不计算 action accuracy
+        try:
+            if bool(getattr(model, "supervise_quantized", False)):
+                if isinstance(logits, (tuple, list)):
+                    logits = logits[0]
+                return logits.argmax(dim=-1)
+        except Exception:
+            pass
         if isinstance(logits, (tuple, list)):
             logits = logits[0]
 
@@ -319,6 +468,12 @@ def run_latent_action_training(
 
 
     def compute_metrics_fn(eval_pred: EvalPrediction):
+        # embedding/quantized 监督模式下略过 action accuracy 指标
+        try:
+            if bool(getattr(model, "supervise_quantized", False)):
+                return {}
+        except Exception:
+            pass
         preds = eval_pred.predictions  # numpy array, shape [N, 2] or [N, ...]
 
         metrics = {}
@@ -336,15 +491,8 @@ def run_latent_action_training(
             metrics["action_top3_accuracy"] = float(acc3)
             metrics["eval_action_top3_accuracy"] = metrics["action_top3_accuracy"]
 
-        # 额外手动写入到 wandb，确保可以直接看到 `action_accuracy` 指标
-        try:
-            if wandb.run is not None:
-                # 仅在 rank0 上写入，避免多进程重复 log
-                if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
-                    wandb.log(metrics)
-        except Exception:
-            # 不让日志错误影响训练
-            pass
+        # 注意：不需要手动调用 wandb.log，因为 Trainer 配置了 report_to=["wandb"]
+        # Trainer 会自动将 compute_metrics 返回的 metrics 发送到 wandb
 
         return metrics
 
@@ -357,12 +505,22 @@ def run_latent_action_training(
             self.action_begin = action_token_begin_id
             self.action_end = action_token_end_id
             # 用于累积梯度累积步骤中的精度统计
-            self._accum_step_count = 0  # 追踪当前累积步骤数
+            self._accum_step_count = 0  # 追踪当前累积步骤数（用于 action accuracy）
+            self._accum_step_count_loss = 0  # 追踪当前累积步骤数（用于 loss 分量记录）
             self._pending_action_acc = None  # 动作精度（对齐）
             self._pending_action_top3_acc = None  # top-3 动作精度（对齐）
             # 手动 token 级损失累计（sum/denom），不受梯度累积与节点数影响
             self._manual_loss_sum = 0.0
             self._manual_loss_tokens = 0
+            # 额外 loss 分量缓存（在 on_log 时合并）
+            self._pending_loss_main = None
+            self._pending_loss_distill = None
+            self._pending_loss_perceptual = None
+            self._pending_loss_kl = None
+            # identity shortcut 指标缓存
+            self._pending_identity_shortcut = None
+            # eval 阶段的 loss 分量累计（用于 wandb 记录）
+            self._reset_eval_loss_components()
 
 
         def get_train_dataloader(self):
@@ -442,9 +600,18 @@ def run_latent_action_training(
             
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             """重写 compute_loss 以同时计算 action 精度。"""
-            # 在训练模式下，强制获取 outputs 以计算精度
-            need_outputs_for_accuracy = self.model.training
-            should_return_outputs = return_outputs or need_outputs_for_accuracy
+            # 在训练模式下，强制获取 outputs 以计算精度/记录额外 loss 分量
+            is_embed_mode = False
+            try:
+                base = unwrap_model(model)
+                is_embed_mode = bool(getattr(base, "supervise_quantized", False))
+            except Exception:
+                is_embed_mode = False
+
+            # 训练时始终拿 outputs：用于记录 loss 分量（即便不算 action accuracy）
+            need_outputs_for_accuracy = self.model.training and (not is_embed_mode)
+            need_outputs_for_logging = self.model.training
+            should_return_outputs = return_outputs or need_outputs_for_accuracy or need_outputs_for_logging
             
             # 调用父类的 compute_loss 获取损失和输出
             if should_return_outputs:
@@ -467,16 +634,20 @@ def run_latent_action_training(
                         with torch.no_grad():
                             # 手动 token 级损失累计（跨卡求和，按 token 数归一）
                             try:
-                                flat_labels = labels.reshape(-1)
-                                valid_mask = flat_labels != -100
+                                # 对齐 HuggingFace CausalLM loss：使用 logits[:, :-1] 预测 labels[:, 1:]
+                                logits_shift = logits[:, :-1, :]
+                                labels_shift = labels[:, 1:]
+                                valid_mask = labels_shift != -100
                                 if valid_mask.any():
-                                    flat_logits = logits.reshape(-1, logits.size(-1))
+                                    flat_logits = logits_shift.reshape(-1, logits_shift.size(-1))
+                                    flat_labels = labels_shift.reshape(-1)
+                                    flat_mask = valid_mask.reshape(-1)
                                     loss_sum = F.cross_entropy(
-                                        flat_logits[valid_mask],
-                                        flat_labels[valid_mask],
+                                        flat_logits[flat_mask],
+                                        flat_labels[flat_mask],
                                         reduction="sum",
                                     )
-                                    token_count = valid_mask.sum()
+                                    token_count = flat_mask.sum()
                                     if dist.is_available() and dist.is_initialized():
                                         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
                                         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -517,10 +688,82 @@ def run_latent_action_training(
                                 else:
                                     self._pending_action_acc = None
                                     self._pending_action_top3_acc = None
+
+                                # Log to Trainer directly so integrations (e.g., WandbCallback) always receive it.
+                                # Do NOT rely on mutating `logs` dict in callbacks, as callback order can drop fields.
+                                try:
+                                    if self._pending_action_acc is not None:
+                                        self.log({"train_action_accuracy": float(self._pending_action_acc)})
+                                    if self._pending_action_top3_acc is not None:
+                                        self.log({"train_action_top3_accuracy": float(self._pending_action_top3_acc)})
+                                except Exception:
+                                    pass
                                 # 重置累积器
                                 self._accum_step_count = 0
                 except Exception:
                     # 如果计算精度出错，静默失败，不影响训练
+                    pass
+
+            # 记录模型输出中的额外 loss 分量（wandb/console）
+            # 使用 self.log() 直接记录，确保 Trainer 能正确分组到 train/ 或 eval/
+            if self.model.training and outputs is not None and isinstance(outputs, dict):
+                try:
+                    def _as_float(x):
+                        if x is None:
+                            return None
+                        if torch.is_tensor(x):
+                            return float(x.detach().float().mean().cpu())
+                        return float(x)
+
+                    # 注意：这些 key 来自 LatentVLAModel.forward 的返回 dict
+                    # 使用 self.log() 直接记录，Trainer 会自动添加 train_ 前缀并正确分组
+                    loss_main = _as_float(outputs.get("loss_main"))
+                    loss_distill = _as_float(outputs.get("loss_distill"))
+                    loss_perceptual = _as_float(outputs.get("loss_perceptual"))
+                    loss_kl = _as_float(outputs.get("loss_kl"))
+                    identity_shortcut = outputs.get("identity_shortcut")
+                    
+                    # 转换为 float（如果是 tensor）
+                    if identity_shortcut is not None:
+                        if isinstance(identity_shortcut, (int, float)):
+                            identity_shortcut = float(identity_shortcut)
+                        elif torch.is_tensor(identity_shortcut):
+                            identity_shortcut = float(identity_shortcut.item())
+                        else:
+                            identity_shortcut = None
+                    
+                    # 缓存到 pending 中，在最后一个累积步骤时通过 self.log() 记录
+                    # 这样可以确保 Trainer 能正确分组到 train/ 或 eval/
+                    self._pending_loss_main = loss_main
+                    self._pending_loss_distill = loss_distill
+                    self._pending_loss_perceptual = loss_perceptual
+                    self._pending_loss_kl = loss_kl
+                    self._pending_identity_shortcut = identity_shortcut
+                    
+                    # 使用独立的计数器追踪累积步骤（因为 _accum_step_count 只在计算 accuracy 时更新）
+                    self._accum_step_count_loss += 1
+                    is_last_accum_step = (self._accum_step_count_loss >= self.args.gradient_accumulation_steps)
+                    
+                    if is_last_accum_step:
+                        # 使用 self.log() 直接记录，Trainer 会自动添加 train_ 前缀并正确分组
+                        log_dict = {}
+                        if loss_main is not None:
+                            log_dict["loss_main"] = loss_main
+                        if loss_distill is not None:
+                            log_dict["loss_distill"] = loss_distill
+                        if loss_perceptual is not None:
+                            log_dict["loss_perceptual"] = loss_perceptual
+                        if loss_kl is not None:
+                            log_dict["loss_kl"] = loss_kl
+                        if identity_shortcut is not None:
+                            log_dict["identity_shortcut"] = identity_shortcut
+                        
+                        if log_dict:
+                            self.log(log_dict)
+                        
+                        # 重置计数器
+                        self._accum_step_count_loss = 0
+                except Exception:
                     pass
             
             # 根据原始的 return_outputs 参数决定返回格式
@@ -528,6 +771,22 @@ def run_latent_action_training(
                 return loss, outputs
             else:
                 return loss
+
+        def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
+            """
+            在评估前重置 loss 分量累计，评估后写入 eval_loss_* 到 metrics 并主动 log。
+            """
+            self._reset_eval_loss_components()
+            metrics = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+            extra_metrics = self._finalize_eval_loss_components(metric_key_prefix=metric_key_prefix)
+            if extra_metrics:
+                metrics.update(extra_metrics)
+                try:
+                    # 主动记录，避免额外指标遗漏到 wandb
+                    self.log(extra_metrics)
+                except Exception:
+                    pass
+            return metrics
 
         def prediction_step(self, model, inputs, prediction_loss_only=False, ignore_keys=None):
             """
@@ -569,10 +828,50 @@ def run_latent_action_training(
             if loss is not None and torch.is_tensor(loss):
                 loss = loss.mean().detach()
 
+            # 评估时累计各 loss 分量，便于日志记录 eval_loss_*
+            if (not self.model.training) and isinstance(outputs, dict):
+                try:
+                    for key in ("loss_main", "loss_distill", "loss_perceptual", "loss_kl"):
+                        val = self._to_float(outputs.get(key))
+                        if val is not None:
+                            self._eval_loss_sums[key] += float(val)
+                            self._eval_loss_counts[key] += 1
+                except Exception:
+                    pass
+
             if prediction_loss_only:
                 return loss, None, None
 
             return loss, logits.detach(), labels
+
+        # ------ helpers for eval loss logging ------
+        def _reset_eval_loss_components(self):
+            self._eval_loss_sums = {
+                "loss_main": 0.0,
+                "loss_distill": 0.0,
+                "loss_perceptual": 0.0,
+                "loss_kl": 0.0,
+            }
+            self._eval_loss_counts = {k: 0 for k in self._eval_loss_sums}
+
+        def _finalize_eval_loss_components(self, *, metric_key_prefix: str = "eval"):
+            out = {}
+            for k, s in self._eval_loss_sums.items():
+                c = self._eval_loss_counts.get(k, 0)
+                if c > 0:
+                    out[f"{metric_key_prefix}_{k}"] = s / float(c)
+            return out
+
+        @staticmethod
+        def _to_float(x):
+            if x is None:
+                return None
+            if torch.is_tensor(x):
+                return float(x.detach().float().mean().cpu())
+            try:
+                return float(x)
+            except Exception:
+                return None
 
         def _save(self, output_dir: Optional[str] = None, state_dict=None):
             """
@@ -584,18 +883,32 @@ def run_latent_action_training(
             os.makedirs(output_dir, exist_ok=True)
 
             base_model = unwrap_model(self.model)
+
+            def _save_processor(target_dir):
+                processor_obj = getattr(self, "processing_class", None)
+                if processor_obj is None:
+                    processor_obj = getattr(self, "tokenizer", None)
+                if processor_obj is not None and hasattr(processor_obj, "save_pretrained"):
+                    try:
+                        processor_obj.save_pretrained(target_dir)
+                    except Exception:
+                        pass
+
+            # LoRA: 在保存前将 LoRA 权重合并到基础模型，再进行持久化
+            if isinstance(base_model, PeftModel) and merge_lora_before_save:
+                try:
+                    merged_model = copy.deepcopy(base_model).to("cpu")
+                    merged_model = merged_model.merge_and_unload(progressbar=False)
+                    merged_model.save_pretrained(output_dir, safe_serialization=True)
+                    _save_processor(output_dir)
+                    return
+                except Exception:
+                    # 回退到常规保存，避免训练中断
+                    pass
+
             # 让 HF 内部处理权重共享与 safetensors 保存
             base_model.save_pretrained(output_dir, safe_serialization=True)
-
-            # 保存 processor/tokenizer（优先使用 processing_class，避免 deprecated 警告）
-            processor_obj = getattr(self, "processing_class", None)
-            if processor_obj is None:
-                processor_obj = getattr(self, "tokenizer", None)
-            if processor_obj is not None and hasattr(processor_obj, "save_pretrained"):
-                try:
-                    processor_obj.save_pretrained(output_dir)
-                except Exception:
-                    pass
+            _save_processor(output_dir)
 
             # 其余状态（optimizer/scheduler/scaler）由基类在 save_checkpoint 时处理
             return

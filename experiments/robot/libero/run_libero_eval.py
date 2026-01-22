@@ -66,7 +66,7 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 
-home_path = "/mnt/mnt/public/jlchen"
+home_path = "/mnt/project_rlinf/jlchen"
 @dataclass
 class GenerateConfig:
     # fmt: off
@@ -75,15 +75,20 @@ class GenerateConfig:
     # Model-specific parameters
     #################################################################################################################
     model_family: str = "openvla"                    # Model family
-    vlm_path: str = home_path + "/code/UniVLA/vla_scripts/vla_log/1027_122446+nsvq_bridgensvq_bridge/checkpoints/checkpoint-4000"
-    lam_path: str = home_path + "/code/UniVLA/latent_action_model/logs/nsvq_ddp/version_0/checkpoints/epoch=1.ckpt"
-    flow_path:  str = home_path + "/code/UniVLA/vla_scripts/world_vla_log/1027_221512+checkpoint-4000+libero_object_no_noops+lr-0.0001+freeze_vlm/checkpoints/step-029000/flow.pt"     # Pretrained checkpoint path
-    vision_model_id: str = home_path + "/weights/vjepa2-vitl-fpc64-256"
-    dataset_statistics_path: str = home_path + "/code/UniVLA/vla_scripts/world_vla_log/1015_220104+checkpoint-4000+libero_object_no_noops+lr-0.0001+freeze_vlm/dataset_statistics.json"
+    model_id: str = "/mnt/project_rlinf/jlchen/code/UniVLA/vla_scripts/world_vla_log/0113_161659+weights+libero_object_no_noops+lr-0.0001+frzVis+frzLLM+unfrzLast4+frzEmb--finetune_libero_emb_gt/checkpoints/step-016000"
+    # ↑ 完整模型 checkpoint 目录，包含 VLM、LAM extra 权重（latent_vla_extra.pt）和 Flow 权重（flow.pt）
+    lam_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/checkpoints/epoch=21.ckpt"
+    lam_yaml_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/dino_base_ae.yaml"  # LAM 配置文件
+    # dataset_statistics_path 将自动从 model_id 推导：向上两级目录 + dataset_statistics.json
     center_crop: bool = False                         # Center crop? (if trained w/ random crop image aug)
     image_resolution: int = 256
     window_size: int = 10
-    guidance_scale: float = 1.0
+    num_actions_to_use: int = 5
+    num_inference_steps: int = 20
+    guidance_scale: float = 1.0  # 1.0 = 关闭CFG（仅使用条件分支）；>1.0 = 启用CFG引导
+    use_history_frame: bool = True                  # Whether to use history frame (should match training config)
+    use_simple_model: bool = False
+    future_prediction: bool = False  # 是否使用h_t1_pred（未来特征）；False=使用h_t（当前特征）
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################
@@ -113,20 +118,30 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # [OpenVLA] Set action un-normalization key
     cfg.unnorm_key = cfg.task_suite_name
+    
+    # 自动推导 dataset_statistics_path：从 model_id 向上两级目录 + dataset_statistics.json
+    # 例如：.../checkpoints/step-028000 -> .../dataset_statistics.json
+    cfg.dataset_statistics_path = os.path.join(
+        os.path.dirname(os.path.dirname(cfg.model_id)),
+        "dataset_statistics.json"
+    )
+    print(f"[*] Auto-derived dataset_statistics_path: {cfg.dataset_statistics_path}")
 
     # Load model
     model = get_model(cfg)
 
-    # [OpenVLA] Check that the model contains the action un-normalization key
+    # [OpenVLA] Get Hugging Face processor
+    processor = get_processor(cfg)
+    
+    # [OpenVLA] Check that the processor contains the action un-normalization key
     if cfg.model_family == "openvla":
         # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
         # with the suffix "_no_noops" in the dataset name)
-        if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
+        if cfg.unnorm_key not in processor.norm_stats and f"{cfg.unnorm_key}_no_noops" in processor.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
-        assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
-
-    # [OpenVLA] Get Hugging Face processor
-    processor = get_processor(cfg)
+        elif cfg.unnorm_key not in processor.norm_stats and "libero_all_merged" in processor.norm_stats:
+            cfg.unnorm_key = "libero_all_merged"
+        assert cfg.unnorm_key in processor.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in processor `norm_stats`!"
 
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
@@ -197,6 +212,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
             log_file.write(f"Starting episode {task_episodes+1}...\n")
 
             action_queue = deque(maxlen=cfg.window_size)
+            observation_history = deque(maxlen=cfg.window_size + 1)  # 维护历史帧，最长存储 window_size+1 个观测
+            
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -213,26 +230,63 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     replay_images.append(img)
 
                     # Prepare observations dict
-                    # Note: OpenVLA does not take proprio state as input
+                    # IMPORTANT: State structure must match training data!
+                    # Training uses: [EEF_state(6), padding(1), gripper_state(1)]
+                    # where EEF_state = [eef_pos(3), axisangle(3)]
+                    # and gripper_state = single scalar (average of two gripper joints)
+                    eef_state = np.concatenate([
+                        obs["robot0_eef_pos"],              # 3D position
+                        quat2axisangle(obs["robot0_eef_quat"])  # 3D axis-angle orientation
+                    ])  # 6 dimensions total
+                    
+                    # gripper_state: average of two gripper joints (to match training data)
+                    # 训练数据中使用的是单个gripper状态值
+                    gripper_state = obs["robot0_gripper_qpos"][-1]  # scalar -> 1D array
+                    
+                    # Construct state matching training format: [eef_state(6), 0(1), gripper(1)]
                     observation = {
                         "full_image": img,
-                        "state": np.concatenate(
-                            (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
-                        ),
+                        "state": np.concatenate([
+                            eef_state,              # 6 dimensions
+                            np.array([0.0]),        # 1 padding dimension (matches training)
+                            np.array([gripper_state])  # 1 gripper dimension
+                        ]),  # Total: 8 dimensions
                     }
-                    print("setp: ", t, "state: ", observation["state"].min(),observation["state"].max())
-                    assert observation["state"].shape == (8,), f"Observation state shape: {observation['state'].shape} not 8"
+                    
+                    # Debug: print state range
+                    if t == cfg.num_steps_wait:  # only print first valid timestep
+                        print(f"[DEBUG] State构成: eef_pos={obs['robot0_eef_pos']}, "
+                              f"axisangle={quat2axisangle(obs['robot0_eef_quat'])}, "
+                              f"gripper={gripper_state}")
+                    # print("step: ", t, "state min/max: ", observation["state"].min(), observation["state"].max())
+                    assert observation["state"].shape == (8,), f"Observation state shape: {observation['state'].shape} != 8"
                     if len(action_queue) == 0:
+                        # 选择与当前观测相隔 window_size 个时间步的历史帧；
+                        # 若尚未累积足够历史，则一直使用初始观测
+                        if len(observation_history) == 0:
+                            prev_observation = observation
+                        else:
+                            hist_idx = max(0, len(observation_history) - cfg.window_size)
+                            prev_observation = observation_history[hist_idx]
+
                         # Query model to get action
+                        # 首次推理时启用诊断模式，打印中间特征统计信息
+                        is_first_inference = (total_episodes == 0 and t == cfg.num_steps_wait and len(action_queue) == 0)
                         actions = get_action(
                             cfg,
                             model,
                             observation,
                             task_description,
                             processor=processor,
+                            prev_obs=prev_observation,  # 传递历史帧
+                            debug=is_first_inference,  # 首次推理时打印诊断信息
                         )
-                        action_queue.extend(actions)
-                        print("actions length: ", len(action_queue))
+                        # print("actions: ", actions)
+                        action_queue.extend(actions[:cfg.num_actions_to_use]) 
+                        # print("actions length: ", len(action_queue))
+                    
+                    # 更新历史帧（为下一次推理准备）
+                    observation_history.append(observation)
                     action = action_queue.popleft()
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
@@ -244,11 +298,15 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
-                    if done:
-                        task_successes += 1
-                        total_successes += 1
-                        break
                     t += 1
+                    
+                    # Check if episode is done (success, failure, or timeout)
+                    if done:
+                        # Only count as success if info indicates success
+                        if info.get('success', False):
+                            task_successes += 1
+                            total_successes += 1
+                        break
 
                 except Exception as e:
                     tb = traceback.format_exc()
@@ -288,7 +346,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     f"num_episodes/{task_description}": task_episodes,
                 }
             )
-        break
+        # break
     # Save local log file
     log_file.close()
 

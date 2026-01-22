@@ -81,6 +81,11 @@ def normalize_action_and_proprio(traj: Dict, metadata: Dict, normalization_type:
             elif normalization_type == NormalizationType.BOUNDS_Q99:
                 low = metadata[key]["q01"]
                 high = metadata[key]["q99"]
+            
+            # Note (Moo Jin): Map unused action dimensions (i.e., dimensions where low == high) to all 0s.
+            # Use the actual low/high values being used for normalization, not always min/max
+            zeros_mask = low == high
+            
             mask = metadata[key].get("mask", tf.ones_like(metadata[key]["min"], dtype=tf.bool))
             traj = dl.transforms.selective_tree_map(
                 traj,
@@ -92,8 +97,7 @@ def normalize_action_and_proprio(traj: Dict, metadata: Dict, normalization_type:
                 ),
             )
 
-            # Note (Moo Jin): Map unused action dimensions (i.e., dimensions where min == max) to all 0s.
-            zeros_mask = metadata[key]["min"] == metadata[key]["max"]
+            # Apply zeros_mask to set unused dimensions to 0
             traj = dl.transforms.selective_tree_map(
                 traj, match=lambda k, _: k == traj_key, map_fn=lambda x: tf.where(zeros_mask, 0.0, x)
             )

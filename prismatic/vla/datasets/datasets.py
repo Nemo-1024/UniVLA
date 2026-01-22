@@ -11,7 +11,7 @@ from typing import Any, Dict, Tuple, Type, Optional, Union
 from IPython.display import Video
 from torchvision import transforms
 import torchvision.transforms.v2.functional as F
-from torchvision.transforms import v2
+from torchvision.transforms import v2, InterpolationMode
 import random
 import numpy as np
 import torch
@@ -195,9 +195,6 @@ class RLDSBatchTransformLIBERO:
         language_instruction = rlds_batch["task"]["language_instruction"]
         # ---- 获取视频帧 ----
         video = np.array(rlds_batch["observation"]["image_primary"])  # [T, H, W, C]（固定长度）
-        # 当前帧
-        img = Image.fromarray(video[0])
-        img = img.resize((self.vlm_resolution, self.vlm_resolution), Image.BILINEAR)
         total_frames = len(video)
         assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
@@ -208,7 +205,6 @@ class RLDSBatchTransformLIBERO:
 
         out: Dict[str, Any] = {
             "language_instruction": language_instruction,
-            "img": img,
             "video": video,
             "proprio": np.array(rlds_batch["observation"]["proprio"]),
             "actions": np.array(rlds_batch["action"])
@@ -265,16 +261,22 @@ class RLDSBatchTransformVideo:
     scale: tuple = (0.8, 1.0)
     # ratio: tuple = (0.5625, 1.0)
     ratio: tuple = (0.8, 1.0)    #不要低于1.0，否则会得到细长的图
+    random_rotation: bool = True
+    rotation_degrees: Tuple[float, float] = (-5, 5)
 
 
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
-        """将 RLDS 批次转换为训练所需格式（支持视频与独立首帧增强）"""
+        """
+        将 RLDS 批次转换为训练所需格式（支持视频与独立首帧增强）。
+        
+        注意：保留完整的视频序列（包括历史帧），帧的选择将在 Collator 中进行。
+        """
         action = np.array(rlds_batch["action"])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
-        # ---- 获取视频帧 ----
-        video_frames = np.array(rlds_batch["observation"]["image_primary"][1:])  # [T, H, W, C]  第0帧是历史帧
+        # ---- 获取完整视频帧序列（包括历史帧）----
+        video_frames = np.array(rlds_batch["observation"]["image_primary"])  # [T, H, W, C]
         total_frames = len(video_frames)
         assert total_frames > 0, f"收到空视频帧序列: T={total_frames}"
 
@@ -300,16 +302,34 @@ class RLDSBatchTransformVideo:
                 dec_video[0], scale=self.scale, ratio=self.ratio
             )
             dec_video = F.resized_crop(dec_video, i, j, h, w, size=(image_size, image_size))
+
+        # 🎯 3️⃣ 轻量旋转扰动（保持各自时序一致；decoder 视角仍独立采样一次）
+        if self.random_rotation:
+            angle_video = float(torch.empty(1).uniform_(self.rotation_degrees[0], self.rotation_degrees[1]).item())
+            angle_dec = float(torch.empty(1).uniform_(self.rotation_degrees[0], self.rotation_degrees[1]).item())
+            video = F.rotate(
+                video,
+                angle=angle_video,
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0.0,
+            )
+            dec_video = F.rotate(
+                dec_video,
+                angle=angle_dec,
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0.0,
+            )
         
-        proprio = np.array(rlds_batch["observation"]["proprio"][1:])
+        # 保留完整的 proprio 序列（包括历史状态）
+        proprio = np.array(rlds_batch["observation"]["proprio"])
 
         # 📦 输出
         result = {
-            "video": video,      # [T, 3, H, W]
-            "dec_video": dec_video,    # [T, 3, H, W]
+            "video": video,      # [T, 3, H, W] - 完整序列，包括历史帧
+            "dec_video": dec_video,    # [T, 3, H, W] - 完整序列，包括历史帧
             "task_instruction": lang,
             "action": action,
-            "proprio": proprio,
+            "proprio": proprio,  # [T, state_dim] - 完整序列，包括历史状态
         }
         if "dataset_name" in rlds_batch:
             result["dataset_name"] = rlds_batch["dataset_name"]
@@ -326,7 +346,7 @@ class RLDSDataset(IterableDataset):
         batch_transform: RLDSBatchTransform,
         resize_resolution: Tuple[int, int],
         shuffle_buffer_size: int = 256_000,
-        window_size: int = 10,
+        window_size: int = 20,
         train: bool = True,
         image_aug: bool = False,
         training_phase: str = 'lam',
@@ -334,6 +354,7 @@ class RLDSDataset(IterableDataset):
         async_prefetch_size: int = 128,
         async_transform: bool = False,
         debug_repeat_batch: Union[bool, int] = False,
+        use_history_frame: bool = True,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -357,6 +378,7 @@ class RLDSDataset(IterableDataset):
             load_proprio=True,  # 启用状态数据加载以支持物理接地损失
             load_language=True,
             action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
+            # action_proprio_normalization_type=NormalizationType.BOUNDS
         )
         rlds_config = dict(
             traj_transform_kwargs=dict(
@@ -367,16 +389,17 @@ class RLDSDataset(IterableDataset):
                 # Episode-level shuffle: shuffle full trajectories before chunking.
                 # Only effective when train=True inside apply_trajectory_transforms.
                 episode_shuffle_size=2048 if train else 0,
+                use_history_frame=use_history_frame,                # 控制是否在观察窗口中包含历史帧
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,
-                num_parallel_calls=tf.data.AUTOTUNE,                          # For CPU-intensive ops (decoding, resizing, etc.)
+                num_parallel_calls=12,                          # For CPU-intensive ops (decoding, resizing, etc.)
             ),
             dataset_kwargs_list=per_dataset_kwargs,
             shuffle_buffer_size=shuffle_buffer_size,
             sample_weights=weights,
             balance_weights=True,
-            traj_transform_threads=32,
+            traj_transform_threads=len(mixture_spec),
             traj_read_threads=len(mixture_spec),
             train=train,
             training_phase=training_phase,
@@ -385,24 +408,40 @@ class RLDSDataset(IterableDataset):
         # If applicable, enable image augmentations
         if image_aug:
             # 使用显式关键字参数形式，避免 dlimp/TF 在内部与 seed 关键字冲突（"Got multiple values for argument 'seed'"）
-            rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
-                random_resized_crop=dict(scale=[1.0, 1.0], ratio=[1.0, 1.0]) if training_phase == 'lam' else dict(scale=[0.8, 1.0], ratio=[0.75, 1.0]),
-                # TF: random_brightness(image, max_delta, seed)
-                random_brightness=dict(max_delta=0.1),
-                # TF: random_contrast(image, lower, upper, seed)
-                random_contrast=dict(lower=0.9, upper=1.1),
-                # TF: random_saturation(image, lower, upper, seed)
-                random_saturation=dict(lower=0.9, upper=1.1),
-                # TF: random_hue(image, max_delta, seed)
-                random_hue=dict(max_delta=0.05),
-                augment_order=[
-                    "random_resized_crop",
-                    "random_brightness",
-                    "random_contrast",
-                    "random_saturation",
-                    "random_hue",
-                ],
-            )}),
+            # 注意：在 LAM 阶段不做 random_resized_crop，避免额外 CPU 开销与空间扰动。
+            if training_phase == 'lam' or training_phase == 'lam_2f' or training_phase == 'post-training':
+                rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
+                    # 仅保留颜色类增强
+                    random_brightness=dict(max_delta=0.1),
+                    random_contrast=dict(lower=0.9, upper=1.1),
+                    random_saturation=dict(lower=0.9, upper=1.1),
+                    random_hue=dict(max_delta=0.05),
+                    augment_order=[
+                        "random_brightness",
+                        "random_contrast",
+                        "random_saturation",
+                        "random_hue",
+                    ],
+                )})
+            else:
+                rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
+                    random_resized_crop=dict(scale=[0.8, 1.0], ratio=[0.75, 1.0]),
+                    # TF: random_brightness(image, max_delta, seed)
+                    random_brightness=dict(max_delta=0.1),
+                    # TF: random_contrast(image, lower, upper, seed)
+                    random_contrast=dict(lower=0.9, upper=1.1),
+                    # TF: random_saturation(image, lower, upper, seed)
+                    random_saturation=dict(lower=0.9, upper=1.1),
+                    # TF: random_hue(image, max_delta, seed)
+                    random_hue=dict(max_delta=0.05),
+                    augment_order=[
+                        "random_resized_crop",
+                        "random_brightness",
+                        "random_contrast",
+                        "random_saturation",
+                        "random_hue",
+                    ],
+                )})
         # fmt: on
 
         # Initialize RLDS Dataset

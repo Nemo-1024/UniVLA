@@ -1,7 +1,8 @@
 import math
 from os import listdir, makedirs, path
 from random import choices, randint
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
+from typing import Union
 
 
 import torch
@@ -185,8 +186,9 @@ class LightningOpenX(LightningDataset):
             episodic: bool = False,
             shuffle_buffer_size: int = 100_000,
             image_aug:bool = False,
-            debug_repeat_batch: bool = False,
+            debug_repeat_batch: Union[bool, int] = False,
             training_phase: str = 'lam',
+            use_history_frame: bool = False,
             **kwargs
     ) -> None:
         super(LightningOpenX, self).__init__(batch_size=batch_size, **kwargs)
@@ -201,14 +203,15 @@ class LightningOpenX(LightningDataset):
         self.shuffle_buffer_size = shuffle_buffer_size
         self.image_aug = image_aug
         self.debug_repeat_batch = debug_repeat_batch
+        self.use_history_frame = use_history_frame
         self.num_workers = 0    # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
         self.worker_init_fn = set_global_seed(42, get_worker_init_fn=True)
         self.training_phase = training_phase
-        self.batch_transform = RLDSBatchTransformVideo() # center crop现在在RLDS阶段处理 # totensor已经在此函数内部实现，无需重复
+        self.batch_transform = RLDSBatchTransformVideo(random_resized_crop=True if image_aug else False, random_rotation=True if image_aug else False) # center crop现在在RLDS阶段处理 # totensor已经在此函数内部实现，无需重复
         # self.batch_transform = RLDSBatchTransformVideo(
         #     image_transform= transforms.Compose([transforms.ToTensor(),])  # center crop现在在RLDS阶段处理
         # )
-        self.collate_fn = CollatorForLatentAction()
+        self.collate_fn = CollatorForLatentAction(use_history_frame=use_history_frame)
 
         self.save_hyperparameters()
 
@@ -228,6 +231,7 @@ class LightningOpenX(LightningDataset):
                 async_prefetch=True,
                 async_prefetch_size=128,
                 debug_repeat_batch=self.debug_repeat_batch,
+                use_history_frame=self.use_history_frame,
             )
             self.val_dataset = cls(
                 self.data_root_dir,
@@ -241,6 +245,7 @@ class LightningOpenX(LightningDataset):
                 async_transform=True,
                 async_prefetch=True,
                 async_prefetch_size=128,
+                use_history_frame=self.use_history_frame,
             )
         elif stage == "test":
             self.test_dataset = cls(
@@ -255,6 +260,7 @@ class LightningOpenX(LightningDataset):
                 async_transform=True,
                 async_prefetch=True,
                 async_prefetch_size=128,
+                use_history_frame=self.use_history_frame,
             )
         else:
             raise ValueError(f"Invalid stage: {stage}")

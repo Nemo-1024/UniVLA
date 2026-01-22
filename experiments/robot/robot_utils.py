@@ -61,11 +61,21 @@ def get_image_resize_size(cfg):
     return resize_size
 
 
-def get_action(cfg, model, obs, task_label, processor=None):
+def get_action(cfg, model, obs, task_label, processor=None, prev_obs=None, debug=False):
     """Queries the model to get an action."""
 
     action = get_vla_action(
-        model, processor, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop, guidance_scale=cfg.guidance_scale, window_size=cfg.window_size,
+        model,
+        processor,
+        obs,
+        task_label,
+        cfg.unnorm_key,
+        center_crop=cfg.center_crop,
+        guidance_scale=cfg.guidance_scale,
+        use_history_frame=cfg.use_history_frame,
+        prev_obs=prev_obs,
+        num_inference_steps=cfg.num_inference_steps,
+        debug=debug,  # 传递诊断开关
     )
 
     return action

@@ -3,6 +3,9 @@ import torch
 import math
 import torch.nn.functional as F
 import torch.nn as nn
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+from typing import Optional
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
@@ -38,35 +41,44 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
 def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
+
 def eef_reconstruction_loss(
-    state: torch.Tensor,
     s_pred: torch.Tensor,
+    state_delta: Optional[torch.Tensor] = None,
     pos_loss_type: str = "l1",
     reduction: str = "mean",
 ) -> torch.Tensor:
     """
-    计算末帧 EEF 状态的重建损失（位置 + 朝向 + 抓手开合）。
-    
-    Args:
-        state: 实际状态 (..., T, 8)
-        s_pred: 预测状态 (..., 8)
-        loss_type: 'l1' 或 'l2'
-        reduction: 'mean' | 'sum' | 'none'
+    只使用预先计算的 state_delta 作为监督信号。
+    state 仅用于接口兼容，不参与计算。
     """
-    if len(s_pred.shape)==2:
+    if len(s_pred.shape) == 2:
         s_pred = s_pred.unsqueeze(1)
-    # --- 提取末帧 ---
-    state_gt = state[..., -s_pred.shape[1]:, :]       # (..., 8)
-    # 兼容输入形状：允许 s_pred 为 (..., 8) 或 (..., 1, 8)
 
-    # --- 拆分状态分量 ---
-    pos_ori_target = state_gt[..., :-1]   # 位置 + 朝向 (7维)
-    gripper_target = (state_gt[..., -1:] > 0.0).float()  # 抓手状态 (1维)
+    if state_delta is None:
+        raise ValueError("eef_reconstruction_loss 需要提供 state_delta 作为监督信号。")
 
-    pos_ori_pred = s_pred[..., :-1]
-    gripper_pred = s_pred[..., -1:]
+    num_steps = s_pred.shape[-2]
+    delta = state_delta
+    if not torch.is_tensor(delta):
+        delta = torch.as_tensor(delta, device=s_pred.device, dtype=s_pred.dtype)
+    if delta.dim() == s_pred.dim() - 1:
+        delta = delta.unsqueeze(-2)
+    if delta.shape[-2] == 1 and num_steps > 1:
+        delta = delta.expand(*s_pred.shape[:-2], num_steps, delta.shape[-1])
 
-    # --- 计算位置 + 朝向损失 ---
+    if delta.shape[-1] != s_pred.shape[-1]:
+        raise ValueError(
+            f"state_delta 末尾维度与预测不匹配: delta={delta.shape[-1]}, pred={s_pred.shape[-1]}"
+        )
+
+    gripper_dim = max(1, s_pred.shape[-1] - 7) if s_pred.shape[-1] > 7 else 1
+    pos_ori_target = delta[..., :-gripper_dim]
+    gripper_target = delta[..., -gripper_dim:]
+
+    pos_ori_pred = s_pred[..., :-gripper_dim]
+    gripper_pred = s_pred[..., -gripper_dim:]
+
     if pos_loss_type == "l1":
         pos_ori_loss = torch.abs(pos_ori_pred - pos_ori_target)
     elif pos_loss_type == "l2":
@@ -74,12 +86,10 @@ def eef_reconstruction_loss(
     else:
         raise ValueError(f"Unsupported pos_loss_type: {pos_loss_type}")
 
-    # --- 计算抓手二分类损失 ---
-    gripper_loss = F.binary_cross_entropy_with_logits(
-        gripper_pred, gripper_target, reduction='none'
-    )
-    # --- 聚合 ---
-    total_loss = pos_ori_loss.mean(dim=-1) + 0.1 * gripper_loss.squeeze(-1)
+    # 抓手默认回归（保持与传入 delta 对齐）
+    gripper_loss = torch.abs(gripper_pred - gripper_target)
+
+    total_loss = pos_ori_loss.mean(dim=-1) + 0.1 * gripper_loss.mean(dim=-1)
 
     if reduction == "mean":
         total_loss = total_loss.mean()
@@ -96,4 +106,6 @@ def eef_reconstruction_loss(
 def charbonnier_loss(input: torch.Tensor, target: torch.Tensor, eps: float = 0.1) -> torch.Tensor:
     diff = input - target
     return torch.mean(torch.sqrt(diff * diff + eps * eps))
+
+
 

@@ -1,0 +1,51 @@
+# Finetune LatentWorldVLA on LIBERO, supervise_quantized + perceptual
+
+# Base model & LAM
+model_cfg:
+  model_id: "/mnt/project_rlinf/jlchen/code/UniVLA/vla_scripts/vla_log/0114_155304+vla_emb_unfreeze_llm4_dec_gt_hist_lam_plus/checkpoints/checkpoint-80000"
+  lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/checkpoints/epoch=21.ckpt"
+  lam_yaml_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/dino_base_ae.yaml"
+  supervise_quantized: true
+  perceptual_weight: 0.1
+  # 细粒度冻结策略（替代原有的 freeze_vlm）
+  freeze_vision_backbone: true      # 冻结视觉骨干
+  freeze_llm_backbone: true         # 冻结语言模型骨干
+  freeze_last_llm_layer: true      # 保持 LM head 可训练
+  freeze_embedding: true           # 保持嵌入层可训练
+  unfreeze_vision_merger: true     # 不解冻视觉 merger
+  unfreeze_llm_last_n_layers: 4 # 不解冻最后 N 层（设为数字如 4 可解冻最后4层）
+  unfreeze_lam_decoder: true
+  latent_action_placeholder_token: "<ACT_PH>"
+  future_prediction: true # 是否预测未来特征
+# Dataset & preprocessing
+data_root_dir: "/mnt/project_rlinf/jlchen/datasets"
+data_mix: "libero_all"    # libero_all  libero_object_no_noops
+image_resolution: 256
+shuffle_buffer_size: 20000
+image_aug: true
+use_history_frame: true
+
+debug_repeat_batch: false
+window_size: 10
+
+# Optimization
+batch_size: 32
+max_steps: 100000
+save_steps: 5000
+eval_steps: 1000
+eval_batches: 20
+learning_rate: 1.0e-5
+warmup_steps: 5000
+vlm_learning_rate: 1.0e-5
+vlm_warmup_steps: 5000
+grad_accumulation_steps: 1
+gradient_clip: 1.0  # 增大 10 倍，避免截断有效梯度  
+weight_decay: 1.0e-8
+# vlm_loss_weight: 1.0
+seed: 42
+
+# Logging / run id
+run_id_note: "finetune_libero_all" 
+wandb_project: "finetune-LIBERO"
+wandb_entity: null
+

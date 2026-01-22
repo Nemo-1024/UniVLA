@@ -80,10 +80,10 @@ def get_latent_vla_dataset_and_collator(
     data_transform_fn = RLDSBatchTransformLatentAction,
     collator_fn = PaddedCollatorForActionPrediction,
     latent_action_num_queries: int = None,
-    debug_repeat_batch: bool = True,
+    debug_repeat_batch: bool = False,
     target_seq_len: int = 330,
-    use_history_frame: bool = False,
-
+    use_history_frame: bool = True,
+    window_size: int = 20,
 ) -> Tuple[Dataset, PreTrainedTokenizerBase, PaddedCollatorForActionPrediction]:
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
     # action_tokenizer = ActionTokenizer(tokenizer)
@@ -127,6 +127,8 @@ def get_latent_vla_dataset_and_collator(
         image_aug=image_aug,
         training_phase=training_phase,
         debug_repeat_batch=debug_repeat_batch,
+        use_history_frame=use_history_frame,
+        window_size=window_size,
     )
     val_dataset = cls(
         data_root_dir,
@@ -137,6 +139,8 @@ def get_latent_vla_dataset_and_collator(
         train=False,
         image_aug=False,
         training_phase=training_phase,
+        use_history_frame=use_history_frame,
+        window_size=window_size,
     )
 
     return train_dataset, val_dataset, collator

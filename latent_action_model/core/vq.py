@@ -5,6 +5,183 @@ import torch.distributed as dist
 from torch import Tensor
 from typing import Optional, Tuple, Union, List
 
+
+class VAEQuantizer(nn.Module):
+    """
+    Continuous alternative to VQ: a lightweight VAE bottleneck.
+
+    Interface-compatible with VQ/NSVQ/EMAVQ used by `LatentLAMModel`:
+      - forward(...) returns (quantized, perplexity, indices, entropy_loss, vq_loss)
+      - inference(...) returns (quantized, indices[, distances/logits/probs when requested])
+
+    Notes:
+      - `vq_loss` is the KL divergence loss (optionally weighted by `beta`)
+      - `perplexity`, `indices`, `entropy_loss` are not applicable and returned as zeros / None
+      - Accepts and ignores extra kwargs so existing `vq_kwargs` configs won't break.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 1024,
+        code_dim: int = 128,
+        beta: float = 1.0,
+        clamp_logvar: Optional[float] = 10.0,
+        layer_norm: bool = False,
+        *args,
+        **kwargs,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.code_dim = int(code_dim)
+        self.beta = float(beta)
+        self.clamp_logvar = float(clamp_logvar) if clamp_logvar is not None else None
+
+        self.in_proj = nn.Linear(self.input_dim, self.code_dim) if self.input_dim != self.code_dim else nn.Identity()
+        self.pre_norm = nn.LayerNorm(self.code_dim) if layer_norm else nn.Identity()
+        self.mu = nn.Linear(self.code_dim, self.code_dim)
+        self.logvar = nn.Linear(self.code_dim, self.code_dim)
+        self.out_proj = nn.Linear(self.code_dim, self.input_dim) if self.input_dim != self.code_dim else nn.Identity()
+
+        # for logging parity with VQ modules
+        self.last_kl_loss: Optional[Tensor] = None
+        # mutual information estimate (see forward for details)
+        self.last_mutual_info: Optional[Tensor] = None
+        # KL(q(z) || p(z)) term used in MI computation
+        self.last_qz_kl: Optional[Tensor] = None
+
+    def _encode(self, nodes: Tensor) -> Tuple[Tensor, Tensor]:
+        # Expect nodes: [B, Q, D] or [B, D]; average over query dim to a single latent
+        if nodes.dim() == 2:
+            nodes = nodes.unsqueeze(1)  # [B, 1, D]
+        nodes_pooled = nodes.mean(dim=1, keepdim=True)  # [B, 1, D]
+        h = self.pre_norm(self.in_proj(nodes_pooled))
+        mu = self.mu(h)
+        logvar = self.logvar(h)
+        if self.clamp_logvar is not None:
+            logvar = torch.clamp(logvar, min=-self.clamp_logvar, max=self.clamp_logvar)
+        return mu, logvar
+
+    @staticmethod
+    def _kl_divergence(mu: Tensor, logvar: Tensor) -> Tensor:
+        # KL(q(z|x) || N(0, I)) = 0.5 * sum(mu^2 + exp(logvar) - 1 - logvar)
+        kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar)
+        return kl.sum(dim=-1)  # [...], sum over latent dim
+
+    def forward(self, nodes: Tensor) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor, Tensor, Tensor]:
+        mu, logvar = self._encode(nodes)
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        z = mu + eps * std  # reparameterized sample
+        quantized = self.out_proj(z)
+
+        # mean KL across batch/query positions (standard VAE objective)
+        kl_per_sample = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=-1)  # [...]
+        kl_loss = kl_per_sample.mean()
+        self.last_kl_loss = kl_loss.detach()
+
+        perplexity = nodes.new_tensor(0.0)
+        indices = None
+        entropy_loss = nodes.new_tensor(0.0)
+        vq_loss = kl_loss * self.beta
+        return quantized, perplexity, indices, entropy_loss, vq_loss, mu, logvar
+
+    @torch.no_grad()
+    def inference(
+        self,
+        nodes: Tensor,
+        user_specific=None,
+        return_distance: bool = False,
+        return_logits: bool = False,
+        return_probs: bool = False,
+        temperature: float = 1.0,
+        sample: bool = False,
+        return_stats: bool = False,
+    ):
+        # Deterministic by default: use mean. Optional sampling for analysis.
+        mu, logvar = self._encode(nodes)
+        if sample:
+            std = (0.5 * logvar).exp() * float(temperature)
+            z = mu + torch.randn_like(std) * std
+        else:
+            z = mu
+        quantized = self.out_proj(z)
+        indices = None
+        if return_distance or return_logits or return_probs:
+            return quantized, indices, None, None, None
+        if return_stats:
+            return quantized, indices, mu, logvar
+        return quantized, indices
+
+
+class AEQuantizer(nn.Module):
+    """
+    Simple linear bottleneck used when vq_type='ae'.
+    - Keeps interface compatible with VQ/VAE modules.
+    - Applies dim -> code_dim -> dim projection per query without discrete codes.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 1024,
+        code_dim: int = 128,
+        layer_norm: bool = False,
+        codebook_size: Optional[int] = None,
+        *args,
+        **kwargs,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.code_dim = int(code_dim)
+        # Align with VQ API: expose codebook_size for downstream components
+        self.codebook_size = int(codebook_size) if codebook_size is not None else int(code_dim)
+        self.in_proj = nn.Linear(self.input_dim, self.code_dim) if self.input_dim != self.code_dim else nn.Identity()
+        self.pre_norm = nn.LayerNorm(self.code_dim) if layer_norm else nn.Identity()
+        self.out_proj = nn.Linear(self.code_dim, self.input_dim) if self.input_dim != self.code_dim else nn.Identity()
+        self.last_nodes_norm: Optional[Tensor] = None
+        # Keep parity with VQ modules that expose this attribute
+        self.nodes_norm: Optional[Tensor] = None
+
+    def forward(self, nodes: Tensor):
+        # nodes: [B, Q, D] or [B, D]
+        nodes_proj = self.pre_norm(self.in_proj(nodes))
+        with torch.no_grad():
+            norm_val = torch.norm(nodes_proj, p=2, dim=-1).mean()
+            self.last_nodes_norm = norm_val
+            self.nodes_norm = norm_val
+        quantized = self.out_proj(nodes_proj)
+        batch = nodes.shape[0]
+        num_queries = nodes.shape[1] if nodes.dim() > 1 else 1
+        indices = torch.zeros((batch, num_queries), device=nodes.device, dtype=torch.long)
+        zero_scalar = nodes.new_tensor(0.0)
+        perplexity = zero_scalar
+        entropy_loss = zero_scalar
+        vq_loss = zero_scalar
+        return quantized, perplexity, indices, entropy_loss, vq_loss
+
+    @torch.no_grad()
+    def inference(
+        self,
+        nodes: Tensor,
+        user_specific=None,
+        return_distance: bool = False,
+        return_logits: bool = False,
+        return_probs: bool = False,
+        temperature: float = 1.0,
+        *args,
+        **kwargs,
+    ):
+        nodes_proj = self.pre_norm(self.in_proj(nodes))
+        quantized = self.out_proj(nodes_proj)
+        norm_val = torch.norm(nodes_proj, p=2, dim=-1).mean()
+        self.last_nodes_norm = norm_val
+        self.nodes_norm = norm_val
+        batch = nodes.shape[0]
+        num_queries = nodes.shape[1] if nodes.dim() > 1 else 1
+        indices = torch.zeros((batch, num_queries), device=nodes.device, dtype=torch.long)
+        if return_distance or return_logits or return_probs:
+            return quantized, indices, None, None, None
+        return quantized, indices
+
 class VQ(nn.Module):
 
     def __init__(

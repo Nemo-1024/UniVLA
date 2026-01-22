@@ -25,5 +25,5 @@ fi
 echo "🖥️ 检测到 GPU 数量: ${NUM_GPUS}"
 
 # 以模块方式运行，避免相对导入问题
-torchrun --nproc_per_node ${NUM_GPUS} -m vla_scripts.finetune_libero 
+torchrun --nproc_per_node ${NUM_GPUS} -m vla_scripts.finetune_libero "$@" 
                                 

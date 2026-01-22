@@ -15,8 +15,9 @@ def chunk_act_obs(
     traj,
     window_size,
     future_action_window_size,
-    proprio_threshold_min: float = 0.05,
-    proprio_threshold_max: float = 0.8,
+    proprio_threshold_min: float = 0.1,
+    proprio_threshold_max: float = 1.0,
+    use_history_frame: bool = False,
 ):
     """
     仅取窗口首尾两帧的轻量版 chunk：
@@ -29,13 +30,19 @@ def chunk_act_obs(
     # Create indices for the first and last elements within the window size
     # 只保留完整窗口：起点范围为 [0, traj_len - window_size]
     max_start = tf.maximum(traj_len - window_size, 0)
-    first_indices = tf.range(max_start + 1, dtype=tf.int32)[:, None]  # First index is the current timestep
+    # 起点从 0 开始，避免 window_size > traj_len 时出现 start > limit 报错
+    first_indices = tf.range(0, max_start + 1, dtype=tf.int32)[:, None]  # First index is the current timestep
     last_indices = first_indices + (window_size - 1)
 
-    # Observation chunks: add a historical frame (~30% window back) plus first/last
-    hist_offset = tf.cast(tf.cast(window_size, tf.float32) * 0.5, tf.int32)
-    obs_hist_indices = first_indices - hist_offset
-    obs_chunk_indices = tf.concat([obs_hist_indices, first_indices, last_indices], axis=1)  # [num_chunks, 3]
+    # Observation chunks: 根据 use_history_frame 决定是否添加历史帧
+    if use_history_frame:
+        # add a historical frame (~1 window back) plus first/last
+        hist_offset = tf.cast(window_size, tf.int32)
+        obs_hist_indices = first_indices - hist_offset
+        obs_chunk_indices = tf.concat([obs_hist_indices, first_indices, last_indices], axis=1)  # [num_chunks, 3]
+    else:
+        # only first/last (no history)
+        obs_chunk_indices = tf.concat([first_indices, last_indices], axis=1)  # [num_chunks, 2]
 
     # Action chunks: only first/last (no history)
     action_first_indices = first_indices
@@ -156,23 +163,50 @@ def chunk_act_obs(
     return new_traj
 
 
-def chunk_act_obs_libero(traj: Dict, window_size: int, future_action_window_size: int = 0) -> Dict:
+def chunk_act_obs_libero(
+    traj: Dict, 
+    window_size: int, 
+    future_action_window_size: int = 0,
+    use_history_frame: bool = True,
+) -> Dict:
     """
     Chunks actions and observations into the given window_size.
 
-    "observation" keys are given a new axis (at index 1) of size `window_size` containing `window_size - 1`
-    observations from the past and the current observation. "action" is given a new axis (at index 1) of size
+    "observation" keys are given a new axis (at index 1) of size `window_size` (+ 1 if use_history_frame) 
+    containing past observations and the current observation. "action" is given a new axis (at index 1) of size
     `window_size + future_action_window_size` containing `window_size - 1` actions from the past, the current
     action, and `future_action_window_size` actions from the future. "pad_mask" is added to "observation" and
     indicates whether an observation should be considered padding (i.e. if it had come from a timestep
     before the start of the trajectory).
+    
+    Args:
+        traj: Trajectory dictionary
+        window_size: Size of the observation and action window
+        future_action_window_size: Number of future actions to include (default: 0)
+        use_history_frame: If True, prepend one additional historical frame to observations.
+                          This historical frame is at index t-window_size (before the window).
+                          VLM will see: [history_frame, obs_window...]
+                          LAM will still use: obs_window (starting from current frame)
     """
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
-    chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [traj_len, window_size]) + tf.broadcast_to(
-        tf.range(traj_len)[:, None], [traj_len, window_size]
+    
+    # 基础窗口索引：[-window_size + 1, ..., 0]
+    base_obs_range = tf.range(-window_size + 1, 1)
+    
+    # 如果使用历史帧，在窗口前添加一帧：[-window_size, -window_size + 1, ..., 0]
+    if use_history_frame:
+        obs_range = tf.concat([tf.constant([-window_size]), base_obs_range], axis=0)
+        obs_window_size = window_size + 1
+    else:
+        obs_range = base_obs_range
+        obs_window_size = window_size
+    
+    chunk_indices = tf.broadcast_to(obs_range, [traj_len, obs_window_size]) + tf.broadcast_to(
+        tf.range(traj_len)[:, None], [traj_len, obs_window_size]
     )
-    # print('chunk_indices', chunk_indices)
+    
+    # 动作窗口不受 use_history_frame 影响
     action_chunk_indices = tf.broadcast_to(
         tf.range(-window_size + 1, 1 + future_action_window_size),
         [traj_len, window_size + future_action_window_size],
@@ -194,6 +228,7 @@ def chunk_act_obs_libero(traj: Dict, window_size: int, future_action_window_size
     traj["action"] = tf.gather(traj["action"], floored_action_chunk_indices)
 
     # indicates whether an entire observation is padding
+    # 注意：当 use_history_frame=True 时，observation 的第 0 帧（历史帧）更可能是 padding
     traj["observation"]["pad_mask"] = chunk_indices >= 0
 
     # if no absolute_action_mask was provided, assume all actions are relative
@@ -223,11 +258,14 @@ def chunk_act_obs_uniform_resample(
     *,
     fixed_obs_len: int = 5,
     proprio_threshold_min: float = 0.1,
-    proprio_threshold_max: float = 0.8,
+    proprio_threshold_max: float = 1.0,
+    use_history_frame: bool = False,
 ) -> Dict:
     """
     基于等距重采样的简化版本：
-    - 在物理时间跨度 [-window_size+1, 0] 内，等距采样 fixed_obs_len 帧作为 observation。
+    - 在物理时间跨度内等距采样 fixed_obs_len 帧作为 observation。
+    - 若 use_history_frame=True，时间范围为 [-window_size, 0]（包含额外历史帧）
+    - 若 use_history_frame=False，时间范围为 [-window_size+1, 0]（标准窗口）
     - 动作与观测使用相同的时间索引（不使用 future_action_window_size）。
     - 输出时间维固定为 fixed_obs_len，便于跨数据集对齐。
     - proprio_threshold_min 和 proprio_threshold_max: 若 > 0，则计算窗口首尾 proprio 的欧氏距离，若小于该阈值则丢弃该 chunk（静止片段）。
@@ -235,11 +273,18 @@ def chunk_act_obs_uniform_resample(
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
 
-    # 等距偏移：[-window_size+1, 0] -> fixed_obs_len 个点
+    # 等距偏移：根据 use_history_frame 决定时间范围
+    if use_history_frame:
+        # [-window_size, 0] -> 包含额外的历史帧
+        start_offset = -window_size
+    else:
+        # [-window_size+1, 0] -> 标准窗口
+        start_offset = -window_size + 1
+    
     obs_offsets = tf.cast(
         tf.round(
             tf.linspace(
-                tf.cast(-window_size + 1, tf.float32),
+                tf.cast(start_offset, tf.float32),
                 tf.cast(0, tf.float32),
                 fixed_obs_len,
             )

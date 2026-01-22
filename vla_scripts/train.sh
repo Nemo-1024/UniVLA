@@ -41,7 +41,7 @@ echo "🖥️  当前节点检测到 GPU 数量: ${NUM_GPUS}"
 NNODES=${WORLD_SIZE:-1}
 NODE_RANK=${RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-MASTER_PORT=${MASTER_PORT:-29501} # 使用文档中提到的默认端口或一个自定义端口
+MASTER_PORT=${MASTER_PORT:-29502} # 使用文档中提到的默认端口或一个自定义端口
 
 echo "🌐 分布式训练配置:"
 echo "➡️  节点数量 (nnodes): ${NNODES}"

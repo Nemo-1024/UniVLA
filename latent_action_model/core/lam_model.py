@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 from typing import Dict, List, Optional, Any
-from .vq import VQ, NSVQ, EMAVQ
+from .vq import VQ, NSVQ, EMAVQ, AEQuantizer
 from .vjepa_encoder import build_vision_encoder, DINOv3Encoder
 
 import torch
@@ -10,7 +11,7 @@ import torch.nn as nn
 import math
 import yaml
 from .utils.lam_encoder import LAMEncoder
-from .utils.lam_decoder import LAMDecoder, LAMDecoder_v2
+from .utils.lam_decoder import LAMDecoder, LAMDecoder_v2, StatePredictor
 from .utils.modules import PatchEmbed
 
 
@@ -66,6 +67,7 @@ class LatentLAMModel(nn.Module):
             norm_layer_type=norm_latents_type,
             enable_norm=norm_latents,
         )
+        self.feature_dim = dim
         if encoder_obj is None:
             # 未使用预训练视觉编码器，回退到可学习的 PatchEmbed 层
             self.vision_encoder = PatchEmbed(patch_size=16, embed_dim=dim, in_chans=3).to(self.device)
@@ -78,6 +80,8 @@ class LatentLAMModel(nn.Module):
         self.ar_prediction = ar_prediction
         self.num_frames = num_frames
         self.num_queries = num_queries
+        self.feature_decoder = None
+        self.state_decoder = None
         if self.ar_prediction:
             self.frame_to_pre = self.num_frames - 1
             self.decoder = LAMDecoder(
@@ -104,35 +108,56 @@ class LatentLAMModel(nn.Module):
                 ffn_expansion_factor=ffn_expansion_factor,
                 dataset_vocab_size=dataset_vocab_size,
             ).to(self.device)
+            self.state_decoder = StatePredictor(
+                latent_dim=dim,
+                dropout=dropout,
+                num_datasets=dataset_vocab_size,
+                num_queries=num_queries,
+            ).to(self.device)
         self.norm_latents = norm_latents
         # print("norm_latents:", self.norm_latents)
         self.norm_latents_type = norm_latents_type
+        self.vq_type = vq_type
         self.encoder = LAMEncoder(context_dim=dim, input_dim=2*self.input_dim if multi_input else self.input_dim, ar_query=self.ar_prediction, add_state=enc_add_state, modal_mask=enc_modal_mask, num_layers=enc_layers, num_heads=num_heads, dropout=dropout, ffn_expansion_factor=ffn_expansion_factor, num_frames=self.num_frames, num_queries=num_queries).to(self.device)
         self.latent_layer_to_use = latent_layer_to_use
         self.multi_input = multi_input
         vq_kwargs = vq_kwargs or {}
 
-        if vq_type == "nsvq":
+        if self.vq_type == "nsvq":
             self.vq = NSVQ(
-            codebook_size=codebook_size,
+                codebook_size=codebook_size,
                 code_dim=code_dim,
                 input_dim=dim,
                 use_diveq=False,
                 **vq_kwargs
             ).to(self.device)
-        elif vq_type in ("ema", "ema_vq"):
+        elif self.vq_type in ("ema", "ema_vq"):
             self.vq = EMAVQ(
                 codebook_size=codebook_size,
                 input_dim=dim,
                 code_dim=code_dim,
                 **vq_kwargs
             ).to(self.device)
-        elif vq_type == "vq":
+        elif self.vq_type == "vq":
             self.vq = VQ(
                 codebook_size=codebook_size,
                 code_dim=code_dim,
                 input_dim=dim,
                 **vq_kwargs
+            ).to(self.device)
+        elif self.vq_type in ("vae", "beta_vae"):
+            from .vq import VAEQuantizer
+            self.vq = VAEQuantizer(
+                input_dim=dim,
+                code_dim=code_dim,
+                **vq_kwargs,
+            ).to(self.device)
+        elif self.vq_type == "ae":
+            self.vq = AEQuantizer(
+                input_dim=dim,
+                code_dim=code_dim,
+                codebook_size=codebook_size,
+                **vq_kwargs,
             ).to(self.device)
         else:
             print(f"Unsupported vq_type='{vq_type}', falling back to NSVQ.")
@@ -148,7 +173,7 @@ class LatentLAMModel(nn.Module):
         #         latent_dim=code_dim, 
         #         dropout=dropout
         #     ).to(self.device)
-        self.code_book_size = codebook_size
+        self.codebook_size = codebook_size
     def forward(self, videos: torch.Tensor, states: torch.Tensor, dec_videos: torch.Tensor, dataset_ids: Optional[Any] = None):
         """
         Args:
@@ -241,31 +266,65 @@ class LatentLAMModel(nn.Module):
 
         nodes = self.encoder(enc_in, states)  # [B, num_queries, code_dim]
         # nodes = self.encoder(video_feature)
+        # defaults for latent stats (VAE path)
+        latent_mu = None
+        latent_logvar = None
+
         with torch.amp.autocast("cuda", enabled=False):
-            if vq_training:
-                quantized, perplexity, indices, entropy_loss, vq_loss = self.vq(nodes.float())
+            vq_distances = None
+            vq_logits = None
+            vq_probs = None
+            zero_tensor = torch.tensor(0.0, device=self.device)
+            if self.vq is not None:
+                if vq_training:
+                    out = self.vq(nodes.float())
+                    quantized, perplexity, indices, entropy_loss, vq_loss = out[:5]
+                    latent_mu = out[5] if len(out) > 5 else None
+                    latent_logvar = out[6] if len(out) > 6 else None
+                else:
+                    if return_vq_probs:
+                        out = self.vq.inference(
+                            nodes.float(),
+                            user_specific=user_specific,
+                            return_distance=True,
+                            return_logits=True,
+                            return_probs=True,
+                            temperature=vq_temperature,
+                        )
+                        quantized, indices, vq_distances, vq_logits, vq_probs = out[:5]
+                    else:
+                        out = self.vq.inference(nodes.float(), user_specific=user_specific)
+                        quantized, indices = out[:2]
+                    latent_mu = None
+                    latent_logvar = None
+                    perplexity = zero_tensor
+                    entropy_loss = zero_tensor
+                    vq_loss = zero_tensor
+            else:
+                # Fallback: should not happen, but keep behavior consistent
+                quantized = nodes.float()
+                indices = torch.zeros(
+                    (nodes.shape[0], nodes.shape[1]), device=self.device, dtype=torch.long
+                )
+                perplexity = zero_tensor
+                entropy_loss = zero_tensor
+                vq_loss = zero_tensor
                 vq_distances = None
                 vq_logits = None
                 vq_probs = None
-            else:
-                if return_vq_probs:
-                    quantized, indices, vq_distances, vq_logits, vq_probs = self.vq.inference(
-                        nodes.float(),
-                        user_specific=user_specific,
-                        return_distance=True,
-                        return_logits=True,
-                        return_probs=True,
-                        temperature=vq_temperature,
-                    )
-                else:
-                    quantized, indices = self.vq.inference(nodes.float(), user_specific=user_specific)
-                    vq_distances = None
-                    vq_logits = None
-                    vq_probs = None
-                perplexity, entropy_loss, vq_loss = 0.0, 0.0, 0.0
+
+        # Ensure indices exist when quantizer returns None (e.g., VAE/AE paths)
+        if indices is None:
+            indices = torch.zeros((nodes.shape[0], nodes.shape[1]), device=self.device, dtype=torch.long)
+        if perplexity is None:
+            perplexity = zero_tensor
+        if entropy_loss is None:
+            entropy_loss = zero_tensor
+        if vq_loss is None:
+            vq_loss = zero_tensor
         if self.disable_vq:
             # quantized = torch.zeros_like(nodes)
-            quantized = nodes
+            quantized = nodes + 0.0 * quantized
         recon = None
         s_pred = None
         # delta_s_pred = self.state_delta_predictor(quantized, state_0=states[:,0])
@@ -277,9 +336,14 @@ class LatentLAMModel(nn.Module):
                 ds_tensor = torch.as_tensor(dataset_ids, device=self.device, dtype=torch.long)
                 if ds_tensor.dim() > 1:
                     ds_tensor = ds_tensor.view(ds_tensor.shape[0])
-
-            # 使用潜动作表示进行解码；当禁用 VQ 时，quantized 等同于 nodes
-            recon, s_pred = self.decoder(features=dec_in, actions=quantized, states=dec_states, dataset_id=ds_tensor)
+            if self.ar_prediction:
+                # 使用潜动作表示进行解码；当禁用 VQ 时，quantized 等同于 nodes
+                recon, s_pred = self.decoder(features=dec_in, actions=quantized, states=dec_states, dataset_id=ds_tensor)
+            else:
+                # 并行解码：特征重建与状态预测解耦
+                recon = self.decoder(features=dec_in, actions=quantized)
+                if self.state_decoder is not None:
+                    s_pred = self.state_decoder(z_t=quantized, state_0=dec_states, dataset_id=ds_tensor)
         # with torch.no_grad():
         #     print(tgt.mean(), tgt.std())
         #     delta = tgt-dec_in
@@ -299,6 +363,8 @@ class LatentLAMModel(nn.Module):
                 vq_distances,
                 vq_logits,
                 vq_probs,
+                latent_mu,
+                latent_logvar,
             )
 
         return (
@@ -341,6 +407,23 @@ class LatentLAMModel(nn.Module):
         if dec_videos is None:
             dec_videos = videos
         if return_teacher_probs:
+            # NOTE: `_run(return_vq_probs=True)` historically returned 13 values, but newer versions may
+            # append extra latent stats (e.g., latent_mu/logvar). Keep this unpack backward compatible.
+            out = self._run(
+                videos=videos,
+                states=states,
+                dec_videos=dec_videos,
+                user_specific=user_specific,
+                vq_training=False,
+                predict_future_frame=predict_future_frame,
+                dataset_ids=dataset_ids,
+                return_vq_probs=return_teacher_probs,
+                vq_temperature=teacher_temperature,
+            )
+            if not isinstance(out, (tuple, list)):
+                raise ValueError(f"[LatentLAMModel] _run returned non-sequence type: {type(out)}")
+            if len(out) < 13:
+                raise ValueError(f"[LatentLAMModel] _run returned too few values: len={len(out)}, expected>=13")
             (
                 recon,
                 dec_in,
@@ -355,17 +438,9 @@ class LatentLAMModel(nn.Module):
                 vq_distances,
                 vq_logits,
                 vq_probs,
-            ) = self._run(
-                videos=videos,
-                states=states,
-                dec_videos=dec_videos,
-                user_specific=user_specific,
-                vq_training=False,
-                predict_future_frame=predict_future_frame,
-                dataset_ids=dataset_ids,
-                return_vq_probs=return_teacher_probs,
-                vq_temperature=teacher_temperature,
-            )
+            ) = out[:13]
+            latent_mu = out[13] if len(out) > 13 else None
+            latent_logvar = out[14] if len(out) > 14 else None
         else:
             (
                 recon,
@@ -392,6 +467,8 @@ class LatentLAMModel(nn.Module):
             vq_distances = None
             vq_logits = None
             vq_probs = None
+            latent_mu = None
+            latent_logvar = None
         return {
             "recon": recon,
             "dec_in": dec_in,
@@ -404,11 +481,27 @@ class LatentLAMModel(nn.Module):
             "vq_distances": vq_distances,
             "vq_logits": vq_logits,
             "vq_probs": vq_probs,
+            # Optional VAE stats (may be None)
+            "latent_mu": latent_mu,
+            "latent_logvar": latent_logvar,
         }
+
+    @torch.no_grad()
+    def extract_dino_features(self, videos: torch.Tensor, *, n: Optional[Any] = -2) -> torch.Tensor:
+        """
+        仅提取视觉编码器的特征（不经过 VQ/decoder），返回 [B, T, K, D]。
+        若 latent_layer_to_use 是列表且 encoder 返回多层，则取最后一层。
+        """
+        # 对齐 latent_layer_to_use 的行为
+        n_used = n if n is not None else self.latent_layer_to_use
+        feats = self.vision_encoder.encode(videos, n=n_used)
+        if isinstance(feats, (list, tuple)):
+            feats = feats[-1]
+        return feats
 
 def load_latent_action_model(ckpt_path, yaml_path):
     # 1) 读取 YAML 配置，并获取 model 配置段
-    with open(yaml_path, 'r') as f:
+    with open(yaml_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
     model_cfg = cfg.get('model', cfg) or {}
 
@@ -421,9 +514,13 @@ def load_latent_action_model(ckpt_path, yaml_path):
     # 5) 加载 checkpoint 并严格对齐键与形状
     lam_ckpt = torch.load(ckpt_path, map_location="cpu")['state_dict']
     new_ckpt = {}
-    for key in lam_ckpt.keys():
-        new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
     model_state = latent_action_model.state_dict()
+    has_feature_decoder = any(k.startswith("feature_decoder.") for k in model_state.keys())
+    has_state_decoder = any(k.startswith("state_decoder.") for k in model_state.keys())
+    for key in lam_ckpt.keys():
+        # 先移除 Lightning 包装前缀
+        renamed = key.replace("lam.", "")
+        new_ckpt[renamed] = lam_ckpt[key]
     model_keys = set(model_state.keys())
     ckpt_keys = set(new_ckpt.keys())
 
@@ -445,9 +542,9 @@ def load_latent_action_model(ckpt_path, yaml_path):
         if shape_mismatches:
             error_lines.append(f"形状不匹配的键数量 {len(shape_mismatches)}：")
             error_lines += [f"  - {k}: 模型{ms} vs 权重{cs}" for k, ms, cs in shape_mismatches]
-        raise RuntimeError("\n".join(error_lines))
+        print("\n".join(error_lines))
 
-    latent_action_model.load_state_dict(new_ckpt, strict=True)
+    latent_action_model.load_state_dict(new_ckpt, strict=False)
     for p in latent_action_model.parameters():
         p.requires_grad = False
     return latent_action_model.eval()

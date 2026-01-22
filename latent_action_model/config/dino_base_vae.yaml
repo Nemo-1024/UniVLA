@@ -11,26 +11,38 @@
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
-  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m"    #必须修改resolution，dino是224，vjepa是256
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
-  dim: 1024                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
-  enc_layers: 16               # LAM 编码器层数 16head
-  ffn_expansion_factor: 4
-  norm_latents: false
-  codebook_size: 16          # 码本大小
-  code_dim: 64                # 码本维度
+  dim: 768                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
+  enc_layers: 12               # LAM 编码器层数 16head
+  ffn_expansion_factor: 3
+  num_heads: 12
+  codebook_size: 32        # 码本大小
+  code_dim: 16                # 码本维度
   ar_prediction: false
-  dec_layers: 16                # 解码器层数
-  dropout: 0.1                 # Dropout 率              
-  warmup_steps: 500           # 预热步数；0 表示关闭预热
+  num_queries: 1
+  num_frames: 2
+  dec_layers: 12                # 解码器层数
+  dropout: 0.0                 # Dropout 率              
+  warmup_steps: 0           # 预热步数；0 表示关闭预热
+  enc_add_state: false
+  enc_modal_mask: true
+  lambda_aux: 1.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
+  loss_type: "l2"
 
-  lambda_aux: 0.1                         # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
-  loss_type: "l1"
-  lambda_diversity: 0.0
-  vq_type: "nsvq"
+  latent_layer_to_use: -2
+  multi_input: false
+  norm_latents: true                 #归一化latents
+  norm_latents_type: "ln"
+  lambda_diversity: 0.0            #0.03与重建损失同一数量级
+  vq_type: "vae"
+
   project: lam
-  task_name: dino_ddp_diveq
+  task_name: dino_base_vae
+
+
   wandb_offline: true
   
   # 训练参数
@@ -38,7 +50,7 @@ model:
     class_path: torch.optim.AdamW
     init_args:
       lr: 1e-4
-      weight_decay: 1e-2
+      weight_decay: 1e-4
   
   # 索引保存参数
   make_data_pair: false        # 是否生成数据对
@@ -47,25 +59,28 @@ model:
 # 数据参数
 data:
   data_root: /mnt/project_rlinf/jlchen/datasets
-  data_mix: lam_plus    # Manip. + Navi. + Human
-  batch_size: 32
+  data_mix: lam_plus   # Manip. + Navi. + Human
+  batch_size: 128
   resolution: 256            #dino是256
   episodic: false
-  shuffle_buffer_size: 102400   # 根据内存大小调整
+  shuffle_buffer_size: 10240   # 根据内存大小调整
   image_aug: true
+  training_phase: lam_2f
+  debug_repeat_batch: false
 
 # 训练器参数
 trainer:
-  max_epochs: 20
+  max_epochs: 40
   accelerator: gpu
   devices: auto
   # strategy: ddp_find_unused_parameters_true
   strategy: ddp_find_unused_parameters_false
-  precision: bf16-mixed
+  accumulate_grad_batches: 1    
+  precision: bf16-mixed            #bf16-mixed 32-true 
   log_every_n_steps: 1000
   gradient_clip_val: 1.0
   # enable_progress_bar: false  # 禁用重复的进度条
-  val_check_interval: 900
+  val_check_interval: 999
   num_sanity_val_steps: 0
   limit_val_batches: 100
 
@@ -77,13 +92,10 @@ trainer:
         save_last: true
         save_top_k: -1
         # save_on_train_epoch_end: true    # 每个epoch结束时也保存
-        every_n_epochs: 1
+        every_n_epochs: 2
         # every_n_train_steps: 10000
         filename: "{epoch}"
         
-    - class_path: latent_action_model.core.lam_lightinng.CodebookMaintenanceCallback
-      init_args:
-        interval_steps: 1000
 
     - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
 
@@ -91,7 +103,12 @@ trainer:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
         save_dir: latent_action_model/logs
-        name: dino_ddp_diveq
+        name:  dino_base_vae
+
+
+
+
+
 
     # - class_path: lightning.pytorch.loggers.WandbLogger
     #   init_args:

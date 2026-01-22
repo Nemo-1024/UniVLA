@@ -1,5 +1,8 @@
 import json
 import os
+import sys
+import shutil
+import copy
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Tuple, Union, Dict, Any
@@ -14,11 +17,12 @@ from prismatic.overwatch import initialize_overwatch
 from prismatic.util import set_global_seed
 from prismatic.vla import get_latent_vla_dataset_and_collator
 from prismatic.vla.datasets.datasets import RLDSDataset
-from prismatic.models import load_vlm_auto, freeze_vlm_generic
+from prismatic.models import load_vlm_auto, freeze_vlm_generic, freeze_qwen3vl
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from typing import cast
 from prismatic.training.accelerate_fsdp_trainer import run_latent_action_training
 from prismatic.vla.latent_vla_model import LatentVLAModel
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoProcessor
 
 # Sane Defaults
@@ -33,7 +37,7 @@ overwatch = initialize_overwatch(__name__)
 # 🔢 对应的 token ID: [151679, 151680, 151681, 151682, 151683, 151684, 151685, 151686, 151687, 151688, 151689, 151690, 151691, 151692, 151693, 151694]
 # 🎯 action_token_begin_id = 151679
 # 📊 ID 范围: 151679 - 151694
-home_path = "/mnt/mnt/public/jlchen"
+home_path = "/mnt/project_rlinf/jlchen"
 @dataclass
 class TrainConfig:
     # fmt: off
@@ -48,8 +52,8 @@ class TrainConfig:
     # Hugging Face 模型标识（或本地权重目录）；用于 PrismaticVLM.from_pretrained()
     model_id: str = home_path + "/weights/InternVL3_5-1B-Instruct-HF"
     hf_cache_dir: Optional[Path] = None
-    lam_ckpt_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_bridge_noar_noposnos_nsvq_5-7/version_1/checkpoints/epoch=19.ckpt"
-    lam_yaml_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_bridge_noar_noposnos_nsvq_5-7/version_1/dino_bridge.yaml"
+    lam_ckpt_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_base_4q_32_norep/version_0/checkpoints/epoch=4.ckpt"
+    lam_yaml_path: str = home_path + "/code/UniVLA/latent_action_model/logs/dino_base_4q_32_norep/version_0/dino_base.yaml"
 
     # =========================
     # 数据与预处理
@@ -72,18 +76,53 @@ class TrainConfig:
     freeze_llm_backbone: bool = False
     freeze_last_llm_layer: bool = False
     freeze_projector: bool = False
+    freeze_embedding: bool = False  # 冻结 embedding 层
+    # 仅解冻视觉 backbone 中的 patch merger（如 Qwen3-VL 的 vision_model.merger / deepstack_merger_list）
+    # 常用于 freeze_vision_backbone=True 时仍允许轻量适配视觉 patch 合并层。
+    unfreeze_vision_merger: bool = False
+    # 解冻 LLM 最后 n 层（需要配合 freeze_llm_backbone=True 使用）
+    # 注意：解冻将在优化器创建前立即执行
+    unfreeze_llm_last_n_layers: Optional[int] = None
+    unfreeze_lam_decoder: bool = False
+    # =========================
+    # LoRA 低秩适配
+    # =========================
+    enable_lora: bool = False
+    lora_r: int = 32
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+    lora_bias: str = "none"  # ["none", "all", "lora_only"]
+    lora_target_modules: Tuple[str, ...] = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+    lora_task_type: str = "CAUSAL_LM"
+    lora_merge_before_save: bool = True
 
     # =========================
     # LAM / 动作离散参数
     # =========================
     latent_action_placeholder_token: str = "<ACT_PH>"
-    enable_lam_encoder_distill: bool = False
+    # === 动作监督模式说明 ===
+    # - supervise_quantized=True: 不使用 token CE，改为在 <ACT_PH> 位置注入可学习 query，并主监督回归 LAM quantized
+    supervise_quantized: bool = False
+    # quantized 回归损失类型：cosine 或 mse
+    quantized_loss_type: str = "mse"
     enable_lam_decoder_perceptual: bool = False
     enable_lam_kl_loss: bool = False
     lam_encoder_distill_weight: float = 1.0
-    lam_decoder_perceptual_weight: float = 0.0
+    lam_decoder_perceptual_weight: float = 1.0
     new_token_lr_scale: float = 1.0  # 对新增 special tokens 的 embedding 梯度放大倍数（>1 放大，=1 不变）
+    # supervise_quantized 模式下，对 query / 回归头施加梯度放大（类似 new_token_lr_scale，但作用于参数整体）
+    act_query_lr_scale: float = 1.0
+    vlm_to_lam_lr_scale: float = 1.0
     use_latent_vla_model: bool = True
+    lam_decoder_target: str = "teacher"
     # vision_model_id: str = home_path + "/weights/dinov3-vitl16-pretrain-lvd1689m"
     # =========================
     # 训练设置
@@ -104,8 +143,9 @@ class TrainConfig:
     # 训练加速
     enable_mixed_precision_training: bool = False
     seed: int = 42                                                  # Random seed (for reproducibility)
-    logging_steps: int = 1
+    logging_steps: int = 50
     use_history_frame: bool = False
+    window_size: int = 20
     # =========================
     # 评估与保存
     # =========================
@@ -158,12 +198,18 @@ def train(cfg: TrainConfig) -> None:
     """
     overwatch.info("OpenVLA Training :: Warming Up")
 
+    # ---- Config info for action supervision ----
+    if bool(getattr(cfg, "supervise_quantized", False)):
+        overwatch.info(
+            "[TrainConfig] supervise_quantized=True: using quantized regression as main supervision (no token CE), with learnable queries at <ACT_PH>."
+        )
+
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
     torch.cuda.set_device(device_id := overwatch.local_rank())
     torch.cuda.empty_cache()
     # 尽量保持确定性，减少 LAM/VQ 输出的随机波动
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
 
     # Configure Unique Run Name & Save Directory
     vla_tag = f"{cfg.model_id.split('/')[-1]}+{cfg.data_mix}"
@@ -205,6 +251,31 @@ def train(cfg: TrainConfig) -> None:
     if dist.is_initialized():
         dist.barrier()
 
+    # 保存本次运行的配置文件到日志目录（rank0）
+    if (not dist.is_initialized()) or overwatch.is_rank_zero():
+        try:
+            # 1) 保存命令行
+            (run_dir / "argv.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
+
+            # 2) 若通过 draccus `--config` 指定了 YAML/JSON/TOML，则复制原始文件
+            src_cfg = None
+            if "--config" in sys.argv:
+                i = sys.argv.index("--config")
+                if i + 1 < len(sys.argv):
+                    src_cfg = sys.argv[i + 1]
+            # 兼容常见短参数
+            if src_cfg is None and "-c" in sys.argv:
+                i = sys.argv.index("-c")
+                if i + 1 < len(sys.argv):
+                    src_cfg = sys.argv[i + 1]
+            if src_cfg is not None:
+                src_path = Path(src_cfg).expanduser()
+                if src_path.exists() and src_path.is_file():
+                    # 使用原配置文件名
+                    shutil.copy2(str(src_path), str(run_dir / src_path.name))
+        except Exception:
+            pass
+
     # 仅 rank0 写入文件日志，并避免重复添加 FileHandler
     if (not dist.is_initialized()) or overwatch.is_rank_zero():
         try:
@@ -236,16 +307,40 @@ def train(cfg: TrainConfig) -> None:
     debug_mode = bool(cfg.debug_repeat_batch)
     latent_vla_model, processor = LatentVLAModel.from_config(cfg, overwatch=overwatch, debug_mode=debug_mode)
 
+    # LoRA 适配（默认仅作用于 LLM/text backbone）
+    if cfg.enable_lora:
+        task_type = getattr(TaskType, str(cfg.lora_task_type).upper(), TaskType.CAUSAL_LM)
+        lora_config = LoraConfig(
+            r=int(cfg.lora_r),
+            lora_alpha=int(cfg.lora_alpha),
+            lora_dropout=float(cfg.lora_dropout),
+            bias=str(cfg.lora_bias),
+            target_modules=list(cfg.lora_target_modules) if cfg.lora_target_modules else None,
+            task_type=task_type,
+        )
+        # 如果启用 LoRA，则确保 backbone 不被整体冻结
+        if cfg.freeze_llm_backbone:
+            overwatch.info("LoRA enabled: overriding freeze_llm_backbone=False to train adapters")
+            cfg.freeze_llm_backbone = False
 
-    # 按配置冻结 VLM（内部已注册 tokenizer），保持显存与训练策略
-    freeze_vlm_generic(
+        latent_vla_model.vlm = get_peft_model(latent_vla_model.vlm, lora_config)
+        try:
+            latent_vla_model.vlm.print_trainable_parameters()
+        except Exception:
+            pass
+
+
+    # 按配置冻结/解冻 VLM（内部已注册 tokenizer），保持显存与训练策略
+    # Qwen3-VL: use explicit (non-generic) freezing logic for stability.
+
+    freeze_qwen3vl(
         latent_vla_model.vlm,
         cfg.freeze_vision_backbone,
-        cfg.freeze_projector,
         cfg.freeze_llm_backbone,
         cfg.freeze_last_llm_layer,
+        cfg.freeze_embedding,
+        cfg.unfreeze_vision_merger,
     )
-
     num_params = sum(p.numel() for p in latent_vla_model.parameters())
     num_trainable_params = sum(p.numel() for p in latent_vla_model.parameters() if p.requires_grad)
     overwatch.info(
@@ -267,6 +362,7 @@ def train(cfg: TrainConfig) -> None:
         debug_repeat_batch=cfg.debug_repeat_batch,
         target_seq_len=350 if "InternVL" in cfg.model_id else 250,
         use_history_frame=cfg.use_history_frame,
+        window_size=cfg.window_size,
     )
 
 
@@ -277,7 +373,9 @@ def train(cfg: TrainConfig) -> None:
     # 组装组合模型（VLM + LAM）
     # 使用 Accelerate + FSDP 的新训练器（直接传入 dataclass -> dict）
     overwatch.info("🚀 启动 VLA 训练循环（Accelerate+FSDP）；首次 step 可能较慢（初始化 FSDP/AMP）")
-    dist.barrier()
+    # Avoid hanging when torch.distributed was not initialized by the launcher.
+    if dist.is_initialized():
+        dist.barrier()
     run_latent_action_training(
         cfg=cfg,
         model=latent_vla_model,

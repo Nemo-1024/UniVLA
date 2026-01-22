@@ -171,6 +171,12 @@ class VJEPA_LAM(LightningModule):
         else:
             recon, dec_in, tgt, perplexity, indices, delta_s_pred, features, _, entropy_loss, vq_loss = self.lam.inference(videos, states, dec_videos, dataset_ids=dataset_ids)
 
+        # 简易烟囱测试：确保解码输出存在且形状匹配目标
+        if recon is None:
+            raise RuntimeError("Decoder output is None; check latent_mode / decoder setup.")
+        if recon.shape != tgt.shape:
+            raise RuntimeError(f"Decoder output shape {recon.shape} mismatch target {tgt.shape}.")
+
         target = tgt
         # recon_loss = F.mse_loss(recon, target)
         # 余弦相似度指标（不参与梯度计算）
@@ -178,7 +184,10 @@ class VJEPA_LAM(LightningModule):
             cos_sim_metric = F.cosine_similarity(recon, target, dim=-1).mean()
             l1_loss_metric = F.l1_loss(recon, target)
         if self.loss_type == "l1":
-            recon_loss = F.smooth_l1_loss(recon, target, beta=0.25)
+            recon_loss = F.l1_loss(recon, target)
+            loss = recon_loss
+        elif self.loss_type == "smooth_l1":
+            recon_loss = F.smooth_l1_loss(recon, target, beta=0.1)
             loss = recon_loss
         elif self.loss_type == "cos":
             cos_sim = F.cosine_similarity(recon, target, dim=-1).mean()
@@ -204,11 +213,12 @@ class VJEPA_LAM(LightningModule):
 
         if "proprio" in batch and delta_s_pred is not None:
             states = batch["proprio"]
+            state_deltas = batch.get("delta_proprio", None)
             robot_indices = self._detect_robot_data(states)
             if len(robot_indices) > 0:
                 delta_s_pred_robot = delta_s_pred[robot_indices]
-                states_robot = states[robot_indices]
-                state_loss = eef_reconstruction_loss(states_robot, delta_s_pred_robot)
+                delta_robot = state_deltas[robot_indices] if state_deltas is not None else None
+                state_loss = eef_reconstruction_loss(delta_s_pred_robot, state_delta=delta_robot)
                 aux_loss = self.lambda_aux * state_loss
                 aux_loss_logs["state_loss"] = aux_loss.item()
                 # aux_loss_logs["robot_data_count"] = torch.tensor(len(robot_indices), device=self.device)
@@ -229,32 +239,32 @@ class VJEPA_LAM(LightningModule):
                 **aux_loss_logs,
             }
             # 追加 VQ 内部的熵相关分量，便于在 WandB / TensorBoard 中观察
-            vq_module = self.lam.vq
-            if hasattr(vq_module, "last_sample_entropy"):
-                logs["sample_entropy"] = vq_module.last_sample_entropy
-            if hasattr(vq_module, "last_codebook_entropy"):
-                logs["codebook_entropy"] = vq_module.last_codebook_entropy
-            if hasattr(vq_module, "nodes_norm"):
-                logs["nodes_norm"] = vq_module.nodes_norm
-            if hasattr(vq_module, "last_commitment_loss"):
-                logs["commitment_loss"] = vq_module.last_commitment_loss
-            if hasattr(vq_module, "last_orthogonal_loss") and vq_module.last_orthogonal_loss is not None:
-                logs["orthogonal_loss"] = vq_module.last_orthogonal_loss
-            # 记录每个样本在当前 batch 中使用到的唯一 code 数的平均值
-            if hasattr(vq_module, "last_avg_unique_codes"):
-                logs["avg_unique_codes"] = vq_module.last_avg_unique_codes
-                # logs["cos_sim_ori"] = cos_sim_ori
-            if self.lambda_diversity >0:
-                logs["entropy_loss"] = entropy_loss
-            # 记录 VQ 中 slot 相关重复率指标（基于离散码索引）
-            if hasattr(vq_module, "last_slot_inter_redundancy") and vq_module.last_slot_inter_redundancy is not None:
-                logs["slot_inter_redundancy"] = vq_module.last_slot_inter_redundancy
-            if hasattr(vq_module, "last_slot_inner_redundancy") and vq_module.last_slot_inner_redundancy is not None:
-                logs["slot_inner_redundancy"] = vq_module.last_slot_inner_redundancy
-            if hasattr(vq_module, "last_min_inter_code_dist"):
-                logs["min_inter_code_dist"] = vq_module.last_min_inter_code_dist
-            if hasattr(vq_module, "last_avg_inter_code_dist"):
-                logs["avg_inter_code_dist"] = vq_module.last_avg_inter_code_dist
+            if getattr(self.lam, "vq", None) is not None:
+                vq_module = self.lam.vq
+                if hasattr(vq_module, "last_sample_entropy"):
+                    logs["sample_entropy"] = vq_module.last_sample_entropy
+                if hasattr(vq_module, "last_codebook_entropy"):
+                    logs["codebook_entropy"] = vq_module.last_codebook_entropy
+                if hasattr(vq_module, "nodes_norm"):
+                    logs["nodes_norm"] = vq_module.nodes_norm
+                if hasattr(vq_module, "last_commitment_loss"):
+                    logs["commitment_loss"] = vq_module.last_commitment_loss
+                if hasattr(vq_module, "last_orthogonal_loss") and vq_module.last_orthogonal_loss is not None:
+                    logs["orthogonal_loss"] = vq_module.last_orthogonal_loss
+                # 记录每个样本在当前 batch 中使用到的唯一 code 数的平均值
+                if hasattr(vq_module, "last_avg_unique_codes"):
+                    logs["avg_unique_codes"] = vq_module.last_avg_unique_codes
+                if self.lambda_diversity >0:
+                    logs["entropy_loss"] = entropy_loss
+                # 记录 VQ 中 slot 相关重复率指标（基于离散码索引）
+                if hasattr(vq_module, "last_slot_inter_redundancy") and vq_module.last_slot_inter_redundancy is not None:
+                    logs["slot_inter_redundancy"] = vq_module.last_slot_inter_redundancy
+                if hasattr(vq_module, "last_slot_inner_redundancy") and vq_module.last_slot_inner_redundancy is not None:
+                    logs["slot_inner_redundancy"] = vq_module.last_slot_inner_redundancy
+                if hasattr(vq_module, "last_min_inter_code_dist"):
+                    logs["min_inter_code_dist"] = vq_module.last_min_inter_code_dist
+                if hasattr(vq_module, "last_avg_inter_code_dist"):
+                    logs["avg_inter_code_dist"] = vq_module.last_avg_inter_code_dist
         return total_loss, logs
 
     def training_step(self, batch: Dict, batch_idx: int) -> Tensor:
