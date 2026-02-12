@@ -165,13 +165,12 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-        # diffusers.Attention 不直接接受 encoder_attention_mask；在交叉注意力时将其传入 attention_mask
-        attn_mask = encoder_attention_mask if encoder_hidden_states is not None else attention_mask
-
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attn_mask,
+            attention_mask=(
+                encoder_attention_mask if encoder_hidden_states is not None else attention_mask
+            ),
         )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)
@@ -191,7 +190,7 @@ class BasicTransformerBlock(nn.Module):
 
 
 class DiT(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = True
+    _supports_gradient_checkpointing = False
 
     @register_to_config
     def __init__(
@@ -211,7 +210,7 @@ class DiT(ModelMixin, ConfigMixin):
         max_num_positional_embeddings: int = 512,
         compute_dtype=torch.float32,
         final_dropout: bool = True,
-        positional_embeddings: Optional[str] = "sinusoidal",
+        positional_embeddings: Optional[str] = None,
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
     ):
@@ -228,9 +227,19 @@ class DiT(ModelMixin, ConfigMixin):
 
         all_blocks = []
         for idx in range(self.config.num_layers):
-
+            # 修复：明确区分自注意力和交叉注意力层的初始化
+            # 当 interleave_self_attention=True 时：
+            # - 奇数层（idx % 2 == 1）：自注意力，cross_attention_dim=None
+            # - 偶数层（idx % 2 == 0）：交叉注意力，cross_attention_dim=cross_attention_dim
             use_self_attn = idx % 2 == 1 and interleave_self_attention
             curr_cross_attention_dim = cross_attention_dim if not use_self_attn else None
+            
+            # 验证：确保自注意力层的 cross_attention_dim 为 None
+            if use_self_attn and curr_cross_attention_dim is not None:
+                raise ValueError(
+                    f"Layer {idx}: interleave_self_attention=True but cross_attention_dim={curr_cross_attention_dim} "
+                    f"(expected None for self-attention layers)"
+                )
 
             all_blocks += [
                 BasicTransformerBlock(
@@ -283,16 +292,22 @@ class DiT(ModelMixin, ConfigMixin):
         all_hidden_states = [hidden_states]
 
         # Process through transformer blocks
+        # NOTE: UniVLA 的 VLM hidden states 包含 padding，需要使用 encoder_attention_mask
+        # 修复：确保 interleave_self_attention 模式下，奇数层的自注意力与初始化时一致
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
+                # 奇数层：自注意力模式（cross_attention_dim=None 在初始化时已设置）
+                # 确保 encoder_hidden_states=None 以触发自注意力
+                # 注意：即使 cross_attention_dim=None，仍需要显式传入 None 以确保一致性
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,
-                    encoder_hidden_states=None,
+                    encoder_hidden_states=None,  # 强制自注意力模式
                     encoder_attention_mask=None,
                     temb=temb,
                 )
             else:
+                # 偶数层：交叉注意力模式（cross_attention_dim 在初始化时已设置）
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,
@@ -313,7 +328,7 @@ class DiT(ModelMixin, ConfigMixin):
 
 
 class SelfAttentionTransformer(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = True
+    _supports_gradient_checkpointing = False
 
     @register_to_config
     def __init__(
@@ -385,8 +400,12 @@ class AlternateVLDiT(DiT):
     """
     交替视觉-语言 DiT，在交叉注意力时分别关注视觉特征和VLM特征
     参照 NVIDIA Isaac-GR00T 实现
+    
+    注意：AlternateVLDiT 强制启用 interleave_self_attention，无需在配置中指定
     """
     def __init__(self, *args, attend_text_every_n_blocks: int = 2, **kwargs):
+        # 强制启用 interleave_self_attention，AlternateVLDiT 必须使用交替自注意力模式
+        kwargs['interleave_self_attention'] = True
         super().__init__(*args, **kwargs)
         self.attend_text_every_n_blocks = attend_text_every_n_blocks
 
@@ -395,11 +414,15 @@ class AlternateVLDiT(DiT):
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
         encoder_hidden_states: torch.Tensor,  # Shape: (B, S, D)
         timestep: Optional[torch.LongTensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,  # padding mask: [B, S], True=有效
         return_all_hidden_states: bool = False,
-        image_mask: Optional[torch.Tensor] = None,  # 新增：标识视觉tokens
-        vlm_mask: Optional[torch.Tensor] = None,    # 新增：标识VLM tokens
+        image_mask: Optional[torch.Tensor] = None,  # [B, S], True=视觉tokens
+        vlm_mask: Optional[torch.Tensor] = None,    # [B, S], True=VLM tokens
     ):
+        """
+        AlternateVLDiT forward: 交替关注视觉特征和VLM特征
+        参照 NVIDIA Isaac-GR00T 实现
+        """
         assert image_mask is not None and vlm_mask is not None, \
             "AlternateVLDiT requires image_mask and vlm_mask"
         
@@ -409,12 +432,32 @@ class AlternateVLDiT(DiT):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
         
+        # 预先计算 attention masks（与 NVIDIA 保持一致）
+        # encoder_attention_mask 作为 backbone_attention_mask 使用
+        if encoder_attention_mask is not None:
+            backbone_attention_mask = encoder_attention_mask.bool()
+        else:
+            # 如果没有提供 padding mask，默认全部有效
+            backbone_attention_mask = torch.ones(
+                hidden_states.shape[0], encoder_hidden_states.shape[1], 
+                dtype=torch.bool, device=hidden_states.device
+            )
+        
+        # 参照 NVIDIA: 预先计算 image 和 non-image (VLM) 的 attention masks
+        image_attention_mask = image_mask & backbone_attention_mask
+        non_image_attention_mask = vlm_mask & backbone_attention_mask  # 等价于 (~image_mask) & backbone_attention_mask
+        
+        # DEBUG: 验证 mask 的统计信息（可在调试后删除）
+        # print(f"[AlternateVLDiT] image_mask: {image_mask.sum(dim=1).tolist()}, vlm_mask: {vlm_mask.sum(dim=1).tolist()}")
+        # print(f"[AlternateVLDiT] backbone_mask: {backbone_attention_mask.sum(dim=1).tolist()}")
+        # print(f"[AlternateVLDiT] image_attn_mask: {image_attention_mask.sum(dim=1).tolist()}, non_image: {non_image_attention_mask.sum(dim=1).tolist()}")
+        
         all_hidden_states = [hidden_states]
         
         # 遍历 transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
-            if idx % 2 == 1 and self.config.interleave_self_attention:
-                # 自注意力块
+            if idx % 2 == 1:
+                # 自注意力块（因为 interleave_self_attention=True 已断言）
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,
@@ -424,22 +467,13 @@ class AlternateVLDiT(DiT):
                 )
             else:
                 # 交叉注意力块：交替关注视觉和VLM特征
-                # 需求：最底层先关注 VLM，再关注视觉
+                # 参照 NVIDIA: idx=0 关注 non-image (VLM)，然后交替
                 if idx % (2 * self.attend_text_every_n_blocks) == 0:
-                    # 关注 VLM 特征，需要结合 padding mask
-                    region_mask = vlm_mask
+                    # 关注 VLM/text 特征
+                    curr_encoder_attention_mask = non_image_attention_mask
                 else:
-                    # 关注视觉特征（h_t + h_t1_star）
-                    region_mask = image_mask
-                
-                # 将区域选择 mask 与 padding mask 结合
-                # encoder_attention_mask: [B, seq_len]，1=有效，0=padding
-                # region_mask: [B, seq_len]，True=关注该区域
-                if encoder_attention_mask is not None:
-                    # 结合：只关注该区域内的有效（非 padding）位置
-                    curr_encoder_attention_mask = region_mask & encoder_attention_mask.bool()
-                else:
-                    curr_encoder_attention_mask = region_mask
+                    # 关注视觉特征
+                    curr_encoder_attention_mask = image_attention_mask
                 
                 hidden_states = block(
                     hidden_states,

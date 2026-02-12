@@ -1,9 +1,12 @@
-from .models import available_model_names, available_models, get_model_description, load
+"""
+Prismatic (pruned)
 
+This repo keeps a minimal subset of the original `prismatic` package to support UniVLA's
+LatentVLAModel / LatentWorldVLA workflows.
+"""
 
+from .models import freeze_qwen3vl, freeze_vlm_generic, load_vlm_auto
+
+__all__ = ["load_vlm_auto", "freeze_vlm_generic", "freeze_qwen3vl"]
 
 __version__ = "0.0.1"
-__project__ = "OmniEmbodiment"
-__author__ = "Qingwen Bu"
-__license__ = "Apache License 2.0"
-__email__ = "qwbu01@sjtu.edu.cn"

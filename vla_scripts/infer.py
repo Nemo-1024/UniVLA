@@ -117,8 +117,8 @@ def _inference_collate(instances: List[Dict[str, Any]], tokenizer, pad_token_id:
     pair_stack = [torch.stack([inst["initial_pixel_values"], inst["target_pixel_values"]], dim=0) for inst in instances]
     video_batch = torch.stack(pair_stack, dim=0).to(lam_model.device)
     with torch.no_grad():
-        vq_out = lam_model.vq_encode(video_batch)
-        latent_action_idx_batch = vq_out['indices']  # [B, Q]
+        lam_out = lam_model.get_latent_action(videos=video_batch)
+        latent_action_idx_batch = lam_out['indices']  # [B, Q]
     gt_action_ids = latent_action_idx_batch.detach().cpu()
 
     # Determine target length (cap by max_input_length, or batch max)
@@ -334,5 +334,3 @@ def infer(cfg: InferenceConfig) -> None:
 
 if __name__ == "__main__":
     infer(InferenceConfig())
-
-

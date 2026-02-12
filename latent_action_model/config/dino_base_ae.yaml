@@ -23,7 +23,7 @@ model:
   code_dim: 64                # 码本维度
   ar_prediction: false
   num_queries: 1
-  num_frames: 2
+  num_frames: 2                 
   dec_layers: 12                # 解码器层数
   dropout: 0.0                 # Dropout 率              
   warmup_steps: 0           # 预热步数；0 表示关闭预热
@@ -38,7 +38,8 @@ model:
   norm_latents_type: "ln"
   lambda_diversity: 0.0            #0.03与重建损失同一数量级
   vq_type: "ae"
-
+  vq_kwargs:
+    layer_norm: true
 
   project: lam
   task_name: dino_base_ae_bigwin
@@ -60,7 +61,7 @@ model:
 # 数据参数
 data:
   data_root: /mnt/project_rlinf/jlchen/datasets
-  data_mix: lam_plus   # Manip. + Navi. + Human
+  data_mix: libero4in1   # Manip. + Navi. + Human
   batch_size: 128
   resolution: 256            #dino是256
   episodic: false

@@ -5,8 +5,8 @@
 model_id: "/mnt/project_rlinf/jlchen/weights/Qwen3-VL-2B-Instruct"
 # lam_ckpt_path: str="/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_base_4q_32_crossattn_mask_2f_norep_bn/version_1/checkpoints/epoch=19.ckpt"
 # lam_yaml_path: str="/mnt/mnt/public/jlchen/code/UniVLA/latent_action_model/logs/dino_base_4q_32_crossattn_mask_2f_norep_bn/version_1/dino_base_2f.yaml"
-lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/checkpoints/epoch=21.ckpt"
-lam_yaml_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/dino_base_ae.yaml"
+lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_2/checkpoints/epoch=39.ckpt"
+lam_yaml_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_2/dino_base_ae.yaml"
 # 数据与预处理
 data_mix: lam_plus
 
@@ -17,19 +17,18 @@ per_device_batch_size: 64
 gradient_accumulation_steps: 1
 learning_rate: 2e-5
 warmup_steps: 5000
-use_history_frame: true
-enable_lam_kl_loss: false
+eval_interval: 1000
+use_history_frame: false
 image_aug: true
-supervise_quantized: true
-quantized_loss_type: "mse"
-enable_lam_kl_loss: false
+latent_loss_type: "mse"
 enable_lam_decoder_perceptual: true
 lam_decoder_perceptual_weight: 1.0
 lam_encoder_distill_weight: 1.0
 act_query_lr_scale: 5.0
 vlm_to_lam_lr_scale: 5.0
+
 # 运行与日志
-run_id: vla_emb_unfreeze_llm4_dec_gt_hist_lam_plus
+run_id: vla_emb_gt_lam_plus
 
 enable_lora: false
 freeze_last_llm_layer: true
@@ -40,4 +39,3 @@ freeze_embedding: true
 unfreeze_lam_decoder: true
 lam_decoder_target: gt
 unfreeze_vision_merger: true  
-

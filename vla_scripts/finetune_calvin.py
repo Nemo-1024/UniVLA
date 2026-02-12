@@ -340,9 +340,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                     with torch.no_grad():
                         video = torch.stack([batch["initial_pixel_values"], batch["target_pixel_values"]], dim=1)
-                        latent_action_idx_batch = latent_action_model.module.vq_encode(video)['indices'].squeeze()
+                        latent_action_idx_batch = latent_action_model.module.get_latent_action(videos=video)['indices'].squeeze()
                         video = torch.stack([batch["initial_pixel_values_hist"], batch["target_pixel_values_hist"]], dim=1)
-                        latent_action_idx_history = latent_action_model.module.vq_encode(video)['indices'].squeeze()
+                        latent_action_idx_history = latent_action_model.module.get_latent_action(videos=video)['indices'].squeeze()
 
                     input_ids_list = []
                     labels_list = []
@@ -392,7 +392,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 else:
                     with torch.no_grad():
                         video = torch.stack([batch["initial_pixel_values"], batch["target_pixel_values"]], dim=1)
-                        latent_action_idx_batch = latent_action_model.module.vq_encode(video)['indices'].squeeze()
+                        latent_action_idx_batch = latent_action_model.module.get_latent_action(videos=video)['indices'].squeeze()
 
                     input_ids_list = []
                     labels_list = []

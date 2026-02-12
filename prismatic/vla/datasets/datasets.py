@@ -5,10 +5,11 @@ Lightweight PyTorch Dataset Definition for wrapping RLDS TFDS Pipeline; just def
 format to OpenVLA, IterableDataset shim.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type, Optional, Union
-from IPython.display import Video
+from typing import Any, Dict, Tuple, Optional, Union
 from torchvision import transforms
 import torchvision.transforms.v2.functional as F
 from torchvision.transforms import v2, InterpolationMode
@@ -18,14 +19,10 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
-from transformers import PreTrainedTokenizerBase
 import threading
 from queue import Queue, Full
 import tensorflow as tf
-from prismatic.models.backbones.llm.prompting import PromptBuilder
-from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
-from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
@@ -49,10 +46,10 @@ datasets_with_higher_frequency = ['utaustin_mutex',
 
 @dataclass
 class RLDSBatchTransform:
-    action_tokenizer: ActionTokenizer
-    base_tokenizer: PreTrainedTokenizerBase
-    image_transform: ImageTransform
-    prompt_builder_fn: Type[PromptBuilder]
+    action_tokenizer: Any
+    base_tokenizer: Any
+    image_transform: Any
+    prompt_builder_fn: Any
     predict_stop_token: bool = True
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -92,11 +89,11 @@ class RLDSBatchTransform:
 
 @dataclass
 class RLDSBatchTransformLIBERO_withHis:
-    action_tokenizer: ActionTokenizer
-    base_tokenizer: PreTrainedTokenizerBase
-    image_transform: ImageTransform
-    image_transform_lam: ImageTransform
-    prompt_builder_fn: Type[PromptBuilder]
+    action_tokenizer: Any
+    base_tokenizer: Any
+    image_transform: Any
+    image_transform_lam: Any
+    prompt_builder_fn: Any
     predict_stop_token: bool = True
     window_size: int = 5
 
@@ -118,13 +115,13 @@ class RLDSBatchTransformLIBERO_withHis:
             target_pixel_values= self.image_transform_lam(Image.fromarray(rlds_batch["observation"]["image_primary"][self.window_size - 1 + randomized_overlap]))
 
             video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
-            latent_action_idx = self.action_tokenizer.vq_encode(video)['indices'].squeeze()
+            latent_action_idx = self.action_tokenizer.get_latent_action(videos=video)['indices'].squeeze()
 
             if randomized_overlap > 0:
                 initial_pixel_values = self.image_transform_lam(img)
                 target_pixel_values= self.image_transform_lam(img_k)
                 video = torch.stack([initial_pixel_values, target_pixel_values], dim=0).unsqueeze(0).to(self.action_tokenizer.device)
-                hist_action_idx = self.action_tokenizer.vq_encode(video)['indices'].squeeze()        
+                hist_action_idx = self.action_tokenizer.get_latent_action(videos=video)['indices'].squeeze()        
 
         action_vocab = [f'<ACT_{i.item()}>' for i in latent_action_idx]   # [ACT_1, ACT_2, ... ACT_K]
         # print(action_vocab)
@@ -184,11 +181,11 @@ class RLDSBatchTransformLIBERO:
     vlm_resolution: int = 448
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
-        轻量化 Transform：仅提取必要的数据供 Collator 批量 VQ 编码。
+        轻量化 Transform：仅提取必要的数据供 Collator 批量 LAM 编码。
         返回内容：
         - language_instruction: 原始字节串（不 decode）
         - pixel_values: 供 VLA 模型使用的图像张量
-        - initial_pixel_values, target_pixel_values: 供 LAM 的 VQ 编码（两帧）
+        - initial_pixel_values, target_pixel_values: 供 LAM 编码（两帧）
         - dataset_name: 可选，若存在则透传
         """
         # 原始语言（bytes，不解码）
@@ -203,12 +200,21 @@ class RLDSBatchTransformLIBERO:
         # 如果 image_transform 是 torch Transform，则逐帧应用（先将 numpy 转为 PIL 或 Tensor）
 
 
+        # 获取 wrist 视角（如果存在）
+        video_wrist = None
+        if "image_wrist" in rlds_batch["observation"]:
+            video_wrist = np.array(rlds_batch["observation"]["image_wrist"])
+        
         out: Dict[str, Any] = {
             "language_instruction": language_instruction,
             "video": video,
             "proprio": np.array(rlds_batch["observation"]["proprio"]),
             "actions": np.array(rlds_batch["action"])
         }
+        
+        # 添加 wrist 视角（如果加载）
+        if video_wrist is not None:
+            out["video_wrist"] = video_wrist
 
         # 透传数据集标识（若存在）
         if "dataset_name" in rlds_batch:
@@ -224,11 +230,11 @@ class RLDSBatchTransformLatentAction:
     image_transform_lam: Optional[Any] = None
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
-        轻量化 Transform：仅提取必要的数据供 Collator 批量 VQ 编码。
+        轻量化 Transform：仅提取必要的数据供 Collator 批量 LAM 编码。
         返回内容：
         - language_instruction: 原始字节串（不 decode）
         - pixel_values: 供 VLA 模型使用的图像张量
-        - initial_pixel_values, target_pixel_values: 供 LAM 的 VQ 编码（两帧）
+        - initial_pixel_values, target_pixel_values: 供 LAM 编码（两帧）
         - dataset_name: 可选，若存在则透传
         """
         # 原始语言（bytes，不解码）
@@ -355,13 +361,21 @@ class RLDSDataset(IterableDataset):
         async_transform: bool = False,
         debug_repeat_batch: Union[bool, int] = False,
         use_history_frame: bool = True,
+        load_camera_views: Tuple[str, ...] = ("primary",),
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
+        self.train: bool = train
         self.async_prefetch: bool = async_prefetch
         self.async_prefetch_size: int = int(async_prefetch_size)
         self.async_transform: bool = async_transform
         self.debug_repeat_batch: Union[bool, int] = debug_repeat_batch
+
+        # Normalize camera-view input: a bare string would be treated as an iterable of characters.
+        if isinstance(load_camera_views, str):
+            load_camera_views = (load_camera_views,)
+        else:
+            load_camera_views = tuple(load_camera_views)
         # Configure RLDS Dataset(s)
         if self.data_mix in OXE_NAMED_MIXTURES:
             mixture_spec = OXE_NAMED_MIXTURES[self.data_mix]
@@ -373,7 +387,7 @@ class RLDSDataset(IterableDataset):
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,
             mixture_spec,
-            load_camera_views=("primary",),
+            load_camera_views=load_camera_views,
             load_depth=False,
             load_proprio=True,  # 启用状态数据加载以支持物理接地损失
             load_language=True,
@@ -412,10 +426,10 @@ class RLDSDataset(IterableDataset):
             if training_phase == 'lam' or training_phase == 'lam_2f' or training_phase == 'post-training':
                 rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
                     # 仅保留颜色类增强
-                    random_brightness=dict(max_delta=0.1),
-                    random_contrast=dict(lower=0.9, upper=1.1),
-                    random_saturation=dict(lower=0.9, upper=1.1),
-                    random_hue=dict(max_delta=0.05),
+                    random_brightness=dict(max_delta=0.3),
+                    random_contrast=dict(lower=0.6, upper=1.4),
+                    random_saturation=dict(lower=0.5, upper=1.5),
+                    random_hue=dict(max_delta=0.08),
                     augment_order=[
                         "random_brightness",
                         "random_contrast",
@@ -427,13 +441,13 @@ class RLDSDataset(IterableDataset):
                 rlds_config["frame_transform_kwargs"].update({"image_augment_kwargs" : dict(
                     random_resized_crop=dict(scale=[0.8, 1.0], ratio=[0.75, 1.0]),
                     # TF: random_brightness(image, max_delta, seed)
-                    random_brightness=dict(max_delta=0.1),
+                    random_brightness=dict(max_delta=0.3),
                     # TF: random_contrast(image, lower, upper, seed)
-                    random_contrast=dict(lower=0.9, upper=1.1),
+                    random_contrast=dict(lower=0.6, upper=1.4),
                     # TF: random_saturation(image, lower, upper, seed)
-                    random_saturation=dict(lower=0.9, upper=1.1),
+                    random_saturation=dict(lower=0.5, upper=1.5),
                     # TF: random_hue(image, max_delta, seed)
-                    random_hue=dict(max_delta=0.05),
+                    random_hue=dict(max_delta=0.08),
                     augment_order=[
                         "random_resized_crop",
                         "random_brightness",
@@ -530,12 +544,16 @@ class RLDSDataset(IterableDataset):
             stop_event.set()
 
     def __len__(self) -> int:
-        """返回预计算的数据集长度，考虑分布式训练时的数据分割"""
+        """
+        返回预计算的数据集长度。
+        - train 数据集：分布式下按 rank 分片，返回 dataset_length // world_size
+        - eval 数据集：不分片，返回完整长度（因为只在 rank 0 评估完整验证集）
+        """
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-            # print(world_size)
-            # print(self.dataset_length)
-            return int(self.dataset_length // world_size)
+            # 只有 train 数据集需要除以 world_size，eval 数据集返回完整长度
+            if self.train:
+                world_size = torch.distributed.get_world_size()
+                return int(self.dataset_length // world_size)
         return int(self.dataset_length)
     # === Explicitly Unused ===
     def __getitem__(self, idx: int) -> None:

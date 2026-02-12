@@ -1,22 +1,93 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
-from typing import List
 from typing import Dict, Optional, Any, Tuple
 
 from latent_action_model.core.lam_model import LatentLAMModel, load_latent_action_model
 from prismatic.models import load_vlm_auto
 
 
+class VLMToLAMQFormer(nn.Module):
+    """Refine VLM query hidden states into a single latent action."""
+
+    def __init__(
+        self,
+        *,
+        vlm_hidden_dim: int,
+        lam_code_dim: int,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        ffn_expansion_factor: float = 4.0,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if num_layers <= 0:
+            raise ValueError("[VLMToLAMQFormer] num_layers must be > 0.")
+        if num_heads <= 0:
+            raise ValueError("[VLMToLAMQFormer] num_heads must be > 0.")
+        if ffn_expansion_factor <= 0:
+            raise ValueError("[VLMToLAMQFormer] ffn_expansion_factor must be > 0.")
+
+        self.query = nn.Parameter(torch.randn(1, 1, int(lam_code_dim)) * 0.02)
+        self.cross_attns = nn.ModuleList(
+            [
+                nn.MultiheadAttention(
+                    embed_dim=int(lam_code_dim),
+                    kdim=int(vlm_hidden_dim),
+                    vdim=int(vlm_hidden_dim),
+                    num_heads=int(num_heads),
+                    dropout=float(dropout),
+                    batch_first=True,
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.norm_qs = nn.ModuleList([nn.LayerNorm(int(lam_code_dim)) for _ in range(int(num_layers))])
+        self.norm_kvs = nn.ModuleList([nn.LayerNorm(int(vlm_hidden_dim)) for _ in range(int(num_layers))])
+        hidden_dim = int(int(lam_code_dim) * float(ffn_expansion_factor))
+        self.ffns = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(int(lam_code_dim)),
+                    nn.Linear(int(lam_code_dim), hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout)),
+                    nn.Linear(hidden_dim, int(lam_code_dim)),
+                    # nn.Dropout(float(dropout)),
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.final_norm = nn.LayerNorm(int(lam_code_dim))
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        if context.dim() != 3:
+            raise ValueError(f"[VLMToLAMQFormer] expected context [B, Q, D], got {tuple(context.shape)}")
+        B = int(context.shape[0])
+        queries = self.query.expand(B, -1, -1)
+        queries = queries.to(device=context.device, dtype=context.dtype)
+        if context.dtype != queries.dtype:
+            context = context.to(dtype=queries.dtype)
+        for norm_q, norm_kv, xattn, ffn in zip(self.norm_qs, self.norm_kvs, self.cross_attns, self.ffns):
+            q = norm_q(queries)
+            kv = norm_kv(context)
+            attn_out, _ = xattn(q, kv, kv)
+            queries = queries + attn_out
+            queries = queries + ffn(queries)
+        queries = self.final_norm(queries)
+        return queries
+
+
 class LatentVLAModel(nn.Module):
     """
-    组合模型：封装 VLM 与 LAM
+    组合模型：封装 VLM 与 LAM（使用可学习 token 作为 latent action）
 
-    - 在 forward 中调用 LAM.vq_encode 取得离散 latent（indices）与连续表征（quantized）
-    - 将占位符 token (<ACT_PH>) 替换为真实 <ACT_i>，并同步替换 labels
-    - 计算主 CE 损失（VLM 内部）与 encoder 蒸馏损失（VLM hidden 对齐 LAM quantized）
-    - decoder 感知损失接口预留，默认关闭
+    - 在 forward 中调用 LAM 编码器取得连续 latent 表征作为监督信号
+    - 在 <ACT_PH> 位置注入可学习 query embedding（act_query）
+    - 计算 latent 回归损失（VLM hidden 对齐 LAM latent）
+    - 可选 decoder 感知损失
+
+    注意：不再使用特殊 token 索引进行训练，完全基于可学习的 query embeddings
     """
 
     def __init__(
@@ -24,24 +95,21 @@ class LatentVLAModel(nn.Module):
         vlm: nn.Module,
         lam: LatentLAMModel,
         *,
-        action_token_begin_id: int,
-        codebook_size: int,
         placeholder_token_id: int,
-        supervise_quantized: bool = False,
-        quantized_loss_type: str = "cosine",
+        latent_loss_type: str = "cosine",
         enable_lam_decoder_perceptual: bool = False,
         lam_encoder_distill_weight: float = 1.0,
         lam_decoder_perceptual_weight: float = 1.0,
-        vlm_hidden_dim: int = 1024,
+        vlm_hidden_dim: int = 2048,
         lam_code_dim: int = 256,
         processor: Optional[Any] = None,
-        new_token_ids: Optional[Any] = None,
-        new_token_lr_scale: float = 1.0,
         act_query_lr_scale: float = 1.0,
         vlm_to_lam_lr_scale: float = 1.0,
-        enable_lam_kl_loss: bool = False,
-        lam_kl_weight: float = 1.0,
-        lam_kl_temperature: float = 0.1,
+        num_queries: int = 8,
+        qformer_layers: int = 1,
+        qformer_heads: int = 8,
+        qformer_ffn_expansion: float = 4.0,
+        qformer_dropout: float = 0.0,
         debug_mode: bool = False,
         unfreeze_lam_decoder: bool = False,
         lam_decoder_target: str = "gt",
@@ -53,24 +121,15 @@ class LatentVLAModel(nn.Module):
             p.requires_grad = False
         self.processor = processor
 
-        self.action_token_begin_id = int(action_token_begin_id)
-        self.codebook_size = int(codebook_size)
         self.placeholder_token_id = int(placeholder_token_id)
 
-        # 当启用时：训练主监督从 token CE 切换为回归 vq_out["quantized"]（在动作位置“前一位”的 hidden 上预测）
-        self.supervise_quantized = bool(supervise_quantized)
-        self.quantized_loss_type = str(quantized_loss_type).lower()
+        # 使用 latent 回归监督
+        self.latent_loss_type = str(latent_loss_type).lower()
         self.enable_lam_decoder_perceptual = bool(enable_lam_decoder_perceptual)
-        # 历史字段名：lam_encoder_distill_weight。当前仅在 supervise_quantized=True 时生效，表示 quantized 回归 loss 的权重。
         self.lam_encoder_distill_weight = float(lam_encoder_distill_weight)
         self.lam_decoder_perceptual_weight = float(lam_decoder_perceptual_weight)
-        self.new_token_lr_scale = float(new_token_lr_scale)
         self.act_query_lr_scale = float(act_query_lr_scale)
         self.vlm_to_lam_lr_scale = float(vlm_to_lam_lr_scale)
-        self.enable_lam_kl_loss = bool(enable_lam_kl_loss)
-        self.lam_kl_weight = float(lam_kl_weight)
-        self.lam_kl_temperature = float(lam_kl_temperature)
-        self.new_token_ids = list(new_token_ids) if new_token_ids is not None else []
         self.debug_mode = bool(debug_mode)
         self.unfreeze_lam_decoder = bool(unfreeze_lam_decoder)
         lam_decoder_target = str(lam_decoder_target).lower()
@@ -92,11 +151,10 @@ class LatentVLAModel(nn.Module):
             except Exception:
                 pass
             self.lam_decoder_target = "gt"
-        # 训练时的 latent 数量（Q）；推理沿用同一数目
-        nq = getattr(lam, "num_queries", None)
-        if nq is None and hasattr(lam, "vq"):
-            nq = getattr(lam.vq, "num_queries", None)
-        self.num_queries = int(nq) if nq is not None else None
+        # 训练时的 latent query 数量（Q）；由配置决定，不再从 LAM 获取
+        self.num_queries = int(num_queries)
+        if self.num_queries <= 0:
+            raise ValueError("[LatentVLAModel] num_queries must be > 0.")
 
         def _register_grad_scale(param: Optional[torch.nn.Parameter], scale: float, name: str) -> None:
             """Multiply gradient by `scale` via hook; safe when grad is None."""
@@ -116,84 +174,35 @@ class LatentVLAModel(nn.Module):
             except Exception:
                 pass
 
-        # 仅在 supervise_quantized 下需要投影头（量化向量回归为主监督）
-        if self.supervise_quantized:
-            self.vlm_to_lam = nn.Sequential(nn.Linear(vlm_hidden_dim, vlm_hidden_dim), nn.LayerNorm(vlm_hidden_dim), nn.GELU(), nn.Linear(vlm_hidden_dim, lam_code_dim))
-        else:
-            self.vlm_to_lam = None
+        # latent 向量回归投影头：QFormer 将多个 VLM query 进一步提炼为单一 latent action
+        self.vlm_to_lam = VLMToLAMQFormer(
+            vlm_hidden_dim=vlm_hidden_dim,
+            lam_code_dim=lam_code_dim,
+            num_layers=qformer_layers,
+            num_heads=qformer_heads,
+            ffn_expansion_factor=qformer_ffn_expansion,
+            dropout=qformer_dropout,
+        )
 
-        # supervise_quantized: 在 <ACT_PH> 位置注入可学习 query embedding（而不是“从头预测”动作 token）
+        # 在 <ACT_PH> 位置注入可学习 query embedding（而不是“从头预测”动作 token）
         # 注意：这些 query 不在 VLM 内部，因此默认不会被 vlm.save_pretrained 保存；我们会在 save_pretrained 里额外落盘。
-        if self.supervise_quantized:
-            if self.num_queries is None:
-                raise ValueError("[LatentVLAModel] supervise_quantized=True requires self.num_queries to be set.")
-            q = int(self.num_queries)
-            # float32 参数更稳定；前向时会按 inputs_embeds dtype 做 cast
-            self.act_query = nn.Parameter(torch.randn(q, int(vlm_hidden_dim)) * 0.02)
-        else:
-            self.act_query = None
+        q = int(self.num_queries)
+        # float32 参数更稳定；前向时会按 inputs_embeds dtype 做 cast
+        self.act_query = nn.Parameter(torch.randn(q, int(vlm_hidden_dim)) * 0.02)
 
-        # 在 supervise_quantized 下对 query / head 做梯度放大（类似 new_token_lr_scale，但作用于参数整体）
-        if self.supervise_quantized:
-            if self.act_query is not None and self.act_query_lr_scale != 1.0:
-                _register_grad_scale(self.act_query, self.act_query_lr_scale, "act_query")
-            if self.vlm_to_lam is not None and self.vlm_to_lam_lr_scale != 1.0:
-                # `vlm_to_lam` may be a single Linear or a small MLP (e.g., nn.Sequential).
-                # Scale gradients for all its parameters robustly.
-                if hasattr(self.vlm_to_lam, "weight") and isinstance(getattr(self.vlm_to_lam, "weight"), torch.nn.Parameter):
-                    _register_grad_scale(self.vlm_to_lam.weight, self.vlm_to_lam_lr_scale, "vlm_to_lam.weight")
-                    if getattr(self.vlm_to_lam, "bias", None) is not None:
-                        _register_grad_scale(self.vlm_to_lam.bias, self.vlm_to_lam_lr_scale, "vlm_to_lam.bias")
-                else:
-                    for n, p in self.vlm_to_lam.named_parameters(recurse=True):
-                        _register_grad_scale(p, self.vlm_to_lam_lr_scale, f"vlm_to_lam.{n}")
-
-        # 针对新增 token 行做梯度放大，实现"只对新增 embedding 提高有效学习率"
-        if self.new_token_lr_scale != 1.0 and len(self.new_token_ids) > 0:
-            try:
-                emb = self.vlm.get_input_embeddings()
-                # 检查 embedding 是否被冻结：如果被冻结，梯度放大hook无法生效，提前跳过
-                if not emb.weight.requires_grad:
-                    # Embedding已冻结，梯度放大hook无法工作，但仍可记录配置
-                    self._new_token_factor = None
-                    import warnings
-                    warnings.warn(
-                        "[LatentVLAModel] new_token_lr_scale is set but embedding is frozen. "
-                        "Gradient scaling hook will not be applied. "
-                        "Consider setting freeze_embedding=False if you want to scale new token gradients."
-                    )
-                else:
-                    # 构建放大系数并注册为 buffer，避免 device 不一致
-                    row_mask = torch.zeros(
-                        emb.weight.size(0), device=emb.weight.device, dtype=emb.weight.dtype
-                    )
-                    for tid in self.new_token_ids:
-                        tid_int = int(tid)
-                        if 0 <= tid_int < row_mask.numel():
-                            row_mask[tid_int] = 1.0
-                    scale = self.new_token_lr_scale
-                    factor = 1.0 + (scale - 1.0) * row_mask  # [vocab]
-                    self.register_buffer("_new_token_factor", factor, persistent=False)
-
-                    def _scale_grad(g):
-                        # g: [vocab, dim] or None (if parameter is frozen)
-                        # 处理梯度为None的情况（当参数被冻结时）
-                        if g is None:
-                            return None
-                        if not hasattr(self, "_new_token_factor") or self._new_token_factor is None:
-                            return g
-                        f = self._new_token_factor
-                        if f.device != g.device:
-                            f = f.to(device=g.device, dtype=g.dtype)
-                        else:
-                            f = f.to(dtype=g.dtype)
-                        return g * f.unsqueeze(1)
-
-                    emb.weight.register_hook(_scale_grad)
-            except Exception as e:
-                self._new_token_factor = None
-                import warnings
-                warnings.warn(f"[LatentVLAModel] Failed to register new token gradient scaling hook: {e}")
+        # 对 query / head 做梯度放大
+        if self.act_query is not None and self.act_query_lr_scale != 1.0:
+            _register_grad_scale(self.act_query, self.act_query_lr_scale, "act_query")
+        if self.vlm_to_lam is not None and self.vlm_to_lam_lr_scale != 1.0:
+            # `vlm_to_lam` may be a single Linear or a small MLP (e.g., nn.Sequential).
+            # Scale gradients for all its parameters robustly.
+            if hasattr(self.vlm_to_lam, "weight") and isinstance(getattr(self.vlm_to_lam, "weight"), torch.nn.Parameter):
+                _register_grad_scale(self.vlm_to_lam.weight, self.vlm_to_lam_lr_scale, "vlm_to_lam.weight")
+                if getattr(self.vlm_to_lam, "bias", None) is not None:
+                    _register_grad_scale(self.vlm_to_lam.bias, self.vlm_to_lam_lr_scale, "vlm_to_lam.bias")
+            else:
+                for n, p in self.vlm_to_lam.named_parameters(recurse=True):
+                    _register_grad_scale(p, self.vlm_to_lam_lr_scale, f"vlm_to_lam.{n}")
 
     def train(self, mode: bool = True):
         """
@@ -237,6 +246,9 @@ class LatentVLAModel(nn.Module):
     def tokenizer(self):
         return self.processor.tokenizer if self.processor is not None else None
 
+    # -------------------------
+    # Checkpoint IO
+    # -------------------------
     # 仅保存/加载 VLM 权重，保持与原有管线一致的 checkpoint 行为
     def save_pretrained(self, save_directory, **kwargs):
         # 1) 先保存 VLM（与原管线一致）
@@ -251,7 +263,7 @@ class LatentVLAModel(nn.Module):
             if getattr(self, "act_query", None) is not None:
                 extra["act_query"] = self.act_query.detach().cpu()
             if getattr(self, "vlm_to_lam", None) is not None:
-                # 保存线性投影头（用于 quantized 回归/encoder distill）
+                # 保存线性投影头（用于 latent 回归/encoder distill）
                 extra["vlm_to_lam"] = self.vlm_to_lam.state_dict()
             lam_dec = getattr(self.lam, "decoder", None)
             if lam_dec is not None:
@@ -265,7 +277,7 @@ class LatentVLAModel(nn.Module):
     def load_latent_vla_extra(self, load_directory: str, *, strict: bool = True, map_location: str = "cpu") -> bool:
         """
         Load wrapper-side trainable parameters saved by `save_pretrained()`:
-        - act_query (when supervise_quantized=True)
+        - act_query
         - vlm_to_lam projection head
 
         Returns True if an extra file existed and was loaded; False if file missing.
@@ -287,8 +299,7 @@ class LatentVLAModel(nn.Module):
             if getattr(self, "act_query", None) is None:
                 if strict:
                     raise ValueError(
-                        "[LatentVLAModel] extra contains act_query but current model has no act_query. "
-                        "Did you forget to set supervise_quantized=True?"
+                        "[LatentVLAModel] extra contains act_query but current model has no act_query."
                     )
             else:
                 q = extra["act_query"]
@@ -305,8 +316,7 @@ class LatentVLAModel(nn.Module):
             if getattr(self, "vlm_to_lam", None) is None:
                 if strict:
                     raise ValueError(
-                        "[LatentVLAModel] extra contains vlm_to_lam but current model has no vlm_to_lam. "
-                        "Enable supervise_quantized."
+                        "[LatentVLAModel] extra contains vlm_to_lam but current model has no vlm_to_lam."
                     )
             else:
                 sd = extra["vlm_to_lam"]
@@ -341,53 +351,9 @@ class LatentVLAModel(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True):
         return self.vlm.load_state_dict(state_dict, strict=strict)
 
-    def _build_prefix_from_placeholders(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor],
-        *,
-        strict_placeholder_count: bool,
-    ) -> Tuple[torch.LongTensor, torch.Tensor, torch.Tensor]:
-        """
-        截断到每个样本第一个 <ACT_PH> 之前作为 prefix，并对 batch 进行 padding。
-        返回 (prefix_input_ids, prefix_attention_mask, placeholder_counts)
-        """
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-
-        device = input_ids.device
-        placeholder_mask = input_ids == self.placeholder_token_id  # [B, L]
-        counts = placeholder_mask.sum(dim=1)  # [B]
-
-        if self.num_queries is not None and strict_placeholder_count:
-            mismatch = counts != self.num_queries
-            if mismatch.any():
-                raise ValueError(
-                    f"[LatentVLAModel] placeholder count mismatch: "
-                    f"found={counts.tolist()}, expected={int(self.num_queries)}"
-                )
-
-        B, L = input_ids.shape
-        idx_range = torch.arange(L, device=device)
-        first_pos = torch.where(
-            placeholder_mask, idx_range.unsqueeze(0).expand_as(input_ids), torch.full_like(input_ids, L)
-        ).min(dim=1).values  # [B]
-
-        prefixes: List[torch.Tensor] = []
-        prefix_masks: List[torch.Tensor] = []
-        for b in range(B):
-            cut = int(first_pos[b].item())
-            prefixes.append(input_ids[b, :cut])
-            prefix_masks.append(attention_mask[b, :cut])
-
-        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
-        if pad_token_id is None:
-            pad_token_id = getattr(self.vlm.config, "pad_token_id", 0)
-
-        prefix_input_ids = pad_sequence(prefixes, batch_first=True, padding_value=pad_token_id)
-        prefix_attention_mask = pad_sequence(prefix_masks, batch_first=True, padding_value=0)
-        return prefix_input_ids, prefix_attention_mask, counts
-
+    # -------------------------
+    # Construction / config
+    # -------------------------
     @classmethod
     def from_config(
         cls,
@@ -400,11 +366,17 @@ class LatentVLAModel(nn.Module):
     ) -> Tuple["LatentVLAModel", Any]:
         """
         内部加载 VLM 与 LAM，返回 (model, processor)
+        
+        该方法会：
+        1. 加载基础 VLM 和 LAM 模型
+        2. 注册占位符 token <ACT_PH>（用于标记可学习 query 的注入位置）
+        3. 初始化可学习的 act_query 参数（替代特殊 token 索引）
+        
         占位符 id 可通过 model.placeholder_token_id 访问
 
         Args:
             yaml_path: 可选。训练时使用的 YAML 配置文件路径；若提供则会先读取并覆盖传入 cfg 的字段，
-                       用于推理/继续训练时确保 `supervise_quantized` 等关键参数与训练一致。
+                       用于推理/继续训练时确保关键参数与训练一致。
             preserve_checkpoint_model_id: 若为 True，则当 cfg.model_id 指向一个本地目录（通常是 HF checkpoint dir）
                        时，不使用 YAML 中的 model_id 覆盖它，以避免把 checkpoint 路径改回 base 模型路径。
         """
@@ -483,30 +455,11 @@ class LatentVLAModel(nn.Module):
         overwatch.info(f"🔄 加载 LAM（yaml=`{cfg.lam_yaml_path}`）")
         lam = load_latent_action_model(cfg.lam_ckpt_path, cfg.lam_yaml_path)
 
-        # 获取 codebook_size：优先从 vq 模块获取，如果 vq 为 None（AE 模式），则从模型属性获取
-        if lam.vq is not None:
-            codebook_size = lam.vq.codebook_size
-        else:
-            # AE 模式：vq 为 None，使用 code_book_size 属性
-            # 兼容历史字段名：`code_book_size`（LatentLAMModel 内部设置）与可能的 `codebook_size`
-            codebook_size = getattr(lam, "code_book_size", None)
-            if codebook_size is None:
-                codebook_size = getattr(lam, "codebook_size", None)
-            if codebook_size is None:
-                raise ValueError(
-                    "[LatentVLAModel] LAM model has no VQ module (vq_type='ae') and no code_book_size attribute. "
-                    "Cannot determine codebook size for action tokens."
-                )
-            overwatch.info(f"[LatentVLAModel] Using code_book_size={codebook_size} from LAM (AE mode, vq=None)")
-
-        # 注册动作 token 与占位符
-        special_tokens_dict = {"additional_special_tokens": [f"<ACT_{i}>" for i in range(codebook_size)]}
-        tokenizer.add_special_tokens(special_tokens_dict)  # type: ignore[attr-defined]
+        # 注册占位符 token
         placeholder_token = getattr(cfg, "latent_action_placeholder_token", "<ACT_PH>")
         tokenizer.add_special_tokens({"additional_special_tokens": [placeholder_token]})  # type: ignore[attr-defined]
 
-
-        # 打印当前 tokenizer 词表大小与 VLM embedding 大小，检查是否超出预留长度
+        # 打印当前 tokenizer 词表大小与 VLM embedding 大小
         try:
             vocab_size = len(tokenizer)
             emb = vlm.get_input_embeddings()
@@ -523,43 +476,25 @@ class LatentVLAModel(nn.Module):
         except Exception:
             pass
 
-        act_tokens = [f"<ACT_{i}>" for i in range(codebook_size)]
-        act_ids = tokenizer.convert_tokens_to_ids(act_tokens)
-        action_token_begin_id = min(act_ids)
         placeholder_token_id = tokenizer.convert_tokens_to_ids(placeholder_token)
-
-        new_token_ids = act_ids
 
         model = cls(
             vlm=vlm,
             lam=lam,
-            action_token_begin_id=action_token_begin_id,
-            codebook_size=codebook_size,
             placeholder_token_id=placeholder_token_id,
-            supervise_quantized=getattr(cfg, "supervise_quantized", False),
-            quantized_loss_type=getattr(cfg, "quantized_loss_type", "cosine"),
+            latent_loss_type=getattr(cfg, "latent_loss_type", "cosine"),
             enable_lam_decoder_perceptual=getattr(cfg, "enable_lam_decoder_perceptual", False),
             lam_encoder_distill_weight=getattr(cfg, "lam_encoder_distill_weight", 1.0),
             lam_decoder_perceptual_weight=getattr(cfg, "lam_decoder_perceptual_weight", 0.0),
-            enable_lam_kl_loss=getattr(cfg, "enable_lam_kl_loss", False),
-            lam_kl_weight=getattr(cfg, "lam_kl_weight", 1.0),
-            lam_kl_temperature=getattr(cfg, "lam_kl_temperature", 1.0),
             vlm_hidden_dim=vlm.config.text_config.hidden_size,
-            # Important: vq_out["quantized"] is in VQ input_dim space (after out_proj), not code_dim.
-            lam_code_dim=int(lam.feature_dim),
+            lam_code_dim=int(lam.code_dim),
             processor=processor,
-            new_token_ids=new_token_ids,
-            new_token_lr_scale=getattr(cfg, "new_token_lr_scale", 1.0),
             act_query_lr_scale=getattr(cfg, "act_query_lr_scale", 1.0),
             vlm_to_lam_lr_scale=getattr(cfg, "vlm_to_lam_lr_scale", 1.0),
             debug_mode=bool(debug_mode),
             unfreeze_lam_decoder=bool(getattr(cfg, "unfreeze_lam_decoder", False)),
             lam_decoder_target=str(getattr(cfg, "lam_decoder_target", "teacher")),
         )
-
-        # 同步 cfg 中的字段（便于后续使用）
-        cfg.action_token_begin_id = action_token_begin_id
-        cfg.codebook_size = codebook_size
         try:
             cfg.unfreeze_lam_decoder = bool(getattr(cfg, "unfreeze_lam_decoder", False))
         except Exception:
@@ -587,6 +522,9 @@ class LatentVLAModel(nn.Module):
 
         return model, processor
 
+    # -------------------------
+    # Public forward APIs
+    # -------------------------
     def forward(
         self,
         *,
@@ -602,99 +540,70 @@ class LatentVLAModel(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        # === 1) LAM 编码（teacher）===
-        vq_out = self._lam_vq_encode(
+        lam_out, teacher_latent = self._run_lam_teacher(
             lam_videos=lam_videos,
             lam_states=lam_states,
             lam_dec_videos=lam_dec_videos,
             lam_dataset_ids=lam_dataset_ids,
         )
-        self._maybe_debug_check_lam_codes(vq_out)
+        teacher_latent = teacher_latent.to(input_ids.device)
 
-        latent_codes = vq_out.get("indices", None)
-        z_teacher = vq_out["quantized"].detach().clone()  # [B, Q, D_lam]
-        # VAE path: indices may be None; require supervise_quantized to regress continuous latents
-        if latent_codes is None:
-            if not self.supervise_quantized:
-                raise ValueError("[LatentVLAModel] VAE mode provides no discrete indices; set supervise_quantized=True to use continuous latents.")
-            B, Q = z_teacher.shape[0], z_teacher.shape[1]
-            latent_codes = torch.zeros(B, Q, device=z_teacher.device, dtype=torch.long)
-        else:
-            latent_codes = latent_codes.detach().clone()
-
-        # === 2) 构造 VLM 输入（token teacher-forcing / query injection）===
-        latent_codes = latent_codes.to(input_ids.device)
-        z_teacher = z_teacher.to(input_ids.device)
-        act_token_ids = self.action_token_begin_id + latent_codes  # [B, Q]
-        input_ids_used, labels_used = self._prepare_vlm_token_inputs(
+        vlm_out, hidden, pred_latent = self._run_vlm_act_queries(
             input_ids=input_ids,
-            labels=labels,
-            act_placeholder_mask=act_placeholder_mask,
-            act_token_ids=act_token_ids,
-        )
-
-        vlm_out = self._vlm_forward(
-            input_ids=input_ids_used,
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            labels=labels_used,
             act_placeholder_mask=act_placeholder_mask,
-            num_queries=int(latent_codes.shape[1]),
         )
-        hidden = vlm_out.hidden_states[-1]  # [B, L, D_vlm]  最后一层是norm过的特征！
         logits = vlm_out.logits
-        loss_main = None if self.supervise_quantized else getattr(vlm_out, "loss", None)
-
-        # === 3) losses ===
-        pred_quantized = self._project_action_hidden_to_lam(
-            hidden=hidden,
-            act_placeholder_mask=act_placeholder_mask,
-            num_queries=int(latent_codes.shape[1]),
-        )
-        loss_distill = self._compute_quantized_loss(pred_quantized=pred_quantized, z_teacher=z_teacher)
+        loss_main = None
+        loss_distill = self._compute_latent_loss(pred_latent=pred_latent, teacher_latent=teacher_latent)
         loss_perceptual, delta_student = self._compute_decoder_perceptual_loss(
-            vq_out=vq_out,
-            pred_quantized=pred_quantized,
+            lam_out=lam_out,
+            pred_latent=pred_latent,
         )
-        loss_kl = self._compute_kl_loss(
-            vq_out=vq_out,
-            logits=logits,
-            act_placeholder_mask=act_placeholder_mask,
-        )
-
         total_loss = self._sum_losses(
             base_dtype=hidden.dtype,
             base_device=input_ids.device,
             loss_main=loss_main,
             loss_distill=loss_distill,
             loss_perceptual=loss_perceptual,
-            loss_kl=loss_kl,
             logits=logits,
         )
 
-        # Compute identity shortcut metric for wandb logging
-        identity_shortcut = None
-        if delta_student is not None:
-            with torch.no_grad():
-                # Mean absolute difference of delta_student, quantifying decoder's tendency to copy f_t
-                # Smaller value means decoder tends to directly copy f_t (recon_pred ≈ dec_in_f)
-                identity_shortcut = delta_student.abs().mean().item()
+        identity_shortcut = self._compute_identity_shortcut(delta_student)
 
         return {
             "loss": total_loss,
             "loss_main": loss_main,
             "loss_distill": loss_distill,
             "loss_perceptual": loss_perceptual,
-            "loss_kl": loss_kl,
             "logits": logits,
             "identity_shortcut": identity_shortcut,
         }
 
     # -------------------------
-    # Forward helper functions
+    # LAM helpers
     # -------------------------
-    def _lam_vq_encode(
+    def _run_lam_teacher(
+        self,
+        *,
+        lam_videos: torch.FloatTensor,
+        lam_states: torch.FloatTensor,
+        lam_dec_videos: Optional[torch.FloatTensor],
+        lam_dataset_ids: Optional[torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        lam_out = self._lam_encode_teacher(
+            lam_videos=lam_videos,
+            lam_states=lam_states,
+            lam_dec_videos=lam_dec_videos,
+            lam_dataset_ids=lam_dataset_ids,
+        )
+        self._maybe_debug_check_lam_codes(lam_out)
+        teacher_latent = lam_out["quantized"].detach().clone()
+        return lam_out, teacher_latent
+
+    def _lam_encode_teacher(
         self,
         *,
         lam_videos: torch.FloatTensor,
@@ -702,11 +611,11 @@ class LatentVLAModel(nn.Module):
         lam_dec_videos: Optional[torch.FloatTensor],
         lam_dataset_ids: Optional[torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Run frozen LAM vq_encode in fp32 (autocast disabled) and return vq_out dict."""
+        """Run frozen LAM encoder in fp32 (autocast disabled) and return latent dict."""
         with torch.no_grad():
             device_type = lam_videos.device.type if hasattr(lam_videos, "device") else "cuda"
             with torch.autocast(device_type=device_type, enabled=False):
-                return self.lam.vq_encode(
+                return self.lam.get_latent_action(
                     videos=lam_videos,
                     states=lam_states,
                     dec_videos=lam_dec_videos,
@@ -714,11 +623,9 @@ class LatentVLAModel(nn.Module):
                         self.enable_lam_decoder_perceptual and self.lam_decoder_perceptual_weight > 0
                     ),
                     dataset_ids=lam_dataset_ids,
-                    return_teacher_probs=self.enable_lam_kl_loss,
-                    teacher_temperature=self.lam_kl_temperature,
                 )
 
-    def _maybe_debug_check_lam_codes(self, vq_out: Dict[str, torch.Tensor]) -> None:
+    def _maybe_debug_check_lam_codes(self, lam_out: Dict[str, torch.Tensor]) -> None:
         """Optional debug hook for LAM indices under debug_repeat_batch.
 
         NOTE: We keep debug_mode for other debugging workflows, but we no longer
@@ -728,9 +635,9 @@ class LatentVLAModel(nn.Module):
         if not self.debug_mode:
             return
         try:
-            codes = vq_out.get("indices", None)
+            codes = lam_out.get("indices", None)
             if codes is None:
-                print("[LamCodes Debug] codes is None; skipping diff (vq_training=True?)")
+                print("[LamCodes Debug] codes is None; skipping diff (lam training=True?)")
                 return
             codes = codes.detach().clone()
             # Record latest codes (train/eval separated) for debugging/inspection.
@@ -739,35 +646,35 @@ class LatentVLAModel(nn.Module):
         except Exception as e:
             print(f"[LamCodes Debug] diff check failed: {e}")
 
-    def _prepare_vlm_token_inputs(
+    # -------------------------
+    # VLM helpers
+    # -------------------------
+    def _run_vlm_act_queries(
         self,
         *,
         input_ids: torch.LongTensor,
-        labels: Optional[torch.LongTensor],
+        attention_mask: torch.LongTensor,
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: Optional[torch.LongTensor],
         act_placeholder_mask: torch.BoolTensor,
-        act_token_ids: torch.LongTensor,
-    ) -> Tuple[torch.LongTensor, Optional[torch.LongTensor]]:
-        """Optionally teacher-force <ACT_i> into input_ids/labels (CE mode)."""
-        if self.supervise_quantized:
-            return input_ids, labels
-
-        input_ids_flat = input_ids.view(-1)
-        mask_flat = act_placeholder_mask.view(-1)
-        act_ids_flat = act_token_ids.view(-1)
-        assert mask_flat.sum().item() == act_ids_flat.numel(), (
-            "占位符数量与 latent 数量不匹配。"
-            f"mask_flat.sum()={mask_flat.sum().item()}, act_ids_flat.numel()={act_ids_flat.numel()}"
+    ) -> Tuple[Any, torch.Tensor, Optional[torch.Tensor]]:
+        Q = int(self.num_queries)
+        vlm_out = self._vlm_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            labels=None,
+            act_placeholder_mask=act_placeholder_mask,
+            num_queries=Q,
         )
-
-        input_ids_flat[mask_flat] = act_ids_flat
-        input_ids_replaced = input_ids_flat.view_as(input_ids)
-
-        if labels is None:
-            return input_ids_replaced, None
-        labels_flat = labels.view(-1)
-        labels_flat[mask_flat] = act_ids_flat
-        labels_replaced = labels_flat.view_as(labels)
-        return input_ids_replaced, labels_replaced
+        hidden = vlm_out.hidden_states[-1]
+        pred_latent = self._project_action_hidden_to_lam(
+            hidden=hidden,
+            act_placeholder_mask=act_placeholder_mask,
+            num_queries=Q,
+        )
+        return vlm_out, hidden, pred_latent
 
     def _vlm_forward(
         self,
@@ -780,36 +687,100 @@ class LatentVLAModel(nn.Module):
         act_placeholder_mask: torch.BoolTensor,
         num_queries: int,
     ):
-        """Forward VLM; in supervise_quantized mode inject learnable queries via inputs_embeds."""
-        if not self.supervise_quantized:
-            return self.vlm(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                labels=labels,
-                output_hidden_states=True,
+        """Forward VLM; inject learnable queries via inputs_embeds."""
+        if self.act_query is None:
+            raise ValueError("[LatentVLAModel] act_query is None.")
+        return self._vlm_forward_with_queries(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            labels=labels,
+            act_placeholder_mask=act_placeholder_mask,
+            act_query=self.act_query,
+            act_num_queries=num_queries,
+            flow_placeholder_mask=None,
+            flow_query=None,
+            flow_num_queries=None,
+        )
+
+    def _inject_queries_into_embeddings(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        placeholder_mask: torch.BoolTensor,
+        queries: torch.Tensor,
+        num_queries: int,
+        name: str,
+    ) -> None:
+        if placeholder_mask is None or queries is None:
+            return
+        device = inputs_embeds.device
+        placeholder_mask = placeholder_mask.to(device=device, dtype=torch.bool)
+        B, L = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
+        if int(placeholder_mask.sum().item()) != int(B * num_queries):
+            raise ValueError(
+                f"[LatentVLAModel] {name} placeholder count mismatch: "
+                f"mask_sum={int(placeholder_mask.sum().item())}, expected={int(B*num_queries)}"
+            )
+        per_sample = placeholder_mask.sum(dim=1)
+        if not torch.all(per_sample == int(num_queries)):
+            bad = torch.nonzero(per_sample != int(num_queries), as_tuple=False).flatten()
+            b = int(bad[0].item()) if bad.numel() > 0 else -1
+            raise ValueError(
+                f"[LatentVLAModel] {name} placeholder count mismatch for sample {b}: "
+                f"got={int(per_sample[b].item()) if b >= 0 else 'unknown'}, expected={num_queries}"
             )
 
-        if self.act_query is None:
-            raise ValueError("[LatentVLAModel] supervise_quantized=True but act_query is None.")
-        B = int(input_ids.shape[0])
-        if int(act_placeholder_mask.sum().item()) != int(B * num_queries):
-            raise ValueError(
-                f"[LatentVLAModel] placeholder count mismatch under supervise_quantized: "
-                f"mask_sum={int(act_placeholder_mask.sum().item())}, expected={int(B*num_queries)}"
-            )
+        qvec = queries.to(device=device, dtype=inputs_embeds.dtype)  # [Q, D]
+
+        # Vectorized assignment: map the i-th placeholder in each sample to queries[i].
+        # Sort indices to guarantee per-sample ascending position order.
+        idx = placeholder_mask.nonzero(as_tuple=False)  # [B*num_queries, 2] => (b, pos)
+        flat = idx[:, 0] * L + idx[:, 1]
+        idx = idx[flat.argsort()]
+        b_idx, p_idx = idx[:, 0], idx[:, 1]
+        q_idx = torch.arange(int(num_queries), device=device).repeat(B)  # [B*num_queries]
+        inputs_embeds[b_idx, p_idx, :] = qvec[q_idx]
+
+    def _vlm_forward_with_queries(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.LongTensor,
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: Optional[torch.LongTensor],
+        labels: Optional[torch.LongTensor],
+        act_placeholder_mask: Optional[torch.BoolTensor],
+        act_query: Optional[torch.Tensor],
+        act_num_queries: Optional[int],
+        flow_placeholder_mask: Optional[torch.BoolTensor],
+        flow_query: Optional[torch.Tensor],
+        flow_num_queries: Optional[int],
+    ):
+        """Forward VLM with custom query injection (supports dual query sets)."""
         embed = self.vlm.get_input_embeddings()
         inputs_embeds = embed(input_ids)
-        qvec = self.act_query.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)  # [Q, D]
-        for b in range(B):
-            pos = torch.nonzero(act_placeholder_mask[b], as_tuple=False).flatten()
-            if pos.numel() != num_queries:
-                raise ValueError(
-                    f"[LatentVLAModel] placeholder count mismatch for sample {b}: got={int(pos.numel())}, expected={num_queries}"
-                )
-            inputs_embeds[b, pos, :] = qvec
-
+        if act_placeholder_mask is not None and act_query is not None:
+            if act_num_queries is None:
+                raise ValueError("[LatentVLAModel] act_num_queries is None.")
+            self._inject_queries_into_embeddings(
+                inputs_embeds=inputs_embeds,
+                placeholder_mask=act_placeholder_mask,
+                queries=act_query,
+                num_queries=int(act_num_queries),
+                name="act_query",
+            )
+        if flow_placeholder_mask is not None and flow_query is not None:
+            if flow_num_queries is None:
+                raise ValueError("[LatentVLAModel] flow_num_queries is None.")
+            self._inject_queries_into_embeddings(
+                inputs_embeds=inputs_embeds,
+                placeholder_mask=flow_placeholder_mask,
+                queries=flow_query,
+                num_queries=int(flow_num_queries),
+                name="flow_query",
+            )
         return self.vlm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -819,7 +790,7 @@ class LatentVLAModel(nn.Module):
             output_hidden_states=True,
         )
 
-    def forward_vlm_queries_supervise_quantized(
+    def forward_vlm_queries_supervise_latent(
         self,
         *,
         input_ids: torch.LongTensor,
@@ -830,9 +801,9 @@ class LatentVLAModel(nn.Module):
         num_queries: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        提供可复用的 VLM-query 前向（supervise_quantized 路径）：
+        提供可复用的 VLM-query 前向：
         - 注入 act_query
-        - 返回占位符位置 hidden (h_vlm) 与投影后的 pred_quantized
+        - 返回占位符位置 hidden (h_vlm) 与投影后的 pred_latent
         """
         Q = int(num_queries) if num_queries is not None else int(self.num_queries)
         vlm_out = self._vlm_forward(
@@ -845,17 +816,68 @@ class LatentVLAModel(nn.Module):
             num_queries=Q,
         )
         hidden = vlm_out.hidden_states[-1]
-        pred_quantized = self._project_action_hidden_to_lam(
+        pred_latent = self._project_action_hidden_to_lam(
             hidden=hidden,
             act_placeholder_mask=act_placeholder_mask,
             num_queries=Q,
         )
         return {
             "h_vlm": hidden,
-            "pred_quantized": pred_quantized,
+            "pred_latent": pred_latent,
             "vlm_out": vlm_out,
         }
 
+    def forward_vlm_queries_supervise_latent_with_flow(
+        self,
+        *,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.LongTensor,
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: Optional[torch.LongTensor],
+        act_placeholder_mask: torch.BoolTensor,
+        flow_placeholder_mask: torch.BoolTensor,
+        flow_query: torch.Tensor,
+        num_queries: Optional[int] = None,
+        flow_num_queries: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        VLM 前向：注入 act_query + flow_query（两组占位符），
+        返回：
+            - pred_latent（来自 act_query 位置）
+            - h_vlm（全序列 hidden）
+        """
+        Q = int(num_queries) if num_queries is not None else int(self.num_queries)
+        F = int(flow_num_queries) if flow_num_queries is not None else int(flow_query.shape[0])
+        if flow_query is None:
+            raise ValueError("[LatentVLAModel] flow_query is None.")
+        vlm_out = self._vlm_forward_with_queries(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            labels=None,
+            act_placeholder_mask=act_placeholder_mask,
+            act_query=self.act_query,
+            act_num_queries=Q,
+            flow_placeholder_mask=flow_placeholder_mask,
+            flow_query=flow_query,
+            flow_num_queries=F,
+        )
+        hidden = vlm_out.hidden_states[-1]
+        pred_latent = self._project_action_hidden_to_lam(
+            hidden=hidden,
+            act_placeholder_mask=act_placeholder_mask,
+            num_queries=Q,
+        )
+        return {
+            "h_vlm": hidden,
+            "pred_latent": pred_latent,
+            "vlm_out": vlm_out,
+        }
+
+    # -------------------------
+    # Projection / loss helpers
+    # -------------------------
     def _project_action_hidden_to_lam(
         self,
         *,
@@ -863,9 +885,7 @@ class LatentVLAModel(nn.Module):
         act_placeholder_mask: torch.BoolTensor,
         num_queries: int,
     ) -> Optional[torch.Tensor]:
-        """Project action/query hidden states to LAM code space: returns [B,Q,D_lam] or None."""
-        if not self.supervise_quantized:
-            return None
+        """Project action/query hidden states to LAM code space: returns [B,1,D_lam] or None."""
         if self.vlm_to_lam is None:
             return None
         B = int(hidden.shape[0])
@@ -889,35 +909,35 @@ class LatentVLAModel(nn.Module):
             target_dtype = h_act.dtype
         if target_dtype != h_act.dtype:
             h_act = h_act.to(dtype=target_dtype)
-        return self.vlm_to_lam(h_act)  # [B, Q, D_lam]
+        return self.vlm_to_lam(h_act)  # [B, 1, D_lam]
 
-    def _compute_quantized_loss(
+    def _compute_latent_loss(
         self,
         *,
-        pred_quantized: Optional[torch.Tensor],
-        z_teacher: torch.Tensor,
+        pred_latent: Optional[torch.Tensor],
+        teacher_latent: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Compute quantized regression/distill loss (cosine or mse)."""
-        if pred_quantized is None:
+        """Compute latent regression/distill loss (cosine or mse)."""
+        if pred_latent is None:
             return None
-        if pred_quantized.shape != z_teacher.shape:
+        if pred_latent.shape != teacher_latent.shape:
             raise ValueError(
-                f"[LatentVLAModel] quantized shape mismatch: pred={tuple(pred_quantized.shape)} "
-                f"teacher={tuple(z_teacher.shape)}. "
-                "This usually means `vlm_to_lam` out_features was set to VQ code_dim instead of VQ input_dim."
+                f"[LatentVLAModel] latent shape mismatch: pred={tuple(pred_latent.shape)} "
+                f"teacher={tuple(teacher_latent.shape)}. "
+                "This usually means `vlm_to_lam` out_features was set to code_dim instead of input_dim."
             )
-        if self.quantized_loss_type == "mse":
-            return F.mse_loss(pred_quantized, z_teacher)
-        return 1 - F.cosine_similarity(pred_quantized, z_teacher, dim=-1).mean()
+        if self.latent_loss_type == "mse":
+            return F.mse_loss(pred_latent, teacher_latent)
+        return 1 - F.cosine_similarity(pred_latent, teacher_latent, dim=-1).mean()
 
     def _compute_decoder_perceptual_loss(
         self,
         *,
-        vq_out: Dict[str, torch.Tensor],
-        pred_quantized: Optional[torch.Tensor],
+        lam_out: Dict[str, torch.Tensor],
+        pred_latent: Optional[torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Compute perceptual loss via LAM decoder recon_pred vs recon_teacher (from vq_encode).
+        Compute perceptual loss via LAM decoder recon_pred vs recon_target (from LAM encoder).
         
         Returns:
             Tuple of (loss, delta_student):
@@ -926,27 +946,26 @@ class LatentVLAModel(nn.Module):
         """
         if not (self.enable_lam_decoder_perceptual and self.lam_decoder_perceptual_weight > 0):
             return None, None
-        if pred_quantized is None:
+        if pred_latent is None:
             raise ValueError(
-                "[LatentVLAModel] enable_lam_decoder_perceptual requires pred_quantized "
-                "(supervise_quantized must be True)."
+                "[LatentVLAModel] enable_lam_decoder_perceptual requires pred_latent."
             )
-        dec_in = vq_out.get("dec_in", None)
+        dec_in = lam_out.get("dec_in", None)
         if dec_in is None:
-            raise ValueError("[LatentVLAModel] vq_out['dec_in'] is None; cannot compute decoder perceptual loss.")
+            raise ValueError("[LatentVLAModel] lam_out['dec_in'] is None; cannot compute decoder perceptual loss.")
         # 目标类型：teacher 预测或真实 future 特征
         target_kind = self.lam_decoder_target
         if target_kind == "gt":
-            recon_target = vq_out.get("tgt", None)
+            recon_target = lam_out.get("tgt", None)
             if recon_target is None:
-                raise ValueError("[LatentVLAModel] vq_out['tgt'] is None; cannot use ground_truth target for perceptual loss.")
+                raise ValueError("[LatentVLAModel] lam_out['tgt'] is None; cannot use ground_truth target for perceptual loss.")
         else:
-            recon_target = vq_out.get("recon", None)
+            recon_target = lam_out.get("recon", None)
             if recon_target is None:
                 raise ValueError(
-                    "[LatentVLAModel] vq_out['recon'] is None; ensure vq_encode was called with predict_future_frame=True."
+                    "[LatentVLAModel] lam_out['recon'] is None; ensure LAM encoder was called with predict_future_frame=True."
                 )
-        # vq_encode runs under torch.inference_mode(): returned tensors are "inference tensors" and cannot be
+        # LAM encoder runs under torch.inference_mode(): returned tensors are "inference tensors" and cannot be
         # saved for backward in autograd ops. Clone them to normal tensors (still no grad) before using in loss/decoder.
         try:
             dec_in = dec_in.detach().clone()
@@ -957,11 +976,11 @@ class LatentVLAModel(nn.Module):
         except Exception:
             pass
 
-        dec_in_f = dec_in.to(device=pred_quantized.device, dtype=pred_quantized.dtype)
+        dec_in_f = dec_in.to(device=pred_latent.device, dtype=pred_latent.dtype)
 
         recon_pred = self.lam.decoder(
             features=dec_in_f,
-            actions=pred_quantized,
+            actions=pred_latent,
         )
         if recon_pred is None:
             raise ValueError("[LatentVLAModel] decoder returned None recon; cannot compute perceptual loss.")
@@ -975,45 +994,11 @@ class LatentVLAModel(nn.Module):
         loss = F.mse_loss(recon_pred, recon_target)
         return loss, recon_pred-dec_in_f
 
-    def _compute_kl_loss(
-        self,
-        *,
-        vq_out: Dict[str, torch.Tensor],
-        logits: torch.Tensor,
-        act_placeholder_mask: torch.BoolTensor,
-    ) -> Optional[torch.Tensor]:
-        """KL(p_teacher || q_student) on action vocabulary, teacher from LAM soft probs."""
-        if not self.enable_lam_kl_loss:
+    def _compute_identity_shortcut(self, delta_student: Optional[torch.Tensor]) -> Optional[float]:
+        if delta_student is None:
             return None
-        teacher_probs = vq_out.get("vq_probs", None)
-        if teacher_probs is None:
-            return None
-
-        act_token_range = torch.arange(self.codebook_size, device=logits.device) + self.action_token_begin_id
-        student_logits_all = logits.index_select(dim=-1, index=act_token_range)
-
-        mask_student = act_placeholder_mask[:, 1:]
-        student_logits = student_logits_all[:, :-1, :]
-
-        num_targets = teacher_probs.numel() // teacher_probs.shape[-1]
-        if mask_student.sum().item() != num_targets:
-            mask_student = act_placeholder_mask
-            student_logits = student_logits_all
-
-        student_log_probs = F.log_softmax(student_logits, dim=-1)
-        mask_flat = mask_student.reshape(-1)
-        student_log_probs_flat = student_log_probs.reshape(-1, student_log_probs.shape[-1])
-        student_log_probs_flat = student_log_probs_flat[mask_flat]
-
-        teacher_probs = teacher_probs.to(device=student_log_probs_flat.device)
-        teacher_probs_flat = teacher_probs.view(-1, teacher_probs.shape[-1]).to(student_log_probs_flat.dtype)
-        if student_log_probs_flat.shape[0] != teacher_probs_flat.shape[0]:
-            raise ValueError(
-                f"[LatentVLAModel] KL shape mismatch: student={student_log_probs_flat.shape} "
-                f"teacher={teacher_probs_flat.shape}, mask_sum={mask_flat.sum().item()}, "
-                f"teacher_targets={teacher_probs_flat.shape[0]}"
-            )
-        return F.kl_div(student_log_probs_flat, teacher_probs_flat, reduction="mean")
+        with torch.no_grad():
+            return delta_student.abs().mean().item()
 
     def _sum_losses(
         self,
@@ -1023,7 +1008,6 @@ class LatentVLAModel(nn.Module):
         loss_main: Optional[torch.Tensor],
         loss_distill: Optional[torch.Tensor],
         loss_perceptual: Optional[torch.Tensor],
-        loss_kl: Optional[torch.Tensor],
         logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sum enabled loss terms with corresponding weights."""
@@ -1034,13 +1018,10 @@ class LatentVLAModel(nn.Module):
             total = total + self.lam_encoder_distill_weight * loss_distill
         if loss_perceptual is not None:
             total = total + self.lam_decoder_perceptual_weight * loss_perceptual
-        if loss_kl is not None:
-            total = total + self.lam_kl_weight * loss_kl
-
-        # DDP safety: supervise_quantized 下通常不使用 logits/lm_head 来计算 loss，
+        # DDP safety: 通常不使用 logits/lm_head 来计算 loss，
         # 会导致 lm_head（及其 bias）等参数在某些配置下被判定为 unused。
         # 加一个 0 * logits.sum()，使其进入 autograd 图但不改变数值。
-        if self.supervise_quantized and logits is not None:
+        if logits is not None:
             total = total + logits.sum().to(dtype=total.dtype) * 0.0
         return total
 
@@ -1057,19 +1038,14 @@ class LatentVLAModel(nn.Module):
         lam_dec_videos: Optional[torch.FloatTensor] = None,
         lam_dataset_ids: Optional[torch.Tensor] = None,
         act_placeholder_mask: Optional[torch.BoolTensor] = None,
-        strict_placeholder_count: bool = True,
-        generate_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
-    推理：
-      - supervise_quantized=False（token CE）：返回
-          lam_latent_idx: LAM vq_encode 的 teacher indices，形状 [B, Q]
-          vlm_latent_idx: VLM generate 在动作词表上的 argmax indices，形状 [B, Q]
-      - supervise_quantized=True（query 回归）：无需 vq 索引，直接回归连续 embedding，返回
-          pred_quantized: VLM 回归的动作 embedding，形状 [B, Q, D_lam]
-          （若传入 lam_videos/lam_states，则额外返回 lam_latent_idx/lam_quantized 供对比）
-    Q 由训练时配置 self.num_queries 决定；若缺失则尝试从 LAM 输出推断。
+        推理：通过可学习 query 直接回归连续 embedding，返回
+          pred_latent: VLM 回归的动作 embedding，形状 [B, Q, D_lam]
+          （若传入 lam_videos/lam_states，则额外返回 lam_latent_idx/lam_latent 供对比/评估，
+           注意：这些 indices 仅用于参考，不参与训练或推理）
+        Q 由训练时配置 self.num_queries 决定；若缺失则报错。
         """
         placeholder_mask = (
             act_placeholder_mask.to(dtype=torch.bool, device=input_ids.device)
@@ -1077,7 +1053,7 @@ class LatentVLAModel(nn.Module):
             else input_ids == self.placeholder_token_id
         )
         if self.num_queries is None:
-            raise ValueError("[LatentVLAModel] num_queries is None; ensure LAM提供了 num_queries")
+            raise ValueError("[LatentVLAModel] num_queries is None; ensure it is configured.")
         Q = int(self.num_queries)
         counts = placeholder_mask.sum(dim=1)  # [B]
         unique_counts = torch.unique(counts)
@@ -1090,109 +1066,36 @@ class LatentVLAModel(nn.Module):
                 "(check data pipeline vs model.num_queries)"
             )
 
-        # ---- supervise_quantized: 直接回归 embedding，不生成 token ----
-        if self.supervise_quantized:
-            vlm_out = self._vlm_forward(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                labels=None,
-                act_placeholder_mask=placeholder_mask,
-                num_queries=Q,
-            )
-            hidden = vlm_out.hidden_states[-1]
-            pred_quantized = self._project_action_hidden_to_lam(
-                hidden=hidden,
-                act_placeholder_mask=placeholder_mask,
-                num_queries=Q,
-            )
-
-            out: Dict[str, torch.Tensor] = {
-                "pred_quantized": pred_quantized,
-                "logits": vlm_out.logits,
-            }
-
-            # 可选：如仍提供 LAM 输入，返回 teacher embedding/indices 便于比较或评估
-            if lam_videos is not None and lam_states is not None:
-                vq_out = self._lam_vq_encode(
-                    lam_videos=lam_videos,
-                    lam_states=lam_states,
-                    lam_dec_videos=lam_dec_videos,
-                    lam_dataset_ids=lam_dataset_ids,
-                )
-                out["lam_latent_idx"] = vq_out["indices"].detach()
-                out["lam_quantized"] = vq_out["quantized"].detach()
-
-            return out
-
-        # ---- token CE 路径：保持原生成/argmax 逻辑 ----
-        # 1) LAM 编码（teacher）
-        device_type = lam_videos.device.type if hasattr(lam_videos, "device") else "cuda"
-        with torch.no_grad():
-            with torch.autocast(device_type=device_type, enabled=False):
-                vq_out = self.lam.vq_encode(
-                    videos=lam_videos,
-                    states=lam_states,
-                    dec_videos=lam_dec_videos,
-                    predict_future_frame=False,
-                    dataset_ids=lam_dataset_ids,
-                    return_teacher_probs=False,
-                )
-
-        lam_latent_idx = vq_out.get("indices", None)
-        if lam_latent_idx is None:
-            raise ValueError("[LatentVLAModel] VAE mode provides no discrete indices; token-generation path is not supported. Use supervise_quantized=True or enable discrete VQ.")
-        lam_latent_idx = lam_latent_idx.detach()
-        if lam_latent_idx.shape[1] != Q:
-            raise ValueError(
-                f"[LatentVLAModel] LAM indices length mismatch: got {lam_latent_idx.shape[1]}, expected {Q}"
-            )
-        lam_latent_idx = lam_latent_idx.to(device=input_ids.device)
-
-        # 2) 构造生成前缀（去掉占位符）
-        placeholder_mask = (
-            act_placeholder_mask.to(dtype=torch.bool, device=input_ids.device)
-            if act_placeholder_mask is not None
-            else input_ids == self.placeholder_token_id
-        )
-        if placeholder_mask.any():
-            prefix_input_ids, prefix_attention_mask, _ = self._build_prefix_from_placeholders(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                strict_placeholder_count=True,
-            )
-        else:
-            prefix_input_ids = input_ids
-            prefix_attention_mask = attention_mask
-
-        # 3) VLM 生成 Q 个动作 token，并在动作词表上取 argmax
-        gen_kwargs = dict(generate_kwargs or {})
-        gen_kwargs.setdefault("min_new_tokens", Q)
-        gen_kwargs.setdefault("max_new_tokens", Q)
-        gen_kwargs.setdefault("do_sample", False)
-        gen_kwargs.setdefault("return_dict_in_generate", True)
-        gen_kwargs.setdefault("output_scores", True)
-
-        gen_out = self.vlm.generate(
-            input_ids=prefix_input_ids,
-            attention_mask=prefix_attention_mask,
+        vlm_out = self._vlm_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
-            **gen_kwargs,
+            labels=None,
+            act_placeholder_mask=placeholder_mask,
+            num_queries=Q,
         )
-        scores = gen_out.scores
-        if scores is None or len(scores) < Q:
-            raise ValueError(f"[LatentVLAModel] generate returned insufficient scores, len={0 if scores is None else len(scores)}")
+        hidden = vlm_out.hidden_states[-1]
+        pred_latent = self._project_action_hidden_to_lam(
+            hidden=hidden,
+            act_placeholder_mask=placeholder_mask,
+            num_queries=Q,
+        )
 
-        act_token_range = torch.arange(self.codebook_size, device=scores[0].device) + self.action_token_begin_id
-        step_indices = []
-        for s in scores[:Q]:
-            act_logits = s.index_select(dim=-1, index=act_token_range)  # [B, K]
-            step_indices.append(torch.argmax(act_logits, dim=-1))  # [B]
-        vlm_latent_idx = torch.stack(step_indices, dim=0).transpose(0, 1).contiguous()  # [B, Q]
-
-        return {
-            "lam_latent_idx": lam_latent_idx,
-            "vlm_latent_idx": vlm_latent_idx.to(device=input_ids.device),
+        out: Dict[str, torch.Tensor] = {
+            "pred_latent": pred_latent,
+            "logits": vlm_out.logits,
         }
+
+        # 如提供 LAM 输入，返回 teacher embedding/indices 便于比较或评估
+        if lam_videos is not None and lam_states is not None:
+            lam_out = self._lam_encode_teacher(
+                lam_videos=lam_videos,
+                lam_states=lam_states,
+                lam_dec_videos=lam_dec_videos,
+                lam_dataset_ids=lam_dataset_ids,
+            )
+            out["lam_latent_idx"] = lam_out["indices"].detach()
+            out["lam_latent"] = lam_out["quantized"].detach()
+
+        return out

@@ -1,27 +1,35 @@
+# VJEPA_LAM 模型配置 - 适配 Lightning CLI
+#
+# 物理接地功能说明：
+# 1. 设置 enable_state_delta_prediction: true 启用物理接地状态差解码器
+# 2. 确保数据混合包含机械臂数据集（如 libero, bridge 等）和人类视频数据集（如 ego4d）
+# 3. 模型会自动识别机械臂数据（状态非零）并计算物理接地辅助损失
+# 4. 人类数据的状态在 transforms.py 中已被填充为零，不参与辅助损失计算
+
 
   
 # 模型参数
 model:
   # VJEPA_LAM 模型架构参数
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitl16-pretrain-lvd1689m" 
-  vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
-  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
+  # vision_model_id: "/mnt/project_rlinf/jlchen/weights/dinov3-vitb16-pretrain-lvd1689m"
+  vision_model_id: "/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"
   # vision_model_id: "/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"
   dim: 768                    # 特征维度 (V-JEPA2 ViT Large 输出维度)
-  enc_layers: 6               # LAM 编码器层数 16head
+  enc_layers: 12               # LAM 编码器层数 16head
   ffn_expansion_factor: 3
-
+  num_heads: 12
   codebook_size: 32        # 码本大小
-  code_dim: 768                # 码本维度
+  code_dim: 64                # 码本维度
   ar_prediction: false
-  num_queries: 16
+  num_queries: 1
   num_frames: 2
-  dec_layers: 2                # 解码器层数
+  dec_layers: 12                # 解码器层数
   dropout: 0.0                 # Dropout 率              
   warmup_steps: 0           # 预热步数；0 表示关闭预热
   enc_add_state: false
   enc_modal_mask: true
-  lambda_aux: 1.0                       # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
+  lambda_aux: 1.0                        # (↑↑) 进一步增加：让物理接地与视觉重构有更平等的对话地位。
   loss_type: "l2"
 
   latent_layer_to_use: -2
@@ -31,13 +39,10 @@ model:
   lambda_diversity: 0.0            #0.03与重建损失同一数量级
   vq_type: "ae"
   vq_kwargs:
-    layer_norm: false
-
-  disable_vq: true
-
+    layer_norm: true
 
   project: lam
-  task_name: vae_test
+  task_name: test
 
 
   wandb_offline: true
@@ -47,7 +52,7 @@ model:
     class_path: torch.optim.AdamW
     init_args:
       lr: 1e-4
-      weight_decay: 0.0
+      weight_decay: 1e-4
   
   # 索引保存参数
   make_data_pair: false        # 是否生成数据对
@@ -56,14 +61,14 @@ model:
 # 数据参数
 data:
   data_root: /mnt/project_rlinf/jlchen/datasets
-  data_mix: bridge_dataset   # Manip. + Navi. + Human
-  batch_size: 32
+  data_mix: libero4in1   # Manip. + Navi. + Human
+  batch_size: 128
   resolution: 256            #dino是256
   episodic: false
-  shuffle_buffer_size: 1024   # 根据内存大小调整
+  shuffle_buffer_size: 10240   # 根据内存大小调整
   image_aug: true
-  training_phase: lam_2f
-  debug_repeat_batch: 32
+  training_phase: lam
+  debug_repeat_batch: false
 
 # 训练器参数
 trainer:
@@ -75,6 +80,7 @@ trainer:
   accumulate_grad_batches: 1    
   precision: bf16-mixed            #bf16-mixed 32-true 
   log_every_n_steps: 1000
+  gradient_clip_val: 1.0
   # enable_progress_bar: false  # 禁用重复的进度条
   val_check_interval: 999
   num_sanity_val_steps: 0
@@ -88,13 +94,10 @@ trainer:
         save_last: true
         save_top_k: -1
         # save_on_train_epoch_end: true    # 每个epoch结束时也保存
-        every_n_epochs: 500
+        every_n_epochs: 2
         # every_n_train_steps: 10000
         filename: "{epoch}"
         
-    - class_path: latent_action_model.core.lam_lightinng.CodebookMaintenanceCallback
-      init_args:
-        interval_steps: 100000000
 
     - class_path: latent_action_model.core.lam_lightinng.SaveConfigToCheckpointCallback
 
@@ -102,7 +105,7 @@ trainer:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
         save_dir: latent_action_model/logs
-        name:  vae_test
+        name:  test
 
 
 

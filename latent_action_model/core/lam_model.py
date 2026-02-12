@@ -67,7 +67,9 @@ class LatentLAMModel(nn.Module):
             norm_layer_type=norm_latents_type,
             enable_norm=norm_latents,
         )
+        self.vision_model_id = vision_model_id
         self.feature_dim = dim
+        self.code_dim = code_dim
         if encoder_obj is None:
             # 未使用预训练视觉编码器，回退到可学习的 PatchEmbed 层
             self.vision_encoder = PatchEmbed(patch_size=16, embed_dim=dim, in_chans=3).to(self.device)
@@ -94,6 +96,7 @@ class LatentLAMModel(nn.Module):
                 train_in_latent=self.train_in_latent,
                 ffn_expansion_factor=ffn_expansion_factor,
                 dataset_vocab_size=dataset_vocab_size,
+                code_dim=code_dim,
             ).to(self.device)
         else:
             self.frame_to_pre = 1
@@ -107,18 +110,20 @@ class LatentLAMModel(nn.Module):
                 train_in_latent=self.train_in_latent,
                 ffn_expansion_factor=ffn_expansion_factor,
                 dataset_vocab_size=dataset_vocab_size,
+                code_dim=code_dim,
             ).to(self.device)
             self.state_decoder = StatePredictor(
                 latent_dim=dim,
                 dropout=dropout,
                 num_datasets=dataset_vocab_size,
                 num_queries=num_queries,
+                code_dim=code_dim,
             ).to(self.device)
         self.norm_latents = norm_latents
         # print("norm_latents:", self.norm_latents)
         self.norm_latents_type = norm_latents_type
         self.vq_type = vq_type
-        self.encoder = LAMEncoder(context_dim=dim, input_dim=2*self.input_dim if multi_input else self.input_dim, ar_query=self.ar_prediction, add_state=enc_add_state, modal_mask=enc_modal_mask, num_layers=enc_layers, num_heads=num_heads, dropout=dropout, ffn_expansion_factor=ffn_expansion_factor, num_frames=self.num_frames, num_queries=num_queries).to(self.device)
+        self.encoder = LAMEncoder(context_dim=dim, input_dim=2*self.input_dim if multi_input else self.input_dim, ar_query=self.ar_prediction, add_state=enc_add_state, modal_mask=enc_modal_mask, num_layers=enc_layers, num_heads=num_heads, dropout=dropout, ffn_expansion_factor=ffn_expansion_factor, num_frames=self.num_frames, num_queries=num_queries, code_dim=code_dim).to(self.device)
         self.latent_layer_to_use = latent_layer_to_use
         self.multi_input = multi_input
         vq_kwargs = vq_kwargs or {}
@@ -127,14 +132,12 @@ class LatentLAMModel(nn.Module):
             self.vq = NSVQ(
                 codebook_size=codebook_size,
                 code_dim=code_dim,
-                input_dim=dim,
                 use_diveq=False,
                 **vq_kwargs
             ).to(self.device)
         elif self.vq_type in ("ema", "ema_vq"):
             self.vq = EMAVQ(
                 codebook_size=codebook_size,
-                input_dim=dim,
                 code_dim=code_dim,
                 **vq_kwargs
             ).to(self.device)
@@ -142,19 +145,16 @@ class LatentLAMModel(nn.Module):
             self.vq = VQ(
                 codebook_size=codebook_size,
                 code_dim=code_dim,
-                input_dim=dim,
                 **vq_kwargs
             ).to(self.device)
         elif self.vq_type in ("vae", "beta_vae"):
             from .vq import VAEQuantizer
             self.vq = VAEQuantizer(
-                input_dim=dim,
                 code_dim=code_dim,
                 **vq_kwargs,
             ).to(self.device)
         elif self.vq_type == "ae":
             self.vq = AEQuantizer(
-                input_dim=dim,
                 code_dim=code_dim,
                 codebook_size=codebook_size,
                 **vq_kwargs,
@@ -163,7 +163,6 @@ class LatentLAMModel(nn.Module):
             print(f"Unsupported vq_type='{vq_type}', falling back to NSVQ.")
             self.vq = NSVQ(
                 codebook_size=codebook_size,
-                input_dim=dim,
                 code_dim=code_dim,
                 **vq_kwargs
             ).to(self.device)
@@ -213,44 +212,80 @@ class LatentLAMModel(nn.Module):
             (recon, perplexity, indices, delta_s_pred, features, quantized, codebook_loss, entropy_loss, commitment_loss)
         """
         # 冻结视觉编码器参数，与原 Lightning 行为保持一致
-        
+        b = videos.shape[0]
         if self.train_in_latent:
-            # 使用预训练视觉编码器：一次性编码 [videos, dec_videos]，避免重复前向
             T = videos.shape[1]
-            cat_videos = torch.cat([videos, dec_videos], dim=1)
-            all_features = self.vision_encoder.encode(
-                cat_videos,
-                n=self.latent_layer_to_use,
-            )
+            is_jepa = "jepa" in self.vision_model_id.lower()
 
+            if is_jepa:
+                # JEPA 路径：videos 走视频编码，dec_videos 走逐帧图像编码
+                enc_features_raw = self.vision_encoder.encode(
+                    videos,
+                    n=self.latent_layer_to_use,
+                )
+                dec_features_raw = self.vision_encoder.encode_image(
+                    dec_videos,
+                    n=self.latent_layer_to_use,
+                )
 
-            # 当 latent_layer_to_use 为列表且视觉编码器返回多层特征时：
-            # - enc_in 使用列表中第一个特征
-            # - dec_in 与 tgt 使用列表中最后一个特征
-            if isinstance(self.latent_layer_to_use, (list, tuple)) and isinstance(
-                all_features, (list, tuple)
-            ):  
-                dec_feats = all_features[-1]
-                if self.multi_input and len(self.latent_layer_to_use) >= 2:
-                    enc_feats = torch.cat([all_features[0],all_features[-1]], dim=-1)
+                # 当 latent_layer_to_use 为列表且视觉编码器返回多层特征时：
+                # - enc_in 使用列表中第一个特征
+                # - dec_in 与 tgt 使用列表中最后一个特征
+                if isinstance(self.latent_layer_to_use, (list, tuple)) and isinstance(
+                    enc_features_raw, (list, tuple)
+                ):
+                    enc_layers = list(enc_features_raw)
+                    if isinstance(dec_features_raw, (list, tuple)):
+                        dec_layers = list(dec_features_raw)
+                    else:
+                        dec_layers = [dec_features_raw]
+                    dec_feats = dec_layers[-1]
+                    if self.multi_input and len(self.latent_layer_to_use) >= 2:
+                        enc_feats = torch.cat([enc_layers[0], enc_layers[-1]], dim=-1)
+                    else:
+                        enc_feats = enc_layers[0]
                 else:
-                    enc_feats = all_features[0]
-                
+                    # 保持原有行为：编码与解码都使用同一层特征
+                    enc_feats = enc_features_raw
+                    dec_feats = dec_features_raw
             else:
-                # 保持原有行为：编码与解码都使用同一层特征
-                enc_feats = dec_feats = all_features
+                # 非 JEPA 路径：按 batch 维拼接 [videos, dec_videos]，一次前向后再拆分
+                cat_videos = torch.cat([videos, dec_videos], dim=0)
+                all_features = self.vision_encoder.encode(
+                    cat_videos,
+                    n=self.latent_layer_to_use,
+                )
+
+                # 当 latent_layer_to_use 为列表且视觉编码器返回多层特征时：
+                # - enc_in 使用列表中第一个特征
+                # - dec_in 与 tgt 使用列表中最后一个特征
+                if isinstance(self.latent_layer_to_use, (list, tuple)) and isinstance(
+                    all_features, (list, tuple)
+                ):
+                    enc_layers = [feat[:b] for feat in all_features]
+                    dec_layers = [feat[b : b * 2] for feat in all_features]
+                    dec_feats = dec_layers[-1]
+                    if self.multi_input and len(self.latent_layer_to_use) >= 2:
+                        enc_feats = torch.cat([enc_layers[0], enc_layers[-1]], dim=-1)
+                    else:
+                        enc_feats = enc_layers[0]
+                else:
+                    # 保持原有行为：编码与解码都使用同一层特征
+                    enc_feats = all_features[:b]
+                    dec_feats = all_features[b : b * 2]
 
             enc_in = enc_feats[:, :T]  # [B, T, K, D]
+            dec_T = dec_feats.shape[1]
             if not self.ar_prediction:
                 # 非自回归：仅预测最后一帧
-                dec_in = dec_feats[:, T : T + 1]  # [B, 1, K, D]
+                dec_in = dec_feats[:, :1]  # [B, 1, K, D]
                 tgt = dec_feats[:, -1:]  # [B, 1, K, D]
                 dec_states = states[:, :1]
             else:
                 # 自回归：预测后续 T-1 帧
-                dec_in = dec_feats[:, T : T * 2 - 1]  # [B, T-1, K, D]
-                tgt = dec_feats[:, T + 1 :]  # [B, T-1, K, D]
-                dec_states = states[:, : T - 1]  # [B, T-1, 8]
+                dec_in = dec_feats[:, : dec_T - 1]  # [B, T-1, K, D]
+                tgt = dec_feats[:, 1:dec_T]  # [B, T-1, K, D]
+                dec_states = states[:, : dec_T - 1]  # [B, T-1, 8]
             # print(f"dec_in norm mean:{dec_in.norm(dim=-1).mean()}", "\n")
             # print(f"dec_in norm std:{dec_in.norm(dim=-1).std()}", "\n")
             # 仅在推理或需要可视化时构建 `vision_features`，训练路径下可跳过以减小开销
@@ -385,7 +420,7 @@ class LatentLAMModel(nn.Module):
         return self._run(videos=videos, states=states, dec_videos=dec_videos, dataset_ids=dataset_ids, vq_training=False, predict_future_frame=True)
 
     @torch.inference_mode()
-    def vq_encode(
+    def get_latent_action(
         self,
         videos: torch.Tensor,
         states: torch.Tensor,
@@ -398,7 +433,7 @@ class LatentLAMModel(nn.Module):
     ):
         """
         推理流程：复用 `_run` 中与训练一致的视觉编码与多层特征逻辑：
-        videos/states[/dec_videos] -> 视觉编码 -> 编码 -> VQ.inference(user_specific)。
+        videos/states[/dec_videos] -> 视觉编码 -> 编码 -> 码本推理（user_specific）。
 
         - 当 `predict_future_frame=False` 时，内部仍会按照 `_run` 的逻辑构造 enc/dec 特征，
           但不会调用 Decoder，仅做离散动作推理（indices/quantized），适用于 VLA 等纯编码场景。
@@ -487,14 +522,16 @@ class LatentLAMModel(nn.Module):
         }
 
     @torch.no_grad()
-    def extract_dino_features(self, videos: torch.Tensor, *, n: Optional[Any] = -2) -> torch.Tensor:
+    def extract_vision_features(self, videos: torch.Tensor, *, n: Optional[Any] = -2) -> torch.Tensor:
         """
-        仅提取视觉编码器的特征（不经过 VQ/decoder），返回 [B, T, K, D]。
+        仅提取视觉编码器特征（不经过 VQ/decoder），返回 [B, T, K, D]。
         若 latent_layer_to_use 是列表且 encoder 返回多层，则取最后一层。
         """
-        # 对齐 latent_layer_to_use 的行为
         n_used = n if n is not None else self.latent_layer_to_use
-        feats = self.vision_encoder.encode(videos, n=n_used)
+        try:
+            feats = self.vision_encoder.encode(videos, n=n_used)
+        except TypeError:
+            feats = self.vision_encoder.encode(videos)
         if isinstance(feats, (list, tuple)):
             feats = feats[-1]
         return feats
@@ -548,5 +585,3 @@ def load_latent_action_model(ckpt_path, yaml_path):
     for p in latent_action_model.parameters():
         p.requires_grad = False
     return latent_action_model.eval()
-
-

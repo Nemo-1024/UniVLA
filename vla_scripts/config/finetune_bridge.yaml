@@ -1,0 +1,75 @@
+# Finetune LatentWorldVLA on LIBERO, latent + perceptual
+
+# Base model & LAM
+model_cfg:
+  model_id: "/mnt/project_rlinf/jlchen/weights/Qwen3-VL-2B-Instruct"
+  lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/checkpoints/epoch=21.ckpt"
+  lam_yaml_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/dino_base_ae.yaml"
+  perceptual_weight: 0.1
+  # 细粒度冻结策略（替代原有的 freeze_vlm）
+  freeze_vision_backbone: true      # 冻结视觉骨干
+  freeze_llm_backbone: true         # 冻结语言模型骨干
+  freeze_last_llm_layer: true      # 保持 LM head 可训练
+  freeze_embedding: true           # 保持嵌入层可训练
+  unfreeze_vision_merger: true     # 不解冻视觉 merger
+  unfreeze_llm_last_n_layers: 4 # 不解冻最后 N 层（设为数字如 4 可解冻最后4层）
+  unfreeze_lam_decoder: true
+  latent_action_placeholder_token: "<ACT_PH>"
+  future_prediction: true # 是否预测未来特征
+  enable_wrist_view: false
+  # Flow Matching 头部配置（ConditionalFlowMatchingConfig）
+  # 这些参数会传给 `prismatic/models/vlas/flowmatching_expert.py` 的 `ConditionalFlowMatchingHead`
+  flow_cfg:
+    # 基本维度（请确保与数据/模型一致）
+    action_dim: 7
+    window_size: 10
+    proprio_dim: 8
+    use_proprio: false
+    vlm_dim: 2048
+    vision_dim: 768
+    num_vision_tokens: 256
+    hidden_dim: 768
+    # DiT / 交替注意力
+    num_layers: 12
+    interleave_self_attention: true
+    use_alternate_vldit: true
+    attend_text_every_n_blocks: 2
+    # CFG（训练 drop + 推理 scale；推理默认用 model_cfg.cfg_guidance_scale）
+    cfg_drop_prob: 0.1
+    cfg_scale: 1.0
+    # 时间离散化与采样
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+# Dataset & preprocessing
+data_root_dir: "/mnt/project_rlinf/jlchen/datasets"
+data_mix: "bridge"    # libero_all  libero_object_no_noops
+image_resolution: 256
+shuffle_buffer_size: 20000
+image_aug: true
+use_history_frame: false
+
+debug_repeat_batch: false
+window_size: 7
+
+# Optimization
+batch_size: 64
+max_steps: 100000
+save_steps: 5000
+eval_steps: 1000
+eval_batches: 20
+learning_rate: 1.0e-4
+warmup_steps: 2000
+vlm_learning_rate: 1.0e-5
+vlm_warmup_steps: 2000
+grad_accumulation_steps: 1
+gradient_clip: 1.0  
+weight_decay: 1.0e-8
+# vlm_loss_weight: 1.0
+seed: 42
+
+# Logging / run id
+run_id_note: "finetune_bridge_vldit" 
+wandb_project: "finetune-bridge"
+wandb_entity: null

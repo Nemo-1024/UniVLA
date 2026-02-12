@@ -1,6 +1,7 @@
 import torch.nn as nn   
 import torch
 import math
+from typing import Optional
 from .ac_predictor import VisionTransformerPredictorAC
 from .modules import Attn_Crossn_Block
 from .pos_embs import Fixed2DPositionalEncoding
@@ -24,6 +25,7 @@ class LAMDecoder(nn.Module):
         img_size = (256, 256),
         patch_size: int = 16,
         dataset_vocab_size: int = 16,
+        code_dim: Optional[int] = None,
     ):
         """
         参数:
@@ -69,12 +71,21 @@ class LAMDecoder(nn.Module):
             use_rope=True,
             action_embed_dim=context_dim,
         )
+        if code_dim is not None and code_dim != context_dim:
+            self.action_in_proj = nn.Linear(code_dim, context_dim)
+        else:
+            self.action_in_proj = nn.Identity()
 
         # 若需要从 latent 还原到像素（通常不在预训练视觉特征上使用）
         if not train_in_latent:
             self.to_pixel = nn.ConvTranspose2d(input_dim, 3, kernel_size=patch_size, stride=patch_size)
 
-        self.state_predictor = StatePredictor(context_dim, dropout=dropout, num_datasets=dataset_vocab_size)
+        self.state_predictor = StatePredictor(
+            context_dim,
+            dropout=dropout,
+            num_datasets=dataset_vocab_size,
+            code_dim=code_dim,
+        )
 
     def forward(self, features, actions, states, dataset_id):
         """
@@ -98,6 +109,7 @@ class LAMDecoder(nn.Module):
             raise ValueError(f"features 期望为 [B, T, K, D] 或 [B, K, D]，但获得 {features.shape}")
 
         B, T, K, D = features.shape
+        actions = self.action_in_proj(actions)
 
         # backbone 期望的输入为 [B, T*H*W, D]
         x = features.reshape(B, T * K, D)
@@ -119,7 +131,7 @@ class LAMDecoder_v2(nn.Module):
     """
     通过堆叠多个 DecoderBlock，将动作应用到状态上，以重建下一帧的特征。
     """
-    def __init__(self, context_dim, input_dim: int=1024, num_queries: int=1, num_layers=6, num_heads=16, dropout=0.1, grid_size: int=16, train_in_latent: bool = True, ffn_expansion_factor=2, dataset_vocab_size: int = 16):
+    def __init__(self, context_dim, input_dim: int=1024, num_queries: int=1, num_layers=6, num_heads=16, dropout=0.1, grid_size: int=16, train_in_latent: bool = True, ffn_expansion_factor=2, dataset_vocab_size: int = 16, code_dim: Optional[int] = None):
         """
         初始化 LAMDecoder。
         
@@ -160,6 +172,10 @@ class LAMDecoder_v2(nn.Module):
         else:
             self.project_input = nn.Linear(input_dim, context_dim)
             self.project_output = nn.Linear(context_dim, input_dim)
+        if code_dim is not None and code_dim != context_dim:
+            self.action_in_proj = nn.Linear(code_dim, context_dim)
+        else:
+            self.action_in_proj = nn.Identity()
         if not train_in_latent:
             self.to_pixel = nn.ConvTranspose2d(input_dim, 3, kernel_size=16, stride=16)
         
@@ -177,7 +193,7 @@ class LAMDecoder_v2(nn.Module):
             torch.Tensor: 重建的最后一帧特征 f_hat_T，形状 [B, 1, K, input_dim]。
         """
         # 投影query并使用self-attention增强
-        actions_tokens = actions  # [B, 1, feature_dim]
+        actions_tokens = self.action_in_proj(actions)  # [B, 1, feature_dim]
         
         # 投影输入特征（只调用一次，避免冗余）
         features_tokens = self.project_input(features)  # [B, 1, K, feature_dim] 或 [B, K, feature_dim]
@@ -224,11 +240,12 @@ class StatePredictor(nn.Module):
         s_pred: [B, 8]  (与目标状态对应)
     """
 
-    def __init__(self, latent_dim: int, dropout: float = 0.1, num_datasets: int = 16, num_queries: int = 1, state_dim: int = 8):
+    def __init__(self, latent_dim: int, dropout: float = 0.1, num_datasets: int = 16, num_queries: int = 1, state_dim: int = 8, code_dim: Optional[int] = None):
         super().__init__()
         self.dataset_embed = nn.Embedding(num_datasets, latent_dim)
         # 对 query 进行均值池化后的线性映射
-        self.z_proj = nn.Linear(latent_dim, latent_dim)
+        z_input_dim = code_dim if code_dim is not None else latent_dim
+        self.z_proj = nn.Linear(z_input_dim, latent_dim)
         # 对完整 state 做线性映射
         self.state_proj = nn.Linear(state_dim, latent_dim)
         # MLP 预测最终状态

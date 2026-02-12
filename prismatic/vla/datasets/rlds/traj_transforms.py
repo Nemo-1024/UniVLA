@@ -256,7 +256,7 @@ def chunk_act_obs_uniform_resample(
     window_size: int,
     future_action_window_size: int = 0,  # 保持签名兼容，实际不使用
     *,
-    fixed_obs_len: int = 5,
+    fixed_obs_len: int = 4,
     proprio_threshold_min: float = 0.1,
     proprio_threshold_max: float = 1.0,
     use_history_frame: bool = False,

@@ -8,14 +8,11 @@ import numpy as np
 import tensorflow as tf
 import torch
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
-
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor, LatentVLAProcessor
+from transformers import AutoProcessor
 
 # LatentWorldVLA loading (mirrors vla_scripts/finetune_libero.py)
 from prismatic.models.vlas.latent_world_vla import LatentWorldVLA, LatentWorldVLAConfig, SimpleLatentWorldVLA
+from prismatic.vla.latent_vla_processor import LatentVLAProcessor
 from safetensors.torch import load_file as load_safetensors
 
 # Initialize important constants and pretty-printing mode in NumPy.
@@ -32,50 +29,73 @@ OPENVLA_V01_SYSTEM_PROMPT = (
 )
 
 
-def get_vla(cfg):
+def get_vla(cfg, training_cfg=None):
     """
     加载 LatentWorldVLA 模型用于评估。
     
-    所有加载逻辑都在 LatentWorldVLA.from_config 内部完成。
-    此函数仅负责：
-    1. 构造配置
-    2. 调用 from_config（自动加载 VLM, LAM, Flow 权重）
-    3. 移到设备并设置为评估模式
+    Args:
+        cfg: 评估配置（GenerateConfig）
+        training_cfg: 已加载的训练yaml配置字典（由调用方传入）
     
-    注意：
-    - Flow 权重会自动从 cfg.model_id/flow.pt 加载（如果存在）
-    - 支持两种场景：
-      * LatentVLAModel checkpoint（无 flow.pt）→ 用于开始训练
-      * LatentWorldVLA checkpoint（有 flow.pt）→ 用于推理/继续训练
-    - 数据集统计信息（dataset_statistics）由 LatentVLAProcessor 单独加载
+    工作流程：
+    1. 用yaml中的model_cfg参数构造LatentWorldVLAConfig
+    2. 用评估配置中的推理参数覆盖
+    3. 调用 from_config 加载模型
     """
-    # 构造模型配置
-    model_cfg = LatentWorldVLAConfig(
-        model_id=cfg.model_id,
-        lam_ckpt_path=cfg.lam_path,
-        lam_yaml_path=cfg.lam_yaml_path,
-        cfg_guidance_scale=cfg.guidance_scale,
-        num_inference_steps=cfg.num_inference_steps,
-        supervise_quantized=True,
-        future_prediction=cfg.future_prediction,  # 🔧 控制是否使用未来特征预测
-    )
+    import dataclasses
+    from prismatic.models.vlas.flowmatching_expert import ConditionalFlowMatchingConfig
     
-    # 使用 from_config 加载模型（内部完成所有权重加载，包括可选的 Flow）
-    print("[*] Loading LatentWorldVLA model...")
-    if cfg.use_simple_model:
+    if training_cfg is None:
+        raise ValueError("training_cfg is required. Please load yaml first using load_training_yaml().")
+    
+    # 1. 准备模型配置参数字典
+    model_cfg_kwargs = {'model_id': cfg.model_id}  # model_id始终使用命令行指定的
+    
+    # 2. 从yaml的model_cfg中提取参数
+    yaml_model_cfg = training_cfg.get('model_cfg', {})
+    config_fields = {f.name for f in dataclasses.fields(LatentWorldVLAConfig)}
+    
+    print("[*] Model parameters from yaml:")
+    for key, value in yaml_model_cfg.items():
+        if key in config_fields and key != 'model_id':
+            if key == 'flow_cfg' and isinstance(value, dict):
+                flow_config_fields = {f.name for f in dataclasses.fields(ConditionalFlowMatchingConfig)}
+                flow_cfg_kwargs = {k: v for k, v in value.items() if k in flow_config_fields}
+                model_cfg_kwargs['flow_cfg'] = ConditionalFlowMatchingConfig(**flow_cfg_kwargs)
+                print(f"  - flow_cfg: {len(flow_cfg_kwargs)} parameters")
+            else:
+                model_cfg_kwargs[key] = value
+                print(f"  - {key} = {value}")
+    
+    # 3. 特殊处理：顶层参数映射
+    if 'use_simple_model' in training_cfg:
+        model_cfg_kwargs['use_simple_action_head'] = training_cfg['use_simple_model']
+        print(f"  - use_simple_action_head = {training_cfg['use_simple_model']}")
+    
+    # 4. 评估参数覆盖
+    if hasattr(cfg, 'guidance_scale') and cfg.guidance_scale is not None:
+        model_cfg_kwargs['cfg_guidance_scale'] = cfg.guidance_scale
+        print(f"[*] Eval override: guidance_scale = {cfg.guidance_scale}")
+    if hasattr(cfg, 'num_inference_steps') and cfg.num_inference_steps is not None:
+        model_cfg_kwargs['num_inference_steps'] = cfg.num_inference_steps
+        print(f"[*] Eval override: num_inference_steps = {cfg.num_inference_steps}")
+    
+    # 5. 构造模型配置并加载模型
+    model_cfg = LatentWorldVLAConfig(**model_cfg_kwargs)
+    
+    print(f"[*] Loading model ({len(model_cfg_kwargs)} parameters)...")
+    if model_cfg.use_simple_action_head:
+        print("[*] Using SimpleLatentWorldVLA")
         vla, processor = SimpleLatentWorldVLA.from_config(model_cfg)
     else:
+        print("[*] Using LatentWorldVLA (flow matching)")
         vla, processor = LatentWorldVLA.from_config(model_cfg)
-    # vla, processor = SimpleLatentWorldVLA.from_config(model_cfg)
-    # 移到设备并设置为评估模式
-    vla = vla.to(DEVICE, dtype=torch.float32).eval()
     
-    # 冻结所有参数（推理模式）
+    vla = vla.to(DEVICE, dtype=torch.float32).eval()
     for p in vla.parameters():
         p.requires_grad = False
     
-    print(f"[*] Model loaded successfully on {DEVICE}")
-    
+    print(f"[*] Model loaded on {DEVICE}")
     return vla
 
 
@@ -139,7 +159,7 @@ import torch
 def get_vla_action(vla, processor, obs, task_label, unnorm_key,
                    center_crop=False, guidance_scale=1.0,
                    use_history_frame=False, prev_obs=None, num_inference_steps=20,
-                   debug=False):
+                   debug=False, return_intermediates=False, image_resolution=256, num_queries=8, num_flow_queries=8):
     """
     使用 LatentWorldVLA 生成动作序列。
     
@@ -153,19 +173,42 @@ def get_vla_action(vla, processor, obs, task_label, unnorm_key,
         guidance_scale: CFG 引导强度
         use_history_frame: 是否使用历史帧（需与训练配置一致）
         prev_obs: 前一帧观测字典（包含 "full_image"），仅当 use_history_frame=True 时使用
-        
+        return_intermediates: 是否返回中间特征（h_t, h_t1_pred）
+        image_resolution: 图像分辨率
     Returns:
-        actions: List[np.ndarray]，长度为 window_size 的动作列表
+        如果 return_intermediates=False:
+            actions: List[np.ndarray]，长度为 window_size 的动作列表
+        如果 return_intermediates=True:
+            (actions, intermediates): 其中 intermediates 包含 h_t, h_t1_pred, vision_tokens_hw
     """
-    # 1. 处理观测
+    def _resize_pil(img: Image.Image, resolution):
+        """Resize PIL image to `resolution` (int or (w,h))."""
+        if resolution is None:
+            return img
+        if isinstance(resolution, int):
+            size = (resolution, resolution)
+        elif isinstance(resolution, (tuple, list)) and len(resolution) == 2:
+            # PIL expects (width, height)
+            size = (int(resolution[0]), int(resolution[1]))
+        else:
+            raise ValueError(f"Unsupported image_resolution={resolution!r}; expected int or (w,h).")
+        if img.size == size:
+            return img
+        resampling = getattr(Image, "Resampling", Image)
+        return img.resize(size, resample=getattr(resampling, "BICUBIC"))
+
+    # 1. 处理观测（先 resize 到 image_resolution）
     image = Image.fromarray(obs["full_image"]).convert("RGB")
+    image = _resize_pil(image, image_resolution)
     proprio = torch.from_numpy(obs["state"])
-    
+    wrist_image = Image.fromarray(obs["wrist_image"]).convert("RGB")
+    wrist_image = _resize_pil(wrist_image, image_resolution)
     # 2. 构造输入消息（根据 use_history_frame 决定是否添加历史帧）
     if use_history_frame:
         # 训练时使用两帧：video[0]（历史帧）和 video[1]（当前帧）
         if prev_obs is not None:
             prev_image = Image.fromarray(prev_obs["full_image"]).convert("RGB")
+            prev_image = _resize_pil(prev_image, image_resolution)
         else:
             # 第一次推理时，重复当前帧作为历史帧
             prev_image = image
@@ -183,9 +226,9 @@ def get_vla_action(vla, processor, obs, task_label, unnorm_key,
         ]
     
     # 构造 assistant 的回复，包含 <ACT_PH> 占位符
-    # 占位符数量等于 LAM 的 num_queries
-    num_queries = vla.lam.num_queries
-    placeholder_str = "".join(["<ACT_PH>" for _ in range(num_queries)])
+    # 占位符数量 = latent queries + flow queries
+    total_queries = int(num_queries) + int(num_flow_queries)
+    placeholder_str = "".join(["<ACT_PH>" for _ in range(total_queries)])
     
     messages = [
         {
@@ -201,7 +244,7 @@ def get_vla_action(vla, processor, obs, task_label, unnorm_key,
     ]
     
     # 3. 构造模型输入特征
-    feats = processor.build_vla_features(messages=messages, proprio=proprio, unnorm_key=unnorm_key,observation=image)
+    feats = processor.build_vla_features(messages=messages, proprio=proprio, unnorm_key=unnorm_key, observation=image, wrist_image=wrist_image)
     
     # 🔍 诊断：打印推理时的输入形状
     if debug:
@@ -214,7 +257,11 @@ def get_vla_action(vla, processor, obs, task_label, unnorm_key,
     feats["pixel_values"] = feats["pixel_values"].to(DEVICE, dtype=dtype)
     feats["input_ids"] = feats["input_ids"].to(DEVICE)
     feats["lam_image"] = feats["lam_image"].to(DEVICE, dtype=dtype)
+    feats["wrist_image"] = feats["wrist_image"].to(DEVICE, dtype=dtype)
     feats["proprio"] = feats["proprio"].to(DEVICE, dtype=dtype)
+    # 处理 attention_mask（如果存在）
+    if "attention_mask" in feats and feats["attention_mask"] is not None:
+        feats["attention_mask"] = feats["attention_mask"].to(DEVICE)
     # 处理 image_grid_thw（如果存在）
     if "image_grid_thw" in feats and feats["image_grid_thw"] is not None:
         feats["image_grid_thw"] = feats["image_grid_thw"].to(DEVICE)
@@ -222,19 +269,29 @@ def get_vla_action(vla, processor, obs, task_label, unnorm_key,
     # 5. 准备 lam_videos：从 [B, C, H, W] 扩展为 [B, 1, C, H, W]
     # lam_image 是当前帧，添加时间维度后成为 lam_videos
     lam_videos = feats["lam_image"].unsqueeze(1)  # [B, 1, C, H, W]
-    
+    wrist_videos = feats["wrist_image"].unsqueeze(1)  # [B, 1, C, H, W]
     # 6. 调用推理管线
     with torch.inference_mode():
-        actions_norm = vla.predict_action(
+        result = vla.predict_action(
             pixel_values=feats["pixel_values"],
             input_ids=feats["input_ids"],
+            attention_mask=feats.get("attention_mask", None),  # 传递 attention_mask
             lam_videos=lam_videos,
+            wrist_videos=wrist_videos,
             proprio=feats["proprio"],
             image_grid_thw=feats.get("image_grid_thw", None),
             guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             debug=debug,  # 传递诊断开关
+            return_intermediates=return_intermediates,
         )
+    
+    # 处理返回值
+    if return_intermediates:
+        actions_norm, intermediates = result
+    else:
+        actions_norm = result
+        intermediates = None
     
     # 7. 后处理：反归一化
     window_size = actions_norm.shape[1]
@@ -248,7 +305,12 @@ def get_vla_action(vla, processor, obs, task_label, unnorm_key,
     
     # 8. 转换为 numpy 并返回列表格式
     actions = actions.detach().cpu().numpy()
-    return [actions[i] for i in range(actions.shape[0])]
+    actions_list = [actions[i] for i in range(actions.shape[0])]
+    
+    if not return_intermediates:
+        return actions_list
+    else:
+        return actions_list, intermediates
 
 
 

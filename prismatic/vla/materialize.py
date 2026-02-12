@@ -6,66 +6,20 @@ exports individual functions for clear control flow.
 """
 
 from pathlib import Path
-from typing import Tuple, Type
+from typing import Tuple
 
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase, AutoProcessor
-import torch.nn as nn
-from prismatic.models.backbones.llm.prompting import PromptBuilder
-from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import (
     PaddedCollatorForActionPrediction,
-    PaddedCollatorForLanguageModeling,
 )
-from prismatic.vla.action_tokenizer import ActionTokenizer
-from prismatic.vla.datasets import EpisodicRLDSDataset, RLDSBatchTransform, RLDSBatchTransformLatentAction, RLDSDataset
+from prismatic.vla.datasets import EpisodicRLDSDataset, RLDSBatchTransformLatentAction, RLDSDataset
 import torchvision.transforms as transforms
 from latent_action_model.core.lam_model import LatentLAMModel
 import torch
 # 使用 timm 的 ImageNet 标准化参数
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
-
-def get_vla_dataset_and_collator(
-    data_root_dir: Path,
-    data_mix: str,
-    image_transform: ImageTransform,
-    tokenizer: PreTrainedTokenizerBase,
-    prompt_builder_fn: Type[PromptBuilder],
-    default_image_resolution: int,
-    padding_side: str = "right",
-    predict_stop_token: bool = True,
-    shuffle_buffer_size: int = 100_000,
-    train: bool = True,
-    episodic: bool = False,
-    image_aug: bool = False,
-) -> Tuple[Dataset, ActionTokenizer, PaddedCollatorForLanguageModeling]:
-    """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
-    action_tokenizer = ActionTokenizer(tokenizer)
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer, tokenizer, image_transform, prompt_builder_fn, predict_stop_token=predict_stop_token
-    )
-    collator = PaddedCollatorForLanguageModeling(
-        tokenizer.model_max_length,
-        tokenizer.pad_token_id,
-        (3, default_image_resolution, default_image_resolution),
-        padding_side=padding_side,
-    )
-
-    # Build RLDS Iterable Dataset
-    cls = RLDSDataset if not episodic else EpisodicRLDSDataset
-    dataset = cls(
-        data_root_dir,
-        data_mix,
-        batch_transform,
-        resize_resolution=(default_image_resolution,default_image_resolution),
-        shuffle_buffer_size=shuffle_buffer_size,
-        train=train,
-        image_aug=image_aug,
-    )
-
-    return dataset, action_tokenizer, collator
-
 
 def get_latent_vla_dataset_and_collator(
     data_root_dir: Path,
@@ -84,6 +38,7 @@ def get_latent_vla_dataset_and_collator(
     target_seq_len: int = 330,
     use_history_frame: bool = True,
     window_size: int = 20,
+    load_camera_views: Tuple[str, ...] = ("primary",),
 ) -> Tuple[Dataset, PreTrainedTokenizerBase, PaddedCollatorForActionPrediction]:
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
     # action_tokenizer = ActionTokenizer(tokenizer)
@@ -115,6 +70,12 @@ def get_latent_vla_dataset_and_collator(
     )
 
 
+    # Normalize camera-view input: callers sometimes pass a bare string.
+    if isinstance(load_camera_views, str):
+        load_camera_views = (load_camera_views,)
+    else:
+        load_camera_views = tuple(load_camera_views)
+
     # Build RLDS Iterable Dataset
     cls = RLDSDataset if not episodic else EpisodicRLDSDataset
     train_dataset = cls(
@@ -129,6 +90,7 @@ def get_latent_vla_dataset_and_collator(
         debug_repeat_batch=debug_repeat_batch,
         use_history_frame=use_history_frame,
         window_size=window_size,
+        load_camera_views=load_camera_views,
     )
     val_dataset = cls(
         data_root_dir,
@@ -141,6 +103,7 @@ def get_latent_vla_dataset_and_collator(
         training_phase=training_phase,
         use_history_frame=use_history_frame,
         window_size=window_size,
+        load_camera_views=load_camera_views,
     )
 
     return train_dataset, val_dataset, collator

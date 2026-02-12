@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional
 from torchvision import transforms
 
 from einops import repeat
@@ -14,7 +15,7 @@ from .modules import QFormer, QFormer_att
 class LAMEncoder(nn.Module):
     def __init__(self, context_dim: int, input_dim: int=1024, ar_query: bool = False, 
                  num_layers: int=4, num_heads: int=16, ffn_expansion_factor=4,
-                 dropout: float = 0.0,  num_frames: int=5, num_queries: int=1, grid_size: int=16, patch_size: int = 16, add_state: bool = False, modal_mask: bool = False):
+                 dropout: float = 0.0,  num_frames: int=5, num_queries: int=1, grid_size: int=16, patch_size: int = 16, add_state: bool = False, modal_mask: bool = False, code_dim: Optional[int] = None):
         super().__init__()
         self.num_frames = num_frames
         self.grid_size = grid_size
@@ -25,6 +26,10 @@ class LAMEncoder(nn.Module):
             self.project_in = nn.Linear(input_dim, context_dim)
         else:
             self.project_in = nn.Identity()
+        if code_dim != context_dim:
+            self.out_proj = nn.Linear(context_dim, code_dim)
+        else:
+            self.out_proj = nn.Identity()
 
         self.pos_embed = Fixed3DPositionalEncoding(context_dim, num_frames, grid_size, grid_size)
         if add_state:
@@ -81,5 +86,5 @@ class LAMEncoder(nn.Module):
         # 3) QFormer: 从上下文中提取 latent actions
         latents = self.QFormer(x_ctx)       # [B, num_queries, context_dim]
 
-        return latents
+        return self.out_proj(latents)
 

@@ -16,10 +16,10 @@ training_phase: lam_2f
 per_device_batch_size: 128
 gradient_accumulation_steps: 1
 learning_rate: 1e-3
-new_token_lr_scale: 5
+act_query_lr_scale: 5.0
+vlm_to_lam_lr_scale: 5.0
 warmup_steps: 0
 use_history_frame: true
-enable_lam_kl_loss: false
 
 # 运行与日志
 run_id: vla_lora_hist

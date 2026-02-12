@@ -1,12 +1,28 @@
-from .load import (
-    available_model_names,
-    available_models,
-    get_model_description,
-    load_InternVL,
-    load_vla,
-    freeze_internvl,
-    freeze_qwen3vl,
+"""
+prismatic.models
+
+This package is pruned to support UniVLA's LatentVLAModel / LatentWorldVLA workflows.
+
+Legacy OpenVLA registry/materialize utilities are intentionally removed as part of cleanup.
+"""
+
+from .vlm_auto import (
     load_vlm_auto,
     freeze_vlm_generic,
+    freeze_qwen3vl,
+    freeze_internvl,
+    _get_nested_attr,
+    _resolve_llm_module,
+    _unfreeze_last_n_llm_layers,
 )
-from .materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform, get_vlm
+
+__all__ = [
+    "load_vlm_auto",
+    "freeze_vlm_generic",
+    "freeze_qwen3vl",
+    "freeze_internvl",
+    "_get_nested_attr",
+    "_resolve_llm_module",
+    "_unfreeze_last_n_llm_layers",
+]
+

@@ -41,7 +41,10 @@ class VJEPAEncoder(nn.Module):
     
     def __init__(
         self, 
-        model_id: str = "facebook/vjepa2-vitl-fpc64-256"
+        model_id: str = "facebook/vjepa2-vitl-fpc64-256",
+        num_latent_layers: int = 1,
+        norm_layer_type: str = "l2",
+        enable_norm: bool = False,
     ):
         """
         初始化V-JEPA2特征编码器
@@ -53,19 +56,65 @@ class VJEPAEncoder(nn.Module):
         super().__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model_id = model_id
-        
-        # 模型组件
-        # self.encoder = None
-        self.feature_dim = 1024  # V-JEPA2 ViT Large 特征维度
-        
+        self.num_latent_layers = max(int(num_latent_layers), 1)
+        self.norm_layer_type = norm_layer_type
+        self.enable_norm = enable_norm
 
         # 加载模型
-        self.model = AutoModel.from_pretrained(self.model_id,trust_remote_code=True,device_map=self.device, dtype=torch.bfloat16)    
-        self.model.to(self.device).eval()
+        model = AutoModel.from_pretrained(
+            self.model_id,
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+        )
+        self.model = model.to(self.device).eval()
+        hidden_size = getattr(self.model.config, "hidden_size", None)
+        self.feature_dim = int(hidden_size) if hidden_size is not None else 1024
         for param in self.model.parameters():
             param.requires_grad = False
+
+        # 与 DINO 保持一致：按 norm 类型仅初始化所需层
+        if self.norm_layer_type in ("bn", "ln"):
+            if self.norm_layer_type == "bn":
+                norm_builder = lambda: nn.SyncBatchNorm(self.feature_dim, affine=False).to(self.device)
+            else:
+                norm_builder = lambda: nn.LayerNorm(self.feature_dim, elementwise_affine=False).to(self.device)
+            self.latent_norms = nn.ModuleList([norm_builder() for _ in range(self.num_latent_layers)])
+        else:
+            self.latent_norms = None
+
+    def train(self, mode: bool = True):
+        """
+        与 DINO 行为保持一致：视觉 backbone 始终保持 eval。
+        """
+        super().train(False)
+        self.model.eval()
+        return self
+
+    def _apply_feature_norm(self, tokens: torch.Tensor, *, norm_idx: int = 0, norm_latents: bool = False) -> torch.Tensor:
+        """
+        tokens: [N, K, D]
+        - 优先使用类级配置（self.enable_norm + self.norm_layer_type）
+        - 若未启用类级 norm，则兼容旧参数 norm_latents（L2）
+        """
+        if self.enable_norm:
+            if self.norm_layer_type == "bn":
+                if self.latent_norms is None:
+                    raise ValueError("当前 VJEPAEncoder 未初始化 BN 层，请将 norm_layer_type 设置为 'bn'。")
+                t2d = tokens.reshape(-1, self.feature_dim)
+                t2d = self.latent_norms[norm_idx](t2d)
+                tokens = t2d.view(tokens.shape[0], tokens.shape[1], self.feature_dim)
+            elif self.norm_layer_type == "ln":
+                if self.latent_norms is None:
+                    raise ValueError("当前 VJEPAEncoder 未初始化 LN 层，请将 norm_layer_type 设置为 'ln'。")
+                tokens = self.latent_norms[norm_idx](tokens)
+            elif self.norm_layer_type == "l2":
+                tokens = F.normalize(tokens, p=2, dim=-1)
+        elif norm_latents:
+            tokens = F.normalize(tokens, p=2, dim=-1)
+        return tokens
+
     @torch.no_grad()
-    def encode(
+    def encode_image(
         self, 
         images: torch.Tensor, 
         norm_latents: bool = False,
@@ -82,31 +131,41 @@ class VJEPAEncoder(nn.Module):
             B, C, H, W = images.shape
             T=1
         assert images.dim() == 4, f"期望4D张量 [B*T, C, H, W]，得到: {images.shape}，图片维度不正确"
-        video_like = images.unsqueeze(1).repeat(1, 2, 1, 1, 1)  # [B*T, 2, C, H, W]
+        model_dtype = next(self.model.parameters()).dtype
+        video_like = images.unsqueeze(1).repeat(1, 2, 1, 1, 1).to(
+            device=self.device,
+            dtype=model_dtype,
+        )  # [B*T, 2, C, H, W]
         # 通过编码器提取特征
 
         encoded_features = self.model.get_vision_features(video_like)  # [B*T, K, D]
-        if norm_latents:
-            encoded_features = F.normalize(encoded_features, dim=-1)
+        encoded_features = encoded_features.to(dtype=images.dtype)
+        encoded_features = self._apply_feature_norm(encoded_features, norm_idx=0, norm_latents=norm_latents)
         # print(encoded_features.min(), encoded_features.max(), encoded_features.mean(), encoded_features.std())
         return encoded_features.reshape(B, T, encoded_features.shape[-2], encoded_features.shape[-1]).detach()  # [B, T, K, D]
         
     @torch.no_grad()
-    def encode_video(
+    def encode(
         self, 
         videos: torch.Tensor, 
         norm_latents: bool = False,
+        n: int = -1,
     ) -> torch.Tensor:
         """
         输入：[B, T, C, H, W]
         输出：[B, T//2, 256, D]
         """
         B, T, C, H, W = videos.shape
+        input_dtype = videos.dtype
+        model_dtype = next(self.model.parameters()).dtype
+        videos = videos.to(device=self.device, dtype=model_dtype)
         with torch.no_grad():
             encoded_features = self.model.get_vision_features(videos)
-        if norm_latents:
-            encoded_features = F.normalize(encoded_features, dim=-1)
-        return encoded_features.reshape(B, T//2, 256, self.feature_dim).detach()
+        encoded_features = encoded_features.to(dtype=input_dtype)
+        encoded_features = self._apply_feature_norm(encoded_features, norm_idx=0, norm_latents=norm_latents)
+        temporal = max(T // 2, 1)
+        tokens_per_step = max(encoded_features.shape[-2] // temporal, 1)
+        return encoded_features.reshape(B, temporal, tokens_per_step, self.feature_dim).detach()
 
 
 class DINOv3Encoder(nn.Module):
@@ -375,7 +434,12 @@ def build_vision_encoder(model_id: str, num_latent_layers: int = 1, norm_layer_t
             enable_norm=enable_norm,
         ), 768
     elif "vjepa" in key or "jepa" in key:
-        return VJEPAEncoder(model_id="/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256"), 1024
+        return VJEPAEncoder(
+            model_id="/mnt/project_rlinf/jlchen/weights/vjepa2-vitl-fpc64-256",
+            num_latent_layers=num_latent_layers,
+            norm_layer_type=norm_layer_type,
+            enable_norm=enable_norm,
+        ), 1024
     elif "cosmos" in key:
         return CosmosAutoencoder(model_id="/mnt/project_rlinf/jlchen/weights/Cosmos-0.1-Tokenizer-CI16x16"), 16
 

@@ -8,7 +8,7 @@ model_id: "/mnt/project_rlinf/jlchen/weights/Qwen3-VL-2B-Instruct"
 lam_ckpt_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/checkpoints/epoch=21.ckpt"
 lam_yaml_path: "/mnt/project_rlinf/jlchen/code/UniVLA/latent_action_model/logs/dino_base_ae_bigwin/version_0/dino_base_ae.yaml"
 # 数据与预处理
-data_mix: libero_90
+data_mix: libero_object_no_noops
 
 
 # 训练超参
@@ -18,11 +18,8 @@ gradient_accumulation_steps: 1
 learning_rate: 1e-5
 warmup_steps: 0
 use_history_frame: true
-enable_lam_kl_loss: false
 image_aug: false
-supervise_quantized: true
-quantized_loss_type: "mse"
-enable_lam_kl_loss: false
+latent_loss_type: "mse"
 enable_lam_decoder_perceptual: true
 lam_decoder_perceptual_weight: 1.0
 lam_encoder_distill_weight: 1.0
@@ -42,7 +39,6 @@ freeze_embedding: true
 unfreeze_lam_decoder: true
 lam_decoder_target: gt
 unfreeze_vision_merger: true  
-
 
 
 

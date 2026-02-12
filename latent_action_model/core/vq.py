@@ -18,11 +18,11 @@ class VAEQuantizer(nn.Module):
       - `vq_loss` is the KL divergence loss (optionally weighted by `beta`)
       - `perplexity`, `indices`, `entropy_loss` are not applicable and returned as zeros / None
       - Accepts and ignores extra kwargs so existing `vq_kwargs` configs won't break.
+      - Now operates directly in code_dim space (projection layers moved to encoder/decoder).
     """
 
     def __init__(
         self,
-        input_dim: int = 1024,
         code_dim: int = 128,
         beta: float = 1.0,
         clamp_logvar: Optional[float] = 10.0,
@@ -31,16 +31,13 @@ class VAEQuantizer(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.input_dim = int(input_dim)
         self.code_dim = int(code_dim)
         self.beta = float(beta)
         self.clamp_logvar = float(clamp_logvar) if clamp_logvar is not None else None
 
-        self.in_proj = nn.Linear(self.input_dim, self.code_dim) if self.input_dim != self.code_dim else nn.Identity()
         self.pre_norm = nn.LayerNorm(self.code_dim) if layer_norm else nn.Identity()
         self.mu = nn.Linear(self.code_dim, self.code_dim)
         self.logvar = nn.Linear(self.code_dim, self.code_dim)
-        self.out_proj = nn.Linear(self.code_dim, self.input_dim) if self.input_dim != self.code_dim else nn.Identity()
 
         # for logging parity with VQ modules
         self.last_kl_loss: Optional[Tensor] = None
@@ -54,7 +51,7 @@ class VAEQuantizer(nn.Module):
         if nodes.dim() == 2:
             nodes = nodes.unsqueeze(1)  # [B, 1, D]
         nodes_pooled = nodes.mean(dim=1, keepdim=True)  # [B, 1, D]
-        h = self.pre_norm(self.in_proj(nodes_pooled))
+        h = self.pre_norm(nodes_pooled)
         mu = self.mu(h)
         logvar = self.logvar(h)
         if self.clamp_logvar is not None:
@@ -72,7 +69,7 @@ class VAEQuantizer(nn.Module):
         std = (0.5 * logvar).exp()
         eps = torch.randn_like(std)
         z = mu + eps * std  # reparameterized sample
-        quantized = self.out_proj(z)
+        quantized = z
 
         # mean KL across batch/query positions (standard VAE objective)
         kl_per_sample = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=-1)  # [...]
@@ -104,7 +101,7 @@ class VAEQuantizer(nn.Module):
             z = mu + torch.randn_like(std) * std
         else:
             z = mu
-        quantized = self.out_proj(z)
+        quantized = z
         indices = None
         if return_distance or return_logits or return_probs:
             return quantized, indices, None, None, None
@@ -117,12 +114,11 @@ class AEQuantizer(nn.Module):
     """
     Simple linear bottleneck used when vq_type='ae'.
     - Keeps interface compatible with VQ/VAE modules.
-    - Applies dim -> code_dim -> dim projection per query without discrete codes.
+    - Now operates directly in code_dim space (projection layers moved to encoder/decoder).
     """
 
     def __init__(
         self,
-        input_dim: int = 1024,
         code_dim: int = 128,
         layer_norm: bool = False,
         codebook_size: Optional[int] = None,
@@ -130,25 +126,22 @@ class AEQuantizer(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.input_dim = int(input_dim)
         self.code_dim = int(code_dim)
         # Align with VQ API: expose codebook_size for downstream components
         self.codebook_size = int(codebook_size) if codebook_size is not None else int(code_dim)
-        self.in_proj = nn.Linear(self.input_dim, self.code_dim) if self.input_dim != self.code_dim else nn.Identity()
         self.pre_norm = nn.LayerNorm(self.code_dim) if layer_norm else nn.Identity()
-        self.out_proj = nn.Linear(self.code_dim, self.input_dim) if self.input_dim != self.code_dim else nn.Identity()
         self.last_nodes_norm: Optional[Tensor] = None
         # Keep parity with VQ modules that expose this attribute
         self.nodes_norm: Optional[Tensor] = None
 
     def forward(self, nodes: Tensor):
         # nodes: [B, Q, D] or [B, D]
-        nodes_proj = self.pre_norm(self.in_proj(nodes))
+        nodes_proj = self.pre_norm(nodes)
         with torch.no_grad():
             norm_val = torch.norm(nodes_proj, p=2, dim=-1).mean()
             self.last_nodes_norm = norm_val
             self.nodes_norm = norm_val
-        quantized = self.out_proj(nodes_proj)
+        quantized = nodes_proj
         batch = nodes.shape[0]
         num_queries = nodes.shape[1] if nodes.dim() > 1 else 1
         indices = torch.zeros((batch, num_queries), device=nodes.device, dtype=torch.long)
@@ -170,8 +163,8 @@ class AEQuantizer(nn.Module):
         *args,
         **kwargs,
     ):
-        nodes_proj = self.pre_norm(self.in_proj(nodes))
-        quantized = self.out_proj(nodes_proj)
+        nodes_proj = self.pre_norm(nodes)
+        quantized = nodes_proj
         norm_val = torch.norm(nodes_proj, p=2, dim=-1).mean()
         self.last_nodes_norm = norm_val
         self.nodes_norm = norm_val
@@ -188,7 +181,6 @@ class VQ(nn.Module):
         self,
         codebook_size: int = 1024,
         code_dim: int = 128,
-        input_dim: int=1024,
         discarding_threshold: float = 0.01,
         initialization: str = 'uniform',
         data_dependent_init: bool = True,
@@ -222,7 +214,6 @@ class VQ(nn.Module):
         super().__init__()
         self.codebook_size = codebook_size
         self.code_dim = code_dim
-        self.input_dim = input_dim or code_dim
         self.discarding_threshold = discarding_threshold
         self.eps = 1e-12
         self.data_dependent_init = bool(data_dependent_init)
@@ -261,10 +252,8 @@ class VQ(nn.Module):
         
         self.codebooks = nn.Parameter(codebooks_data)
         self.use_cosine_sim = use_cosine_sim
-        # 映射层：外部特征 -> code_dim，code_dim -> 外部特征
+        # 仅保留 in_norm 用于可选的层归一化（投影层已移至 encoder/decoder）
         self.in_norm = nn.LayerNorm(self.code_dim, elementwise_affine=not self.use_cosine_sim) if (layer_norm or self.use_cosine_sim) else nn.Identity()
-        self.in_proj = nn.Linear(self.input_dim, self.code_dim) if self.input_dim != self.code_dim else nn.Identity()
-        self.out_proj = nn.Linear(self.code_dim, self.input_dim) if self.input_dim != self.code_dim else nn.Identity()
         # 注册码字使用计数器作为缓冲区
         # 这使得它成为模块状态的一部分，并能随模块移动到不同设备
         self.register_buffer('node_count', torch.zeros(self.codebook_size, dtype=torch.long))
@@ -283,10 +272,10 @@ class VQ(nn.Module):
 
     def get_nodes_proj(self, nodes: Tensor) -> Tensor:
         """
-        返回经过 in_proj 和 in_norm 处理后的 nodes 投影（与 forward 中一致）。
+        返回经过 in_norm 处理后的 nodes（与 forward 中一致）。
         不修改内部状态，仅作纯函数计算。
         """
-        return self.in_norm(self.in_proj(nodes))
+        return self.in_norm(nodes)
 
     def _get_indices(self, nodes: Tensor) -> Tensor:
         """计算输入节点与码本之间的最近索引（平方欧氏距离或负余弦相似度）。"""
@@ -590,7 +579,7 @@ class VQ(nn.Module):
         """
         训练阶段的前向传播。
         """
-        nodes_proj = self.in_norm(self.in_proj(nodes))
+        nodes_proj = self.in_norm(nodes)
         with torch.no_grad():
             # 记录用于距离计算的表征范数（余弦模式下为 1，欧氏模式下为投影空间范数）
             self.nodes_norm = torch.norm(nodes_proj, p=2, dim=-1).mean()
@@ -648,7 +637,7 @@ class VQ(nn.Module):
         # 码本间距统计
         self.compute_inter_code_stats()
 
-        quantized_out = self.out_proj(quantized)
+        quantized_out = quantized
 
         return (
             quantized_out,
@@ -885,7 +874,7 @@ class VQ(nn.Module):
             - probs (Tensor | None): 若 return_probs，则为 logits 的 softmax。
         """
         batch_size = nodes.shape[0]
-        nodes_proj = self.in_norm(self.in_proj(nodes))
+        nodes_proj = self.in_norm(nodes)
 
         distances: Optional[Tensor] = None
         code_used: Optional[Tensor] = None
@@ -908,7 +897,7 @@ class VQ(nn.Module):
             distances, _, code_used = self._compute_distance(nodes_proj, self.codebooks, return_normed=True)
 
         quantized = F.embedding(min_indices, code_used)
-        quantized_out = self.out_proj(quantized)
+        quantized_out = quantized
 
         logits_out: Optional[Tensor] = None
         probs_out: Optional[Tensor] = None
@@ -922,7 +911,7 @@ class VQ(nn.Module):
 
         if return_distance or return_logits or return_probs:
             return (
-                quantized_out.reshape(batch_size, -1, self.input_dim),
+                quantized_out.reshape(batch_size, -1, self.code_dim),
                 min_indices.view(batch_size, -1),
                 distances,
                 logits_out,
@@ -930,7 +919,7 @@ class VQ(nn.Module):
             )
 
         return (
-            quantized_out.reshape(batch_size, -1, self.input_dim),
+            quantized_out.reshape(batch_size, -1, self.code_dim),
             min_indices.view(batch_size, -1),
         )
     def codebook_reinit(self) -> None:
@@ -1032,7 +1021,7 @@ class EMAVQ(VQ):
 
     def forward(self, nodes: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         # Data-dependent init (k-means) if needed
-        nodes_proj = self.in_norm(self.in_proj(nodes))
+        nodes_proj = self.in_norm(nodes)
         with torch.no_grad():
             self.nodes_norm = torch.norm(nodes_proj, p=2, dim=-1).mean()
         nodes_for_init = F.normalize(nodes_proj, dim=-1, eps=self.eps) if self.use_cosine_sim else nodes_proj
@@ -1080,7 +1069,7 @@ class EMAVQ(VQ):
         # 码本间距统计
         self.compute_inter_code_stats()
 
-        quantized_out = self.out_proj(quantized)
+        quantized_out = quantized
 
         return (
             quantized_out,
@@ -1118,7 +1107,7 @@ class NSVQ(VQ):
         """
         训练阶段的前向传播。
         """
-        nodes_proj = self.in_norm(self.in_proj(nodes))
+        nodes_proj = self.in_norm(nodes)
         nodes_for_init = F.normalize(nodes_proj, dim=-1, eps=self.eps) if self.use_cosine_sim else nodes_proj
         # 在训练早期，根据数据进行一次可选的 KMeans 初始化
         if self.training:
@@ -1154,7 +1143,7 @@ class NSVQ(VQ):
         else:
             vq_loss = torch.zeros_like(entropy_loss)
 
-        quantized_out = self.out_proj(quantized)
+        quantized_out = quantized
 
         return (
             quantized_out,

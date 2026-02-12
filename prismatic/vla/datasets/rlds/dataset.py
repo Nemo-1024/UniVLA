@@ -275,6 +275,8 @@ def make_dataset_from_rlds(
 
     # === Distributed sharding via manual percent slicing (train only) ===
     # Ensure each rank gets a disjoint percent range inside the current split expression.
+    # 注意：只对 train 数据集进行 sharding，eval 数据集不 sharding，
+    # 这样可以在 rank 0 上评估完整验证集，避免分布式 eval 死锁问题。
     try:
         world_size, rank = overwatch.world_size(), overwatch.rank()
         if world_size > 1 and train:
@@ -440,12 +442,12 @@ def apply_trajectory_transforms(
     if 'ego4d' in name:
         window_size = 2
     elif 'fractal' in name:
-        window_size = 5
-    elif name in datasets_with_lower_frequency:
+        window_size = 4
+    if name in datasets_with_lower_frequency and training_phase == 'lam_2f' or training_phase == 'lam':
         # window_size = random.randint(5,7) if training_phase == 'lam' else 5
-        window_size = random.randint(8, 10) if training_phase == 'lam_2f' else 10
-    elif name in datasets_with_higher_frequency:
-        window_size = random.randint(25,30) if training_phase == 'lam_2f' else 30
+        window_size = random.randint(8, 10)
+    if name in datasets_with_higher_frequency and training_phase == 'lam_2f' or training_phase == 'lam':
+        window_size = random.randint(25,30)
     # 选择chunking策略
     # if training_phase == 'post-training':
     #     transform = traj_transforms.chunk_act_obs_libero    # load all obs. within a window
@@ -643,8 +645,18 @@ def make_interleaved_dataset(
         dataset_sizes.append(dataset_statistics["num_transitions"])
         all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
 
-    # Get the indices of the "primary" datasets (i.e., datasets with sample_weight == 1.0)
-    primary_dataset_indices = np.array([idx for idx in range(len(sample_weights)) if sample_weights[idx] == 1.0])
+    # Get the indices of the "primary" datasets (i.e., datasets with sample_weight == 1.0).
+    # Note: some mixtures may not include any exact 1.0 weights; fall back to all datasets.
+    primary_dataset_indices = np.array(
+        [idx for idx in range(len(sample_weights)) if np.isclose(sample_weights[idx], 1.0)],
+        dtype=int,
+    )
+    if primary_dataset_indices.size == 0:
+        overwatch.warning(
+            "No primary datasets found (no sample_weight == 1.0). "
+            "Falling back to using all datasets to compute effective dataset length."
+        )
+        primary_dataset_indices = np.arange(len(sample_weights), dtype=int)
 
     # Balance and Normalize Weights
     if balance_weights:

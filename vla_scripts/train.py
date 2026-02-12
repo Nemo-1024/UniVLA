@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Optional, Tuple, Union, Dict, Any
 from datetime import datetime
 import draccus
-from tensorflow.python.data.util.structure import NoneTensorSpec
 import torch
 import torch.distributed as dist
 import yaml
@@ -33,10 +32,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
-# 📝 动作 token 列表: ['<ACT_0>', '<ACT_1>', '<ACT_2>', '<ACT_3>', '<ACT_4>', '<ACT_5>', '<ACT_6>', '<ACT_7>', '<ACT_8>', '<ACT_9>', '<ACT_10>', '<ACT_11>', '<ACT_12>', '<ACT_13>', '<ACT_14>', '<ACT_15>']
-# 🔢 对应的 token ID: [151679, 151680, 151681, 151682, 151683, 151684, 151685, 151686, 151687, 151688, 151689, 151690, 151691, 151692, 151693, 151694]
-# 🎯 action_token_begin_id = 151679
-# 📊 ID 范围: 151679 - 151694
 home_path = "/mnt/project_rlinf/jlchen"
 @dataclass
 class TrainConfig:
@@ -109,16 +104,13 @@ class TrainConfig:
     # =========================
     latent_action_placeholder_token: str = "<ACT_PH>"
     # === 动作监督模式说明 ===
-    # - supervise_quantized=True: 不使用 token CE，改为在 <ACT_PH> 位置注入可学习 query，并主监督回归 LAM quantized
-    supervise_quantized: bool = False
-    # quantized 回归损失类型：cosine 或 mse
-    quantized_loss_type: str = "mse"
+    # latent 回归监督：在 <ACT_PH> 位置注入可学习 query (act_query)，并监督回归 LAM latent
+    # latent 回归损失类型：cosine 或 mse
+    latent_loss_type: str = "mse"
     enable_lam_decoder_perceptual: bool = False
-    enable_lam_kl_loss: bool = False
     lam_encoder_distill_weight: float = 1.0
     lam_decoder_perceptual_weight: float = 1.0
-    new_token_lr_scale: float = 1.0  # 对新增 special tokens 的 embedding 梯度放大倍数（>1 放大，=1 不变）
-    # supervise_quantized 模式下，对 query / 回归头施加梯度放大（类似 new_token_lr_scale，但作用于参数整体）
+    # 对可学习 query / 回归头施加梯度放大（>1 放大，=1 不变）
     act_query_lr_scale: float = 1.0
     vlm_to_lam_lr_scale: float = 1.0
     use_latent_vla_model: bool = True
@@ -131,7 +123,7 @@ class TrainConfig:
     # debug_repeat_batch 支持 bool 或 int：传入正整数 k 时，会缓存前 k 个样本并循环返回
     debug_repeat_batch: Union[bool, int] = False
     epochs: Optional[int] = 10
-    max_steps: Optional[int] = 100000  #以max_steps为准，若为空则按epochs * 10000近似
+    max_steps: Optional[int] = 200000  #以max_steps为准，若为空则按epochs * 10000近似
     per_device_batch_size: int = 16
     gradient_accumulation_steps: int = 2
     learning_rate: float = 1e-6
@@ -154,7 +146,7 @@ class TrainConfig:
     eval_interval: int = 1000
     eval_accumulation_steps: int = 1
     per_device_eval_batch_size: int = 64
-    save_interval: int = 5000                                    # Interval for saving checkpoints (in steps
+    save_interval: int = 10000                                   # Interval for saving checkpoints (in steps
 
     # =========================
     # 分布式 / FSDP
@@ -199,15 +191,14 @@ def train(cfg: TrainConfig) -> None:
     overwatch.info("OpenVLA Training :: Warming Up")
 
     # ---- Config info for action supervision ----
-    if bool(getattr(cfg, "supervise_quantized", False)):
-        overwatch.info(
-            "[TrainConfig] supervise_quantized=True: using quantized regression as main supervision (no token CE), with learnable queries at <ACT_PH>."
-        )
+    overwatch.info(
+        "[TrainConfig] using latent regression as main supervision (no token CE), with learnable queries at <ACT_PH>."
+    )
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
     torch.cuda.set_device(device_id := overwatch.local_rank())
     torch.cuda.empty_cache()
-    # 尽量保持确定性，减少 LAM/VQ 输出的随机波动
+    # 尽量保持确定性，减少 LAM/latent 输出的随机波动
     # torch.backends.cudnn.deterministic = True
     # torch.backends.cudnn.benchmark = False
 
@@ -350,7 +341,7 @@ def train(cfg: TrainConfig) -> None:
     overwatch.info(
         f"🔄 构建 RLDS 数据集与 Collator（mixture=`{cfg.data_mix}`，image_res={cfg.image_resolution}）"
     )
-    # 类型提示规避：latent_action_tokenizer 需要 VQ 编码器，这里用 cast 静态规避
+    # 类型提示规避：latent_action_tokenizer 需要 LAM 编码器，这里用 cast 静态规避
     train_dataset, val_dataset, collator = get_latent_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.data_mix,
@@ -358,9 +349,9 @@ def train(cfg: TrainConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         training_phase=cfg.training_phase,
-        latent_action_num_queries=latent_vla_model.lam.num_queries,
+        latent_action_num_queries=latent_vla_model.num_queries,
         debug_repeat_batch=cfg.debug_repeat_batch,
-        target_seq_len=350 if "InternVL" in cfg.model_id else 250,
+        target_seq_len=250 if cfg.use_history_frame else 200,
         use_history_frame=cfg.use_history_frame,
         window_size=cfg.window_size,
     )

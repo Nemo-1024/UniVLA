@@ -23,7 +23,7 @@ import wandb
 from prismatic.vla import get_latent_vla_dataset_and_collator
 from prismatic.models.vlas.latent_world_vla import LatentWorldVLA, LatentWorldVLAConfig, SimpleLatentWorldVLA
 from prismatic.util.data_utils import PaddedCollatorForLatentWorldVLA_LIBERO
-from prismatic.vla.datasets import RLDSBatchTransformLIBERO
+from prismatic.vla.datasets.datasets import RLDSBatchTransformLIBERO
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
  
 
@@ -92,7 +92,7 @@ class FinetuneConfig:
     vlm_warmup_steps: int = 200
     grad_accumulation_steps: int = 1
     gradient_clip: float = 1.0
-    weight_decay: float = 1e-4
+    weight_decay: float = 1e-5
     # vlm_loss_weight: float = 1.0
 
     # Seeding & dtype
@@ -114,6 +114,13 @@ class FinetuneConfig:
 def finetune(cfg: FinetuneConfig) -> None:
     # 构建模型配置（包含 VLM/LAM 加载所需参数，已迁移至 LatentWorldVLAConfig）
     model_cfg = cfg.model_cfg
+    # 关键一致性：dataset/collator 使用 cfg.window_size；Flow head 使用 model_cfg.flow_cfg.window_size
+    # 避免用户只改了一个导致 shape/assert mismatch
+    try:
+        if hasattr(model_cfg, "flow_cfg") and model_cfg.flow_cfg is not None:
+            model_cfg.flow_cfg.window_size = int(cfg.window_size)
+    except Exception:
+        pass
     overwatch.info(f"Fine-tuning LatentWorldVLA on `{cfg.data_mix}` with base `{model_cfg.model_id}`")
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
@@ -137,21 +144,20 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Configure Unique Experiment ID & Log Directory
     exp_id = (
-        f"{cfg.run_time}+{model_cfg.model_id.split('/')[-2]}+{cfg.data_mix}"
-        f"+lr-{cfg.learning_rate}"
+        f"{cfg.run_time}+{cfg.data_mix}"
     )
-    # 添加冻结策略标记
-    freeze_tags = []
-    if model_cfg.freeze_vision_backbone:
-        freeze_tags.append("frzVis")
-    if model_cfg.freeze_llm_backbone:
-        freeze_tags.append("frzLLM")
-        if model_cfg.unfreeze_llm_last_n_layers:
-            freeze_tags.append(f"unfrzLast{model_cfg.unfreeze_llm_last_n_layers}")
-    if model_cfg.freeze_embedding:
-        freeze_tags.append("frzEmb")
-    if freeze_tags:
-        exp_id += "+" + "+".join(freeze_tags)
+    # # 添加冻结策略标记
+    # freeze_tags = []
+    # if model_cfg.freeze_vision_backbone:
+    #     freeze_tags.append("frzVis")
+    # if model_cfg.freeze_llm_backbone:
+    #     freeze_tags.append("frzLLM")
+    #     if model_cfg.unfreeze_llm_last_n_layers:
+    #         freeze_tags.append(f"unfrzLast{model_cfg.unfreeze_llm_last_n_layers}")
+    # if model_cfg.freeze_embedding:
+    #     freeze_tags.append("frzEmb")
+    # if freeze_tags:
+    #     exp_id += "+" + "+".join(freeze_tags)
     if cfg.run_id_note is not None:
         exp_id += f"--{cfg.run_id_note}"
 
@@ -305,10 +311,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         training_phase='post-training', 
         data_transform_fn=RLDSBatchTransformLIBERO,
         collator_fn=PaddedCollatorForLatentWorldVLA_LIBERO,
-        latent_action_num_queries=lwvla.lam.num_queries,
+        latent_action_num_queries=lwvla.latent_vla.num_queries,
         debug_repeat_batch=cfg.debug_repeat_batch,
         use_history_frame=cfg.use_history_frame,
-        target_seq_len=180 if cfg.use_history_frame else 120,
+        target_seq_len=200 if cfg.use_history_frame else 150,
+        load_camera_views=("primary", "wrist"),
     )
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
@@ -352,7 +359,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         else:
             # cosine decay
             progress = float(current_step - cfg.warmup_steps) / float(max(1, cfg.max_steps - cfg.warmup_steps))
-            return max(0.5 * (1.0 + math.cos(math.pi * progress)), 1e-6)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     def lr_lambda_vlm(current_step: int):
         if current_step < cfg.vlm_warmup_steps:
@@ -361,7 +368,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         else:
             # cosine decay
             progress = float(current_step - cfg.vlm_warmup_steps) / float(max(1, cfg.max_steps - cfg.vlm_warmup_steps))
-            return max(0.5 * (1.0 + math.cos(math.pi * progress)), 1e-6)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     if len(param_groups) == 2:
         scheduler = LambdaLR(optimizer, lr_lambda=[lr_lambda_base, lr_lambda_vlm])
@@ -374,7 +381,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         batch_size=cfg.batch_size,
         sampler=None,
         collate_fn=collator,
-        num_workers=0,  # collator 已不再调用 vq_encode，默认单进程以保持确定性
+        num_workers=0,  # collator 已不再调用 LAM 编码，默认单进程以保持确定性
         pin_memory=True,
     )
     val_loader = DataLoader(
@@ -419,7 +426,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             batch = {
                 k: (v.to(device_id) if isinstance(v, torch.Tensor) else v)
                 for k, v in batch.items()
-                if k in {"pixel_values","input_ids","attention_mask","act_placeholder_mask","lam_videos","lam_states","actions","proprio","image_grid_thw"}
+                if k in {"pixel_values","input_ids","attention_mask","act_placeholder_mask","flow_placeholder_mask","lam_videos","lam_states","actions","proprio","image_grid_thw","wrist_videos"}
             }
             if "pixel_values" in batch:
                 batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
@@ -431,6 +438,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 out = wrapped_model(**batch)
                 flow_loss = out["loss_flow"]
                 perceptual_loss = out.get("loss_perceptual", torch.tensor(0.0, device=device_id, dtype=flow_loss.dtype))
+                distill_loss = out.get("loss_distill", torch.tensor(0.0, device=device_id, dtype=flow_loss.dtype))
                 loss = out["loss_total"]
 
             normalized_loss = loss / cfg.grad_accumulation_steps
@@ -458,6 +466,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                         "loss": f"{smoothened_loss:.6f}",
                         "flow": f"{float(flow_loss.item()):.6f}",
                         "perc": f"{float(perceptual_loss.item()):.6f}",
+                        "dist": f"{float(distill_loss.item()):.6f}",
                     }
                     if "vlm_action_accuracy" in out:
                         postfix["acc"] = f"{float(out['vlm_action_accuracy'].item()):.4f}"
@@ -466,6 +475,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                         "train_loss": smoothened_loss,
                         "train_flow_loss": float(flow_loss.item()),
                         "train_perceptual_loss": float(perceptual_loss.item()),
+                        "train_distill_loss": float(distill_loss.item()),
                         # 记录基础参数组与（若有）VLM 参数组的学习率
                         "lr": optimizer.param_groups[0]['lr'],
                     }
@@ -483,6 +493,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                                 f"loss={smoothened_loss:.6f} "
                                 f"flow={float(flow_loss.item()):.6f} "
                                 f"perc={float(perceptual_loss.item()):.6f} "
+                                f"dist={float(distill_loss.item()):.6f} "
                                 f"lr={optimizer.param_groups[0]['lr']:.3e}"
                             )
                         except Exception:
@@ -537,7 +548,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                             eval_batch = {
                                 k: (v.to(device_id) if isinstance(v, torch.Tensor) else v)
                                 for k, v in eval_batch.items()
-                                if k in {"pixel_values","input_ids","attention_mask","act_placeholder_mask","lam_videos","lam_states","actions","proprio","image_grid_thw"}
+                                if k in {"pixel_values","input_ids","attention_mask","act_placeholder_mask","flow_placeholder_mask","lam_videos","lam_states","actions","proprio","image_grid_thw","wrist_videos"}
                             }
                             if "pixel_values" in eval_batch:
                                 eval_batch["pixel_values"] = eval_batch["pixel_values"].to(torch.bfloat16)
@@ -548,10 +559,12 @@ def finetune(cfg: FinetuneConfig) -> None:
                                     input_ids=eval_batch["input_ids"],
                                     attention_mask=eval_batch["attention_mask"],
                                     act_placeholder_mask=eval_batch["act_placeholder_mask"],
+                                    flow_placeholder_mask=eval_batch.get("flow_placeholder_mask", None),
                                     lam_videos=eval_batch["lam_videos"],
                                     lam_states=eval_batch.get("lam_states", None),
                                     proprio=eval_batch.get("proprio", None),
                                     image_grid_thw=eval_batch.get("image_grid_thw", None),
+                                    wrist_videos=eval_batch.get("wrist_videos", None),
                                 )
                                 # 计算预测动作与真实动作的 MSE
                                 gt_actions = eval_batch["actions"]  # [B, T, Da]
@@ -672,4 +685,3 @@ def finetune(cfg: FinetuneConfig) -> None:
 
 if __name__ == "__main__":
     finetune()
-

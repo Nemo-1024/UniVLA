@@ -311,6 +311,7 @@ class PaddedCollatorForLatentWorldVLA_LIBERO:
     padding_side: str = "right"
     processor: Any = None
     latent_action_num_queries: int = 4
+    flow_action_num_queries: int = 8
     target_seq_len: int = 330
     use_history_frame: bool = True
     predict_stop_token: bool = False  # 兼容旧签名，当前不使用
@@ -348,6 +349,16 @@ class PaddedCollatorForLatentWorldVLA_LIBERO:
             [torch.as_tensor(instance["proprio"][lam_start_idx:]).float() for instance in instances],
             dim=0,
         )
+        
+        # Wrist 视角输入（如果加载）：使用与 lam_videos 相同的处理流程
+        wrist_videos = None
+        if "video_wrist" in instances[0]:
+            wrist_videos = torch.stack(
+                [torch.as_tensor(instance["video_wrist"][lam_start_idx: lam_start_idx+1]).permute(0, 3, 1, 2).float().div_(255.0) for instance in instances],
+                dim=0,
+            )
+            # 使用与 lam_videos 相同的归一化
+            wrist_videos = (wrist_videos - self.mean_5d) / self.std_5d
 
         # Flow/动作监督
         actions = torch.stack([torch.from_numpy(instance["actions"]) for instance in instances], dim=0)
@@ -362,11 +373,13 @@ class PaddedCollatorForLatentWorldVLA_LIBERO:
         input_ids_list: List[torch.Tensor] = []
         attention_mask_list: List[torch.Tensor] = []
         act_placeholder_mask_list: List[torch.Tensor] = []
+        flow_placeholder_mask_list: List[torch.Tensor] = []
         image_grid_thw_list: List[torch.Tensor] = []
 
         num_latents = int(self.latent_action_num_queries)
+        num_flow = int(self.flow_action_num_queries)
         placeholder_token_id = int(self.placeholder_token_id)
-        placeholder_str = "".join(["<ACT_PH>" for _ in range(num_latents)])
+        placeholder_str = "".join(["<ACT_PH>" for _ in range(num_latents + num_flow)])
 
         for b, lang_raw in enumerate(lang_instructions_list):
             lang: str = lang_raw.decode().lower()
@@ -408,14 +421,28 @@ class PaddedCollatorForLatentWorldVLA_LIBERO:
             pixel_values = inputs.pixel_values.squeeze(0)
             image_grid_thw = getattr(inputs, "image_grid_thw", None)
 
-            # labels 不用于 supervise_quantized，直接全 IGNORE
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-            act_placeholder_mask = (input_ids == placeholder_token_id)
+            # labels 不用于 supervise_latent，直接全 IGNORE
+            attention_mask = inputs.attention_mask.squeeze(0)
+            placeholder_mask = (input_ids == placeholder_token_id)
+            placeholder_pos = torch.nonzero(placeholder_mask, as_tuple=False).flatten()
+            expected_total = num_latents + num_flow
+            if int(placeholder_pos.numel()) != int(expected_total):
+                raise ValueError(
+                    f"[PaddedCollatorForLatentWorldVLA_LIBERO] placeholder count mismatch: "
+                    f"got={int(placeholder_pos.numel())}, expected={int(expected_total)}"
+                )
+            act_placeholder_mask = torch.zeros_like(placeholder_mask, dtype=torch.bool)
+            flow_placeholder_mask = torch.zeros_like(placeholder_mask, dtype=torch.bool)
+            if num_latents > 0:
+                act_placeholder_mask[placeholder_pos[:num_latents]] = True
+            if num_flow > 0:
+                flow_placeholder_mask[placeholder_pos[num_latents: expected_total]] = True
 
             input_ids_list.append(input_ids)
             attention_mask_list.append(attention_mask)
             pixel_values_list.append(pixel_values)
             act_placeholder_mask_list.append(act_placeholder_mask)
+            flow_placeholder_mask_list.append(flow_placeholder_mask)
             if image_grid_thw is not None:
                 image_grid_thw_list.append(image_grid_thw)
 
@@ -444,6 +471,15 @@ class PaddedCollatorForLatentWorldVLA_LIBERO:
             act_placeholder_mask = F.pad(act_placeholder_mask, (0, pad_amt), value=0)
         act_placeholder_mask = act_placeholder_mask.bool()
 
+        flow_placeholder_mask = pad_sequence(
+            flow_placeholder_mask_list, batch_first=True, padding_value=0
+        )
+        flow_placeholder_mask = flow_placeholder_mask[:, :target_len]
+        if flow_placeholder_mask.size(1) < target_len:
+            pad_amt = target_len - flow_placeholder_mask.size(1)
+            flow_placeholder_mask = F.pad(flow_placeholder_mask, (0, pad_amt), value=0)
+        flow_placeholder_mask = flow_placeholder_mask.bool()
+
         if isinstance(pixel_values_list[0], torch.Tensor):
             pixel_values = torch.stack(pixel_values_list)
         else:
@@ -456,11 +492,14 @@ class PaddedCollatorForLatentWorldVLA_LIBERO:
             input_ids=input_ids,
             attention_mask=attention_mask,
             act_placeholder_mask=act_placeholder_mask,
+            flow_placeholder_mask=flow_placeholder_mask,
             lam_videos=lam_videos,
             lam_states=lam_states,
             actions=actions,
             proprio=proprio,
         )
+        if wrist_videos is not None:
+            output["wrist_videos"] = wrist_videos
         if image_grid_thw is not None:
             output["image_grid_thw"] = image_grid_thw
         if dataset_names is not None:
@@ -489,7 +528,7 @@ class PaddedCollatorForActionPrediction_LIBERO:
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         # 与标准 Action Collator 对齐：需要 action_tokenizer 和 processor
         assert self.action_tokenizer is not None and self.processor is not None, (
-            "action_tokenizer 和 processor 需要在 Collator 初始化时提供，用于批量 VQ 编码与模板生成"
+            "action_tokenizer 和 processor 需要在 Collator 初始化时提供，用于批量 LAM 编码与模板生成"
         )
         device = self.action_tokenizer.device
         # 收集批次数据（来自轻量 Transform，collate 阶段统一处理）
@@ -501,7 +540,7 @@ class PaddedCollatorForActionPrediction_LIBERO:
         actions = torch.stack([torch.from_numpy(instance["actions"]) for instance in instances], dim=0)
         proprio = torch.stack([torch.from_numpy(instance["proprio"]) for instance in instances], dim=0)
         proprio_lam = proprio.to(device, dtype=torch.float32)
-         # 批量 VQ 编码
+        # 批量 LAM 编码
         video_batch = torch.stack([torch.from_numpy(instance["video"]) for instance in instances], dim=0).to(device=device, dtype=torch.float32)
         video_batch = video_batch.permute(0, 1, 4, 2, 3).div_(255.0)
         if self.mean_5d.device != device:
@@ -513,11 +552,17 @@ class PaddedCollatorForActionPrediction_LIBERO:
 
         with torch.no_grad():
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                vq_out = self.action_tokenizer.vq_encode(videos=video_batch, states=proprio_lam, dec_in=video_batch[:,0], tgt=video_batch[:,-1], predict_future_frame=False)
+                lam_out = self.action_tokenizer.get_latent_action(
+                    videos=video_batch,
+                    states=proprio_lam,
+                    dec_in=video_batch[:, 0],
+                    tgt=video_batch[:, -1],
+                    predict_future_frame=False,
+                )
             # 确保返回到 CPU，便于 DataLoader pin_memory 与后续非阻塞拷贝
-            latent_action_idx_batch = vq_out['indices'].detach().cpu()  # [B, Q]
-            first_image_features = vq_out['features'][:,:1]
-            last_image_features = vq_out['features'][:,-1:]
+            latent_action_idx_batch = lam_out['indices'].detach().cpu()  # [B, Q]
+            first_image_features = lam_out['features'][:, :1]
+            last_image_features = lam_out['features'][:, -1:]
             image_features = torch.cat([first_image_features, last_image_features], dim=1).detach().cpu()          # [B, 2, K, D]
 
         proprio = proprio[:,0]

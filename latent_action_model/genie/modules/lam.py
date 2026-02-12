@@ -102,7 +102,7 @@ class UncontrolledDINOLatentActionModel(nn.Module):
 
         return last_hidden_states, attention_mask
 
-    def vq_encode(self, videos: Tensor, lang_embed: Tensor = None, attention_mask: Tensor = None) -> Dict:
+    def get_latent_action(self, videos: Tensor, lang_embed: Tensor = None, attention_mask: Tensor = None) -> Dict:
         # Preprocess videos
         B, T = videos.shape[:2]
         videos = rearrange(videos, "b T c h w -> (b T) c h w")
@@ -142,7 +142,11 @@ class UncontrolledDINOLatentActionModel(nn.Module):
                                     attention_mask],
                                     dim = -1)
 
-        outputs = self.vq_encode(batch["videos"], repeat(lang_embed, 'b l d -> b T l d', T=T), attention_mask.repeat(T, 1)) 
+        outputs = self.get_latent_action(
+            batch["videos"],
+            repeat(lang_embed, 'b l d -> b T l d', T=T),
+            attention_mask.repeat(T, 1),
+        )
         video_patches = self.patch_up(outputs["patches"][:, :-1])
         action_patches = self.action_up(outputs["z_q"])
         video_action_patches = torch.cat([action_patches, video_patches], dim=2)
@@ -240,7 +244,7 @@ class ControllableDINOLatentActionModel(nn.Module):
         self.vq.requires_grad_(False)
 
 
-    def vq_encode(self, videos: Tensor, lang_embed: Tensor = None, attention_mask: Tensor = None) -> Dict:
+    def get_latent_action(self, videos: Tensor, lang_embed: Tensor = None, attention_mask: Tensor = None) -> Dict:
         # Preprocess videos
         B, T = videos.shape[:2]
         videos = rearrange(videos, "b T c h w -> (b T) c h w")
@@ -289,7 +293,7 @@ class ControllableDINOLatentActionModel(nn.Module):
         B, T = batch["videos"].shape[:2]
         H, W = batch["videos"].shape[3:5]
 
-        outputs = self.vq_encode(batch["videos"]) 
+        outputs = self.get_latent_action(batch["videos"]) 
         video_patches = self.patch_up(outputs["patches"][:, :-1])
 
         # Decode

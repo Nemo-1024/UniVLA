@@ -178,26 +178,30 @@ class ConditionalFlowMatchingConfig:
     # Flow 维度与步数
     hidden_dim: int = 768
     num_layers: int = 12  #DiT层数
-    num_steps: int = 50
-    cfg_drop_prob: float = 0.25
+    num_steps: int = 20
+    cfg_drop_prob: float = 0.1
     cfg_scale: float = 1.0
-    interleave_self_attention: bool = False  # 让所有层都关注 VLM 特征
     num_timestep_buckets: int = 1000
 
     # 可学习编码器（内部构造 cond）所需配置
     vlm_dim: int = 2048
     vision_dim: int = 768
     num_vision_tokens: int = 256
+    flow_action_num_queries: int = 8
+    use_proprio: bool = True
     proprio_dim: int = 8
+    state_dropout_prob: float = 0.0
     # num_vision_queries: int = 64
     # qformer_layers: int = 2
     # enc_num_heads: int = 4
     # enc_hidden_dim: int = 512  # Enc(h_*) 输出维度；cond_dim = enc_hidden_dim * 4
     
     # AlternateVLDiT 相关配置
+    interleave_self_attention: bool = True  # 让所有层都关注 VLM 特征
     use_alternate_vldit: bool = False  # 是否使用交替注意力模式
     attend_text_every_n_blocks: int = 2  # 每多少个块关注一次VLM特征
     
+
     # 噪声采样配置（与 GR00T 对齐）
     noise_beta_alpha: float = 1.5  # Beta 分布的 alpha 参数
     noise_beta_beta: float = 1.0   # Beta 分布的 beta 参数
@@ -219,10 +223,19 @@ class ConditionalFlowMatchingHead(nn.Module):
         # )
         self.enc_vlm = VectorMLP(in_dim=self.config.vlm_dim, hidden_dim=self.config.vision_dim)
         # self.enc_a_p_to_a = VectorMLP(in_dim=2 * self.config.hidden_dim, hidden_dim=self.config.hidden_dim)
-        self.enc_prop = VectorMLP(in_dim=self.config.proprio_dim, hidden_dim=self.config.hidden_dim)
+        if self.config.use_proprio:
+            self.enc_prop = VectorMLP(in_dim=self.config.proprio_dim, hidden_dim=self.config.hidden_dim)
+            self.state_mask_token = nn.Parameter(torch.zeros(1, 1, self.config.hidden_dim))
+            nn.init.normal_(self.state_mask_token, mean=0.0, std=0.02)
+        else:
+            self.enc_prop = None
+            self.state_mask_token = None
         self.action_encoder = ActionEncoder(action_dim=self.config.action_dim, hidden_size=self.config.hidden_dim)
         self.position_embedding = nn.Embedding(512, self.config.hidden_dim)
         nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+        self.flow_action_query = nn.Parameter(
+            torch.randn(int(self.config.flow_action_num_queries), int(self.config.vlm_dim)) * 0.02
+        )
         
         # 根据配置选择 DiT 类型
         DiTClass = AlternateVLDiT if self.config.use_alternate_vldit else DiT
@@ -292,6 +305,7 @@ class ConditionalFlowMatchingHead(nn.Module):
         # 流匹配插值（与 GR00T 一致：t=0 是噪声，t=1 是数据）
         noisy_trajectory = (1 - time) * noise + time * actions
         velocity = actions - noise
+        # velocity = (actions-noisy_trajectory)/(1-time+1e-5)
         # 离散化时间步，并确保在有效范围内 [0, num_timestep_buckets-1]
         t_discretized = (time[:, 0, 0] * self.config.num_timestep_buckets).long()
         t_discretized = torch.clamp(t_discretized, 0, self.config.num_timestep_buckets - 1)
@@ -303,7 +317,19 @@ class ConditionalFlowMatchingHead(nn.Module):
         noisy_trajectory = noisy_trajectory + pos_embs
 
         # 编码条件特征
-        cond_prop = self.enc_prop(proprio)
+        if self.config.use_proprio:
+            cond_prop = self.enc_prop(proprio)
+            if self.training and self.config.state_dropout_prob > 0.0:
+                do_dropout = (
+                    torch.rand(cond_prop.shape[0], device=cond_prop.device) < self.config.state_dropout_prob
+                )
+                do_dropout = do_dropout[:, None, None].to(dtype=cond_prop.dtype)
+                cond_prop = (
+                    cond_prop * (1.0 - do_dropout)
+                    + self.state_mask_token.to(dtype=cond_prop.dtype) * do_dropout
+                )
+        else:
+            cond_prop = None
         cond_vlm = self.enc_vlm(h_vlm)  # [B, seq_len, vision_dim]
 
         # CFG drop（仅作用于 h_t1_star）
@@ -316,7 +342,10 @@ class ConditionalFlowMatchingHead(nn.Module):
 
         # 统一数据流：VLM 特征合并到 encoder_hidden_states
         encoder_hidden_states = torch.cat((h_t, cond_future, cond_vlm), dim=1)
-        hidden_states = torch.cat((cond_prop, noisy_trajectory), dim=1)
+        if self.config.use_proprio:
+            hidden_states = torch.cat((cond_prop, noisy_trajectory), dim=1)
+        else:
+            hidden_states = noisy_trajectory
         
         action_horizon = noisy_trajectory.shape[1]  # 记录动作序列长度，确保与推理时一致
         
@@ -383,7 +412,7 @@ class ConditionalFlowMatchingHead(nn.Module):
         h_vlm: torch.Tensor,
         proprio: torch.Tensor,
         cfg_scale: Optional[float] = None,
-        num_inference_steps: int = 50,
+        num_inference_steps: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,  # [B, vlm_seq_len] VLM 的 attention_mask
     ) -> torch.Tensor:
         """
@@ -405,6 +434,11 @@ class ConditionalFlowMatchingHead(nn.Module):
         device = h_t.device
         batch_size = h_t.shape[0]
         action_horizon = self.config.window_size
+        # 默认从 config 读取（便于在 YAML 里通过 ConditionalFlowMatchingConfig 统一管理）
+        if num_inference_steps is None:
+            num_inference_steps = int(getattr(self.config, "num_steps", 50))
+        if cfg_scale is None:
+            cfg_scale = float(getattr(self.config, "cfg_scale", 1.0))
         # 初始化为纯噪声（t=0 的起点）
         actions = torch.randn(
             size=(batch_size, action_horizon, self.config.action_dim),
@@ -416,7 +450,10 @@ class ConditionalFlowMatchingHead(nn.Module):
 
         # 编码条件特征（循环外，只需计算一次）
         cond_vlm = self.enc_vlm(h_vlm)  # [B, seq_len, vision_dim]
-        cond_prop = self.enc_prop(proprio)
+        if self.config.use_proprio:
+            cond_prop = self.enc_prop(proprio)
+        else:
+            cond_prop = None
 
         # 统一数据流：构建 encoder_hidden_states
         cond_encoder_hidden = torch.cat((h_t, h_t1_star, cond_vlm), dim=1)
@@ -476,7 +513,10 @@ class ConditionalFlowMatchingHead(nn.Module):
             action_features = action_features + pos_embs
 
             # 构建 hidden_states
-            hidden_states = torch.cat((cond_prop, action_features), dim=1)
+            if self.config.use_proprio:
+                hidden_states = torch.cat((cond_prop, action_features), dim=1)
+            else:
+                hidden_states = action_features
 
             # 根据模式调用 DiT
             if self.config.use_alternate_vldit:
@@ -531,5 +571,3 @@ class ConditionalFlowMatchingHead(nn.Module):
             actions = actions + dt * pred_velocity
 
         return actions
-
-
